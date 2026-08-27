@@ -1,0 +1,48 @@
+# Artefacts de compilation (Intel et gcc)
+*.o
+*.mod
+build-gcc/
+
+# Binaires de la ligne vivante
+test_block_lu
+test_blr_compress
+test_mpi_grid
+test_mpi_lu_pivot
+test_openmp_dense
+bench_seq
+bench_mpi
+test_mpi_lu_solve_2d
+test_mpi_blr_matrix
+test_mpi_blr_matrix_pivot
+bench_blr_pipeline
+test_blr_matrix_progress
+test_blr_workspace
+
+# Binaires des exemples canoniques
+example_blr_sequentiel
+example_dense_sequentiel
+example_mpi_dense
+example_blr_mpi_sans_pivot
+example_blr_mpi_pivot
+examples/*.o
+
+# Binaires legacy/
+legacy/test_ldlt
+legacy/test_blr_ldlt
+legacy/test_mpi_matvec
+legacy/test_mpi_lu_nopiv
+legacy/test_mpi_lu_solve
+legacy/test_mpi_blr_lu_pivot
+legacy/test_mpi_blr_lu_pivot_bcast
+legacy/test_mpi_blr_lu_nopiv
+legacy/test_blr_lu
+legacy/test_blr_lu_storage
+legacy/test_pivoting
+legacy/test_openmp
+legacy/bench_seq_full
+legacy/bench_mpi_full
+
+# Sorties de scripts (regenerables, pas versionnees)
+run_all_tests_logs/
+bench/logs/
+bench/results_*.csv

@@ -1,0 +1,40 @@
+name: CI
+
+# Verifie la correction de la ligne vivante avec la chaine gcc + BLAS/LAPACK
+# de reference + OpenMPI (voir INSTALL.md, section "Chemin alternatif") --
+# aucune licence Intel n'est disponible sur un runner GitHub Actions, donc
+# la chaine Intel (Makefile) n'est PAS testee ici. Le runner utilise un
+# systeme de fichiers Linux natif, donc le piège gfortran/DrvFs documente
+# dans INSTALL.md (specifique a un developpement local sous WSL2 sur disque
+# Windows) ne s'applique pas ici.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer gfortran, BLAS/LAPACK de reference, OpenMPI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran libblas-dev liblapack-dev libopenmpi-dev openmpi-bin
+
+      - name: Compiler et lancer le jeu de tests (chaine gcc)
+        working-directory: blr_solver
+        run: |
+          chmod +x run_all_tests.sh
+          ./run_all_tests.sh gcc
+
+      - name: Archiver les logs de test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run_all_tests_logs
+          path: blr_solver/run_all_tests_logs/
