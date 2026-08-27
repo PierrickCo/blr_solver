@@ -90,8 +90,10 @@ blr_solver/
 │                      stockage dense) -- voir legacy/README.md
 ├── .github/workflows/ CI (chaine gcc, build + run_all_tests.sh a chaque push)
 ├── run_all_tests.sh   compile + lance le jeu de tests cure, resume PASS/FAIL
-├── Makefile           chaine Intel (ifx+MKL+Intel MPI), reference
+├── Makefile           chaine Intel oneAPI (ifx+MKL+Intel MPI), reference
 ├── Makefile.gcc       chaine alternative (gfortran+BLAS/LAPACK+OpenMPI)
+├── Makefile.ifort2019 chaine alternative (ifort/Parallel Studio XE 2019 --
+│                      non validee en conditions reelles, voir INSTALL.md)
 ├── INSTALL.md
 ├── CLUSTER.md
 └── LICENSE            MIT

@@ -1,0 +1,226 @@
+# Chaine de build ALTERNATIVE : ifort (Intel Parallel Studio XE 2019,
+# compilateur Intel CLASSIQUE, distinct de ifx/oneAPI utilise pour
+# developper ce projet -- voir INSTALL.md, section correspondante, pour le
+# detail des precautions). Chemin secondaire, pour un cluster qui n'a que
+# cette generation de toolkit Intel installee.
+#
+# TOUS les artefacts (.o/.mod/binaires) vont dans build-ifort2019/ -- JAMAIS
+# a la racine ni dans build-gcc/, meme principe que Makefile.gcc : le
+# format .mod n'est PAS garanti compatible entre generations de compilateur
+# Intel (classique vs oneAPI), un melange silencieux corromprait le build.
+#
+# PREREQUIS -- sourcer l'environnement Parallel Studio XE 2019 AVANT make
+# (PAS setvars.sh, qui n'existe qu'a partir de oneAPI/2020) :
+#   source /opt/intel/compilers_and_libraries_2019/linux/bin/compilervars.sh intel64
+#   source /opt/intel/compilers_and_libraries_2019/linux/mkl/bin/mklvars.sh intel64
+# (ou le script combine psxevars.sh intel64 si disponible sur l'install).
+#
+# MKLROOT/IMPI_LIBDIR ci-dessous sont les chemins par defaut d'une install
+# Parallel Studio XE 2019 standard sous Linux -- SURCHARGER si differents
+# sur votre machine/cluster, ex. :
+#   make -f Makefile.ifort2019 MKLROOT=/chemin/vers/mkl IMPI_LIBDIR=/chemin/vers/mpi/intel64/lib
+#
+# Usage :
+#   make -f Makefile.ifort2019
+#   make -f Makefile.ifort2019 examples
+#   make -f Makefile.ifort2019 clean
+
+MKLROOT     ?= /opt/intel/compilers_and_libraries_2019/linux/mkl
+IMPI_LIBDIR ?= /opt/intel/compilers_and_libraries_2019/linux/mpi/intel64/lib
+
+FC    = ifort
+MPIFC = mpiifort
+BUILDDIR = build-ifort2019
+
+# -warn all -check bounds : memes garde-fous que le Makefile principal
+# (ifx). PRECAUTION CONNUE ET NON VERIFIEE sur ifort 2019 specifiquement
+# (seul ifx a ete teste) : mpi_blr_matrix_mod.f90 contient quelques lignes
+# en forme libre depassant 132 colonnes (limite standard Fortran) --  ifx
+# les tolere silencieusement, gfortran les rejette (voir Makefile.gcc,
+# -ffree-line-length-none). Le comportement d'ifort 2019 sur ce point n'a
+# PAS ete teste : si la compilation de mpi_blr_matrix_mod.f90 echoue avec
+# une erreur de troncature/longueur de ligne, c'est la cause -- reformater
+# les lignes incriminees (couper avec "&" en continuation) resout le
+# probleme, aucun flag ifort connu ne desactive cette limite en forme libre.
+OPTF = -O2 -qopenmp -warn all -check bounds -module $(BUILDDIR) -I$(BUILDDIR)
+
+SRC  = src
+TEST = test
+EX   = examples
+
+INCS = -I$(SRC)
+
+# Structure des libs MKL/Intel MPI classique (Parallel Studio XE) :
+# sous-dossier intel64/, DIFFERENT de la structure oneAPI (lib/ directement)
+# du Makefile principal -- piege le plus probable si on copie l'autre
+# Makefile sans ajuster.
+LIBMKL  = -L$(MKLROOT)/lib/intel64 -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core
+LIBS    = $(LIBMKL) -lpthread -lm -ldl
+MPILIBS = -L$(IMPI_LIBDIR) $(LIBS)
+
+all: $(BUILDDIR)/.dirstamp $(BUILDDIR)/test_block_lu $(BUILDDIR)/test_blr_compress $(BUILDDIR)/test_mpi_grid $(BUILDDIR)/test_mpi_lu_pivot $(BUILDDIR)/test_openmp_dense $(BUILDDIR)/test_mpi_lu_solve_2d $(BUILDDIR)/test_blr_matrix_progress $(BUILDDIR)/test_blr_workspace $(BUILDDIR)/test_mpi_blr_matrix $(BUILDDIR)/test_mpi_blr_matrix_pivot $(BUILDDIR)/bench_seq $(BUILDDIR)/bench_mpi $(BUILDDIR)/bench_blr_pipeline
+
+$(BUILDDIR)/.dirstamp:
+	mkdir -p $(BUILDDIR)
+	touch $@
+
+$(BUILDDIR)/blr_kinds_mod.o: $(SRC)/blr_kinds_mod.f90 $(BUILDDIR)/.dirstamp
+	$(FC) $(OPTF) -c $(SRC)/blr_kinds_mod.f90 -o $@
+
+# --- Reference C : LU par blocs dense, sans compression -------------------
+$(BUILDDIR)/test_block_lu: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_block_lu.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_block_lu.o $(LIBS)
+
+$(BUILDDIR)/block_lu_mod.o: $(SRC)/block_lu_mod.f90 $(BUILDDIR)/blr_kinds_mod.o
+	$(FC) $(OPTF) -c $(SRC)/block_lu_mod.f90 -o $@
+
+$(BUILDDIR)/test_block_lu.o: $(TEST)/test_block_lu.f90 $(BUILDDIR)/block_lu_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_block_lu.f90 -o $@
+
+# --- Bibliotheque d'algebre par blocs full/low-rank ------------------------
+$(BUILDDIR)/test_blr_compress: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/test_blr_compress.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/test_blr_compress.o $(LIBS)
+
+$(BUILDDIR)/blr_compress_mod.o: $(SRC)/blr_compress_mod.f90 $(BUILDDIR)/blr_kinds_mod.o
+	$(FC) $(OPTF) -c $(SRC)/blr_compress_mod.f90 -o $@
+
+$(BUILDDIR)/test_blr_compress.o: $(TEST)/test_blr_compress.f90 $(BUILDDIR)/blr_compress_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_compress.f90 -o $@
+
+# --- Grille de processus + distribution bloc-cyclique 2D -------------------
+$(BUILDDIR)/test_mpi_grid: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/test_mpi_grid.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/test_mpi_grid.o $(MPILIBS)
+
+$(BUILDDIR)/mpi_grid_mod.o: $(SRC)/mpi_grid_mod.f90 $(BUILDDIR)/blr_kinds_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_grid_mod.f90 -o $@
+
+$(BUILDDIR)/test_mpi_grid.o: $(TEST)/test_mpi_grid.f90 $(BUILDDIR)/mpi_grid_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_grid.f90 -o $@
+
+# --- Reference MPI (base) : factorisation LU dense distribuee, AVEC pivot -
+$(BUILDDIR)/test_mpi_lu_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_mpi_lu_pivot.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_mpi_lu_pivot.o $(MPILIBS)
+
+$(BUILDDIR)/mpi_lu_pivot_mod.o: $(SRC)/mpi_lu_pivot_mod.f90 $(BUILDDIR)/mpi_grid_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_lu_pivot_mod.f90 -o $@
+
+$(BUILDDIR)/test_mpi_lu_pivot.o: $(TEST)/test_mpi_lu_pivot.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_lu_pivot.f90 -o $@
+
+$(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o: $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90 $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90 -o $@
+
+# --- Case "dense + OpenMP" -------------------------------------------------
+$(BUILDDIR)/test_openmp_dense: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_openmp_dense.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_openmp_dense.o $(LIBS)
+
+$(BUILDDIR)/test_openmp_dense.o: $(TEST)/test_openmp_dense.f90 $(BUILDDIR)/block_lu_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_openmp_dense.f90 -o $@
+
+# --- Benchmarks de reference (A/B/MPI/C) -----------------------------------
+$(BUILDDIR)/bench_utils_mod.o: $(SRC)/bench_utils_mod.f90 $(BUILDDIR)/.dirstamp
+	$(FC) $(OPTF) -c $(SRC)/bench_utils_mod.f90 -o $@
+
+$(BUILDDIR)/bench_seq: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_seq.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_seq.o $(LIBS)
+
+$(BUILDDIR)/bench_seq.o: $(TEST)/bench_seq.f90 $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(TEST)/bench_seq.f90 -o $@
+
+$(BUILDDIR)/bench_mpi: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_mpi.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_mpi.o $(MPILIBS)
+
+$(BUILDDIR)/bench_mpi.o: $(TEST)/bench_mpi.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/bench_mpi.f90 -o $@
+
+# --- Resolution MPI distribuee 2D ------------------------------------------
+$(BUILDDIR)/test_mpi_lu_solve_2d: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/test_mpi_lu_solve_2d.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/test_mpi_lu_solve_2d.o $(MPILIBS)
+
+$(BUILDDIR)/mpi_lu_solve_2d_mod.o: $(SRC)/mpi_lu_solve_2d_mod.f90 $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_lu_solve_2d_mod.f90 -o $@
+
+$(BUILDDIR)/test_mpi_lu_solve_2d.o: $(TEST)/test_mpi_lu_solve_2d.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_lu_solve_2d.f90 -o $@
+
+# --- Solveur BLR+MPI (sans et avec pivot) ----------------------------------
+$(BUILDDIR)/thread_control_mod.o: $(SRC)/thread_control_mkl.f90 $(BUILDDIR)/.dirstamp
+	$(FC) $(OPTF) -c $(SRC)/thread_control_mkl.f90 -o $@
+
+$(BUILDDIR)/progress_bar_mod.o: $(SRC)/progress_bar_mod.f90 $(BUILDDIR)/.dirstamp
+	$(FC) $(OPTF) -c $(SRC)/progress_bar_mod.f90 -o $@
+
+$(BUILDDIR)/blr_matrix_mod.o: $(SRC)/blr_matrix_mod.f90 $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o
+	$(FC) $(OPTF) -c $(SRC)/blr_matrix_mod.f90 -o $@
+
+$(BUILDDIR)/mpi_blr_matrix_mod.o: $(SRC)/mpi_blr_matrix_mod.f90 $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_matrix_mod.f90 -o $@
+
+$(BUILDDIR)/test_mpi_blr_matrix: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/test_mpi_blr_matrix.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/test_mpi_blr_matrix.o $(MPILIBS)
+
+$(BUILDDIR)/test_mpi_blr_matrix.o: $(TEST)/test_mpi_blr_matrix.f90 $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_matrix.f90 -o $@
+
+$(BUILDDIR)/test_mpi_blr_matrix_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/test_mpi_blr_matrix_pivot.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/test_mpi_blr_matrix_pivot.o $(MPILIBS)
+
+$(BUILDDIR)/test_mpi_blr_matrix_pivot.o: $(TEST)/test_mpi_blr_matrix_pivot.f90 $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_matrix_pivot.f90 -o $@
+
+# --- References A/B : pipeline "matrice compressee de bout en bout" ------
+$(BUILDDIR)/bench_blr_pipeline: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_blr_pipeline.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_blr_pipeline.o $(LIBS)
+
+$(BUILDDIR)/bench_blr_pipeline.o: $(TEST)/bench_blr_pipeline.f90 $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(TEST)/bench_blr_pipeline.f90 -o $@
+
+$(BUILDDIR)/test_blr_matrix_progress: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/test_blr_matrix_progress.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/test_blr_matrix_progress.o $(LIBS)
+
+$(BUILDDIR)/test_blr_matrix_progress.o: $(TEST)/test_blr_matrix_progress.f90 $(BUILDDIR)/blr_matrix_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_matrix_progress.f90 -o $@
+
+$(BUILDDIR)/test_blr_workspace: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/test_blr_workspace.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/test_blr_workspace.o $(LIBS)
+
+$(BUILDDIR)/test_blr_workspace.o: $(TEST)/test_blr_workspace.f90 $(BUILDDIR)/blr_compress_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_workspace.f90 -o $@
+
+# --- Exemples canoniques (examples/) : voir Makefile (chaine Intel oneAPI)
+# et examples/README.md pour le detail -- meme structure, artefacts dans
+# build-ifort2019/.
+$(BUILDDIR)/example_blr_sequentiel: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/example_blr_sequentiel.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/example_blr_sequentiel.o $(LIBS)
+
+$(BUILDDIR)/example_blr_sequentiel.o: $(EX)/example_blr_sequentiel.f90 $(BUILDDIR)/blr_matrix_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(EX)/example_blr_sequentiel.f90 -o $@
+
+$(BUILDDIR)/example_dense_sequentiel: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/example_dense_sequentiel.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/example_dense_sequentiel.o $(LIBS)
+
+$(BUILDDIR)/example_dense_sequentiel.o: $(EX)/example_dense_sequentiel.f90 $(BUILDDIR)/block_lu_mod.o
+	$(FC) $(OPTF) $(INCS) -c $(EX)/example_dense_sequentiel.f90 -o $@
+
+$(BUILDDIR)/example_mpi_dense: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/example_mpi_dense.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/example_mpi_dense.o $(MPILIBS)
+
+$(BUILDDIR)/example_mpi_dense.o: $(EX)/example_mpi_dense.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_mpi_dense.f90 -o $@
+
+$(BUILDDIR)/example_blr_mpi_sans_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/example_blr_mpi_sans_pivot.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/example_blr_mpi_sans_pivot.o $(MPILIBS)
+
+$(BUILDDIR)/example_blr_mpi_sans_pivot.o: $(EX)/example_blr_mpi_sans_pivot.f90 $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_sans_pivot.f90 -o $@
+
+$(BUILDDIR)/example_blr_mpi_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/example_blr_mpi_pivot.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/example_blr_mpi_pivot.o $(MPILIBS)
+
+$(BUILDDIR)/example_blr_mpi_pivot.o: $(EX)/example_blr_mpi_pivot.f90 $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_pivot.f90 -o $@
+
+examples: $(BUILDDIR)/example_blr_sequentiel $(BUILDDIR)/example_dense_sequentiel $(BUILDDIR)/example_mpi_dense $(BUILDDIR)/example_blr_mpi_sans_pivot $(BUILDDIR)/example_blr_mpi_pivot
+
+clean:
+	$(RM) -r $(BUILDDIR)

@@ -51,6 +51,47 @@ le dépôt sur le disque Windows peut le rencontrer — dans ce cas, travailler
 depuis une copie sur le système de fichiers Linux natif (`~/...`) pour la
 chaîne gcc spécifiquement (la chaîne Intel, elle, n'a pas ce problème).
 
+## Chemin alternatif : ifort 2019 (Intel Parallel Studio XE, compilateur classique)
+
+Pour un cluster n'ayant que l'ancienne generation de toolkit Intel
+(`ifort`/`mpiifort`, pas `ifx`/`mpiifx` de oneAPI). **NON valide en
+conditions reelles** (aucune installation Parallel Studio XE 2019
+disponible dans cet environnement de developpement) — construit par
+analogie stricte avec `Makefile.gcc` (deja valide) et `Makefile` (deja
+valide), avec dry-run (`make -n`) verifie sur le graphe de dependances,
+mais jamais reellement compile avec `ifort`. A tester avant usage en
+production :
+
+```bash
+source /opt/intel/compilers_and_libraries_2019/linux/bin/compilervars.sh intel64
+source /opt/intel/compilers_and_libraries_2019/linux/mkl/bin/mklvars.sh intel64
+make -f Makefile.ifort2019
+# ou, si MKLROOT/IMPI_LIBDIR different sur votre install :
+make -f Makefile.ifort2019 MKLROOT=/chemin/vers/mkl IMPI_LIBDIR=/chemin/vers/mpi/intel64/lib
+```
+
+**Precautions specifiques a `ifort` 2019** (voir l'en-tete de
+`Makefile.ifort2019` pour le detail) :
+- Pas de `setvars.sh` (introduit avec oneAPI/2020) — sourcer
+  `compilervars.sh` et `mklvars.sh` separement (ou `psxevars.sh` si
+  disponible).
+- Structure de dossiers MKL/Intel MPI differente de oneAPI : les
+  bibliotheques sont sous `lib/intel64/`, pas `lib/` directement — deja
+  pris en compte dans `Makefile.ifort2019`, mais a verifier si votre
+  installation a une disposition non standard (surcharger `MKLROOT`/
+  `IMPI_LIBDIR`).
+- `mpi_blr_matrix_mod.f90` contient quelques lignes en forme libre
+  depassant 132 colonnes (limite standard Fortran). `ifx` les tolere
+  silencieusement ; le comportement d'`ifort` 2019 sur ce point precis
+  n'est **pas verifie**. Si la compilation de ce fichier echoue avec une
+  erreur de troncature/longueur de ligne, c'est la cause la plus probable
+  — reformater les lignes incriminees avec une continuation `&` resout le
+  probleme (aucun flag `ifort` connu ne desactive cette limite en forme
+  libre, contrairement a `-ffree-line-length-none` sous `gfortran`).
+- Tous les artefacts vont dans `build-ifort2019/`, jamais melanges avec
+  ceux de `Makefile`/`Makefile.gcc` (format `.mod` non garanti compatible
+  entre generations de compilateur).
+
 ## Compiler
 
 ```bash

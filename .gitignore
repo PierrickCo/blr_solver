@@ -1,7 +1,8 @@
-# Artefacts de compilation (Intel et gcc)
+# Artefacts de compilation (Intel oneAPI, gcc, ifort 2019)
 *.o
 *.mod
 build-gcc/
+build-ifort2019/
 
 # Binaires de la ligne vivante
 test_block_lu
