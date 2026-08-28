@@ -73,13 +73,26 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! --- 1) assemblage BLR distribue (matrice "anti-diagonale forte / diagonale
   !     naturelle faible" -- force un vrai pivotage, chaotique/peu compressible :
   !     la plupart des blocs hors-diagonale tombent en repli dense) ---
+  ! SHOW_PROGRESS=.TRUE. : barre de progression affichee par le processus 0
+  ! (voir mpi_blr_matrix_mod.f90 -- approximative ici, l'assemblage n'est
+  ! pas synchronise entre processus, contrairement aux 2 etapes suivantes).
   CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, T_ASM, &
-                                N_COMPRESSED, N_OFFDIAG, RANK_SUM)
-  IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
+                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE.)
+  ! N_COMPRESSED/N_OFFDIAG sont deja des sommes GLOBALES (MPI_ALLREDUCE
+  ! interne a MPI_ASSEMBLE_BLR_MATRIX) -- identiques sur tous les
+  ! processus, un seul affichage (rang 0) suffit, pas une approximation.
+  IF (MYID0.EQ.0) THEN
+    WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
+    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (assemblage) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+         ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+  END IF
 
   ! --- 2) factorisation LU, AVEC pivot confine au bloc diagonal ----------
+  ! SHOW_PROGRESS=.TRUE. : ici K/NBLK est un pourcentage EXACT (boucle
+  ! globalement synchronisee par les MPI_BCAST a chaque etape K).
   CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
-                                       N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR)
+                                       N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
+                                       SHOW_PROGRESS=.TRUE.)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT, INFO=', INFO
     CALL MPI_FINALIZE(IERR)
@@ -88,6 +101,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   IF (MYID0.EQ.0) THEN
     WRITE(6,'(A,F8.3,A)') ' Factorisation LU : ', T_FACTOR, ' s'
     WRITE(6,'(A,I0)') ' Nombre de permutations de lignes (pivot) : ', N_SWAPS
+    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (fin factorisation) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+         ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
   END IF
 
   ! --- 3) second membre B, distribue par blocs-lignes ET par colonnes sur
@@ -105,7 +120,10 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
 
   ! --- 4) resolution 2D, AVEC pivot (applique la meme sequence de swaps
   !     que celle utilisee a la factorisation, deja diffusee a la grille) --
-  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1))
+  ! SHOW_PROGRESS=.TRUE. : une seule barre pour les 2 sous-etapes
+  ! (substitution avant + arriere), pourcentage exact (meme raison que la
+  ! factorisation -- boucle globalement synchronisee).
+  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE.)
 
   ALLOCATE(X_GLOBAL(N,NRHS))
   CALL GATHER_2D_RHS(GRID, N, NB, NRHS, B_LOCAL, MAX(MLOC,1), NRHS_LOC, 0, X_GLOBAL)

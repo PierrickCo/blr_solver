@@ -43,3 +43,27 @@ Chaque exemple assemble une matrice de demonstration (formule analytique,
 pas de fichier d'entree), factorise, resout un second membre arbitraire,
 et affiche les premieres valeurs de la solution -- point de depart a
 adapter (callback `GET_BLOCK`, second membre) pour un probleme reel.
+
+## Barres de progression et taux de compression (BLR+MPI avec pivot)
+
+`example_blr_mpi_pivot.f90` active `SHOW_PROGRESS=.TRUE.` sur les 3 etapes
+couteuses (assemblage, factorisation, resolution) et affiche le taux de
+compression (`N_COMPRESSED/N_OFFDIAG`) apres l'assemblage et a la fin de
+la factorisation. Ces deux compteurs sont deja des sommes GLOBALES
+(agregees par `MPI_ALLREDUCE` a l'interieur de `mpi_blr_matrix_mod.f90`) --
+identiques sur tous les processus, affiches une seule fois (rang 0).
+
+La barre de progression, elle, n'a la meme garantie que pour la
+factorisation et la resolution : ces deux boucles sont globalement
+synchronisees (un `MPI_BCAST` a chaque etape K), donc `K/NBLK` est un
+pourcentage d'avancement EXACT. L'assemblage, en revanche, n'a aucune
+synchronisation entre processus (chacun assemble ses blocs locaux de son
+cote) -- la barre affichee par le rang 0 n'est donc qu'une approximation
+(mais fidele, le decoupage bloc-cyclique equilibrant la charge entre
+processus). `MPI_ASSEMBLE_BLR_MATRIX` (etape d'assemblage) est PARTAGEE
+par les 2 variantes -- `example_blr_mpi_sans_pivot.f90` beneficie donc
+deja de sa barre de progression. En revanche, `SHOW_PROGRESS` n'a ete
+ajoute qu'aux routines de factorisation/resolution PIVOT
+(`MPI_BLR_MATRIX_LU_FACTOR_PIVOT`/`_SOLVE_PIVOT_2D`) -- les equivalents
+NOPIV (`MPI_BLR_MATRIX_LU_FACTOR_NOPIV`/`_SOLVE_2D`) n'ont pas encore cet
+argument optionnel.

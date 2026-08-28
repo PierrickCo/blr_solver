@@ -50,6 +50,7 @@ MODULE MPI_BLR_MATRIX_MOD
   USE BLR_COMPRESS_MOD
   USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE, DENSE_PANEL_T
+  USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
   IMPLICIT NONE
 
   TYPE :: MPI_BLR_MATRIX_T
@@ -87,7 +88,8 @@ CONTAINS
   ! indices GLOBAUX, comme en sequentiel).
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
-                                      T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM)
+                                      T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
+                                      SHOW_PROGRESS)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)        :: GRID
     INTEGER, INTENT(IN)             :: N, NB
@@ -97,11 +99,26 @@ CONTAINS
     DOUBLE PRECISION, INTENT(OUT)   :: T_ASSEMBLE_COMPRESS
     INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
     INTEGER(8), INTENT(OUT)         :: RANK_SUM
+    LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
 
     COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
-    INTEGER :: li, lj, I, J, MI, NJ, NC_LOCAL, NO_LOCAL, IERR
+    INTEGER :: li, lj, I, J, MI, NJ, NC_LOCAL, NO_LOCAL, IERR, NDONE, NTOTAL
     INTEGER(8) :: RS_LOCAL
     DOUBLE PRECISION :: T0
+    LOGICAL :: PROGRESS
+
+    ! La barre de progression est affichee UNIQUEMENT par le processus 0,
+    ! sur SA PROPRE part locale (NBLKR_LOC*NBLKC_LOC) -- pas de
+    ! synchronisation entre processus dans cette boucle (assemblage
+    ! "embarrassingly parallel", chaque processus assemble ses blocs sans
+    ! communication), donc pas de pourcentage GLOBAL exact possible sans
+    ! communication supplementaire. Approximation raisonnable : le
+    ! decoupage bloc-cyclique (BLOCK_NUMROC) equilibre la charge entre
+    ! processus, la progression du processus 0 suit donc de pres celle
+    ! des autres.
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    NDONE = 0
 
     T0 = MPI_WTIME()
     CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
@@ -111,6 +128,7 @@ CONTAINS
     A_BLR%NBLKC_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PC, GRID%MYCOL)
     ALLOCATE(A_BLR%DIAGBLK(A_BLR%NBLK))
     ALLOCATE(A_BLR%OFFBLK(MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1)))
+    NTOTAL = A_BLR%NBLKR_LOC * A_BLR%NBLKC_LOC
 
     NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8
 
@@ -136,6 +154,8 @@ CONTAINS
           END IF
           DEALLOCATE(TMP)
         END IF
+        NDONE = NDONE + 1
+        IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression (rang 0)', NDONE, NTOTAL)
       END DO
     END DO
     T_ASSEMBLE_COMPRESS = MPI_WTIME() - T0
@@ -407,7 +427,8 @@ CONTAINS
   ! verifier qu'un test de validation exerce reellement le code de pivot.
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
-                                             N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR)
+                                             N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
+                                             SHOW_PROGRESS)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)          :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(INOUT) :: A_BLR
@@ -417,6 +438,7 @@ CONTAINS
     INTEGER(8), INTENT(OUT)           :: RANK_SUM
     INTEGER, INTENT(OUT), OPTIONAL    :: N_SWAPS
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_FACTOR
+    LOGICAL, INTENT(IN), OPTIONAL     :: SHOW_PROGRESS
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
@@ -426,6 +448,15 @@ CONTAINS
     INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, NS_LOCAL, li_K
     INTEGER(8) :: RS_LOCAL
     DOUBLE PRECISION :: T0
+    LOGICAL :: PROGRESS
+
+    ! Boucle K=1..NBLK GLOBALEMENT synchronisee (MPI_BCAST a chaque etape,
+    ! voir plus bas) -- contrairement a l'assemblage, K/NBLK est ici un
+    ! pourcentage d'avancement EXACT (tous les processus traitent le meme K
+    ! au meme moment), pas une approximation. Affiche uniquement par le
+    ! processus 0 pour eviter des lignes entrelacees.
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
 
     T0 = MPI_WTIME()
     NBLK = A_BLR%NBLK
@@ -572,6 +603,8 @@ CONTAINS
           END IF
         END DO
       END DO
+
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU (pivot)', K, NBLK)
     END DO
 
     DEALLOCATE(LRECV, URECV)
@@ -796,20 +829,31 @@ CONTAINS
   ! CTRSM de substitution avant. La substitution arriere n'a besoin d'AUCUN
   ! pivot (U*X=Y ne depend pas de P -- convention standard P*A=L*U).
   !-----------------------------------------------------------------------
-  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB)
+  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)           :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(IN) :: A_BLR
     INTEGER, INTENT(IN)                :: NRHS, NRHS_LOC, LDB
     COMPLEX(WP), INTENT(INOUT)         :: B_LOCAL(MAX(LDB,1),MAX(NRHS_LOC,1))
+    LOGICAL, INTENT(IN), OPTIONAL      :: SHOW_PROGRESS
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
     INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
     INTEGER :: NBLK, K, li, lj, I, J, KW, MI, RS, RE, NROWTRAIL, C, IERR
-    INTEGER :: PROW_K, PCOL_K
+    INTEGER :: PROW_K, PCOL_K, STEP, NSTEPS
+    LOGICAL :: PROGRESS
+
+    ! Une seule barre pour toute la resolution (substitution avant PUIS
+    ! arriere, 2*NBLK etapes au total) -- comme la factorisation, chaque K
+    ! est GLOBALEMENT synchronise (MPI_BCAST a chaque etape), K/NBLK (ou
+    ! ici STEP/NSTEPS) est donc un pourcentage exact, pas une approximation.
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    STEP = 0
 
     NBLK = A_BLR%NBLK
+    NSTEPS = 2 * NBLK
     ALLOCATE(RSTARTS(0:GRID%PC-1), RLOCS(0:GRID%PC-1), RCOUNTS(0:GRID%PC-1), RDISPLS(0:GRID%PC-1))
     DO C = 0, GRID%PC-1
       CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
@@ -907,6 +951,8 @@ CONTAINS
         DEALLOCATE(CONTRIB, CONTRIB_LOC)
       END IF
       DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution (pivot)', STEP, NSTEPS)
     END DO
 
     ! === 2) U*X = Y (substitution arriere) -- AUCUN pivot necessaire ===
@@ -978,6 +1024,8 @@ CONTAINS
         DEALLOCATE(CONTRIB, CONTRIB_LOC)
       END IF
       DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution (pivot)', STEP, NSTEPS)
     END DO
 
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
