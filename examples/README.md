@@ -53,14 +53,26 @@ la factorisation. Ces deux compteurs sont deja des sommes GLOBALES
 (agregees par `MPI_ALLREDUCE` a l'interieur de `mpi_blr_matrix_mod.f90`) --
 identiques sur tous les processus, affiches une seule fois (rang 0).
 
-La barre de progression, elle, n'a la meme garantie que pour la
+L'affichage de progression, lui, n'a la meme garantie que pour la
 factorisation et la resolution : ces deux boucles sont globalement
 synchronisees (un `MPI_BCAST` a chaque etape K), donc `K/NBLK` est un
 pourcentage d'avancement EXACT. L'assemblage, en revanche, n'a aucune
 synchronisation entre processus (chacun assemble ses blocs locaux de son
-cote) -- la barre affichee par le rang 0 n'est donc qu'une approximation
-(mais fidele, le decoupage bloc-cyclique equilibrant la charge entre
-processus). `MPI_ASSEMBLE_BLR_MATRIX` (etape d'assemblage) est PARTAGEE
+cote) -- l'affichage du rang 0 n'est donc qu'une approximation (mais
+fidele, le decoupage bloc-cyclique equilibrant la charge entre
+processus).
+
+**Affichage par paliers, pas par barre a rafraichissement en place** :
+les routines MPI utilisent `PRINT_PROGRESS_MILESTONE` (une ligne complete
+tous les 5%), pas `PRINT_PROGRESS_BAR` (barre a base de retour chariot
+`CHAR(13)`, utilisee par le pipeline sequentiel `blr_matrix_mod.f90`) --
+`mpirun` relaie le stdout de chaque processus via un pipe, pas un
+pseudo-terminal, donc le retour chariot n'est PAS interprete comme
+"ecraser la ligne precedente" : chaque appel finirait sur SA PROPRE
+ligne (bug constate et corrige). Voir `src/progress_bar_mod.f90` pour le
+detail des deux mecanismes.
+
+`MPI_ASSEMBLE_BLR_MATRIX` (etape d'assemblage) est PARTAGEE
 par les 2 variantes -- `example_blr_mpi_sans_pivot.f90` beneficie donc
 deja de sa barre de progression. En revanche, `SHOW_PROGRESS` n'a ete
 ajoute qu'aux routines de factorisation/resolution PIVOT
