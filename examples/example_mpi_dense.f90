@@ -79,6 +79,9 @@ PROGRAM EXAMPLE_MPI_DENSE
       IF (GI .EQ. GJ) A_LOCAL(I,J) = A_LOCAL(I,J) + CMPLX(REAL(N,WP), 0.0_WP, KIND=WP)
     END DO
   END DO
+  ! Empreinte THEORIQUE (8 octets/element, COMPLEX(WP) simple precision) --
+  ! PAS mesuree via l'OS (voir CLUSTER.md pour la RSS reelle).
+  CALL REPORT_MEMORY_MB(GRID, 'Matrice A (dense)', 8_8*INT(MLOC,8)*INT(NLOC,8))
 
   ALLOCATE(IPIV_GLOBAL(N))
   CALL MPI_LU_PIVOT_FACTOR(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, INFO, N_SWAPS=N_SWAPS, &
@@ -89,6 +92,10 @@ PROGRAM EXAMPLE_MPI_DENSE
     STOP 1
   END IF
   IF (MYID0.EQ.0) WRITE(6,'(A,I0)') ' Nombre de permutations de lignes (pivot) : ', N_SWAPS
+  ! Facteurs L/U ecrasent A_LOCAL EN PLACE (meme stockage, meme taille --
+  ! contrairement au BLR, il n'y a ici aucun phenomene de remplissage qui
+  ! ferait grossir/retrecir l'empreinte entre la matrice et ses facteurs).
+  CALL REPORT_MEMORY_MB(GRID, 'Facteurs LU (dense)', 8_8*INT(MLOC,8)*INT(NLOC,8))
 
   ! --- second membre distribue PAR LIGNES (comme A) ET PAR COLONNES sur
   !     NRHS -- meme principe : formule deterministe, sans communication --
@@ -100,6 +107,7 @@ PROGRAM EXAMPLE_MPI_DENSE
       B_LOCAL(I,J) = CMPLX(REAL(GI,WP)*0.01_WP, -0.5_WP*REAL(GJ,WP), KIND=WP)
     END DO
   END DO
+  CALL REPORT_MEMORY_MB(GRID, 'Second membre B', 8_8*INT(MLOC,8)*INT(NRHS_LOC,8))
 
   CALL MPI_LU_SOLVE_DISTRIBUTED_2D(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, &
                                     NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE.)

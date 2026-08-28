@@ -44,6 +44,35 @@ pas de fichier d'entree), factorise, resout un second membre arbitraire,
 et affiche les premieres valeurs de la solution -- point de depart a
 adapter (callback `GET_BLOCK`, second membre) pour un probleme reel.
 
+## Empreinte memoire theorique (solveurs MPI)
+
+Les 3 exemples MPI (`example_mpi_dense.f90`, `example_blr_mpi_sans_pivot.f90`,
+`example_blr_mpi_pivot.f90`) affichent, a 3 moments cles, l'empreinte
+memoire THEORIQUE (calculee a partir des tailles de tableaux -- PAS
+mesuree via l'OS, voir `GET_RSS_KB`/`CLUSTER.md` pour la RSS reelle) :
+
+1. **Matrice** (dense ou compressee BLR) juste apres l'assemblage.
+2. **Facteurs LU** juste apres la factorisation -- pour la reference MPI
+   (dense), c'est EXACTEMENT la meme valeur qu'a l'assemblage (facteurs
+   ecrasent la matrice en place, aucune compression ne peut changer la
+   taille) ; pour BLR+MPI, cette valeur peut DIFFERER de celle de
+   l'assemblage a cause du remplissage ("fill-in") introduit par la mise
+   a jour de Schur -- observe concretement sur `example_blr_mpi_pivot`
+   (matrice 1.9 Mo -> facteurs 2.0 Mo a N=1000/NB=100/grille 2x2).
+3. **Second membre B** juste apres son allocation/remplissage.
+
+Chaque ligne affiche DEUX nombres (`REPORT_MEMORY_MB`, nouvelle routine
+partagee de `mpi_grid_mod.f90`) : le **total** agrege sur toute la grille
+(`MPI_ALLREDUCE`/`MPI_SUM`, utile pour la capacite globale du cluster) et
+le **maximum par-processus** (`MPI_ALLREDUCE`/`MPI_MAX`, c'est LUI qui
+determine si le job tient dans la RAM de chaque noeud -- la contrainte
+qui bloque reellement un job, pas le total). Pour BLR+MPI, la memoire de
+la matrice/des facteurs reutilise directement `MPI_BLR_MATRIX_MEMORY_
+BYTES` (deja existante) ; pour la reference MPI dense et le second
+membre (les deux BLR+MPI inclus), c'est une simple formule
+`lignes_locales * colonnes_locales * 8 octets` (`COMPLEX(WP)` simple
+precision).
+
 ## Barres de progression et taux de compression
 
 Les 5 exemples activent `SHOW_PROGRESS=.TRUE.` sur chacune de leurs etapes

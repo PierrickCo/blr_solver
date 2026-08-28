@@ -82,6 +82,10 @@ PROGRAM EXAMPLE_BLR_MPI_SANS_PIVOT
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (assemblage) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
          ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
   END IF
+  ! Empreinte THEORIQUE (blocs BLR_BLOCK_T reellement stockes -- dense pour
+  ! les blocs diagonaux/repli, UFAC*VFAC pour les blocs basse-rang), PAS
+  ! mesuree via l'OS.
+  CALL REPORT_MEMORY_MB(GRID, 'Matrice A_BLR (compressee)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
 
   ! --- 2) factorisation LU, SANS pivot -----------------------------------
   ! SHOW_PROGRESS=.TRUE. : ici K/NBLK est un pourcentage EXACT (boucle
@@ -99,6 +103,11 @@ PROGRAM EXAMPLE_BLR_MPI_SANS_PIVOT
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (fin factorisation) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
          ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
   END IF
+  ! A_BLR est factorisee EN PLACE (les facteurs L/U ecrasent DIAGBLK/OFFBLK) --
+  ! cette valeur peut differer de celle de l'assemblage : le remplissage
+  ! (fill-in) de la mise a jour de Schur peut faire grossir le rang de
+  ! certains blocs (voire les faire tomber en repli dense).
+  CALL REPORT_MEMORY_MB(GRID, 'Facteurs LU (compresses)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
 
   ! --- 3) second membre B, distribue par blocs-lignes (comme A_BLR, via
   !     NBLKR_LOC/BSTART/BEND) ET par colonnes sur NRHS -- formule
@@ -114,6 +123,7 @@ PROGRAM EXAMPLE_BLR_MPI_SANS_PIVOT
 
   ALLOCATE(B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
   CALL FILL_B(A_BLR, GRID, NRHS_LOC, RSTART_MINE, B_LOCAL, MLOC)
+  CALL REPORT_MEMORY_MB(GRID, 'Second membre B', 8_8*INT(MLOC,8)*INT(NRHS_LOC,8))
 
   ! --- 4) resolution 2D --------------------------------------------------
   ! SHOW_PROGRESS=.TRUE. : pourcentage exact, meme raison que la

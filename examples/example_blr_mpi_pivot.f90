@@ -86,6 +86,9 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (assemblage) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
          ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
   END IF
+  ! Empreinte THEORIQUE (blocs BLR_BLOCK_T reellement stockes), PAS
+  ! mesuree via l'OS.
+  CALL REPORT_MEMORY_MB(GRID, 'Matrice A_BLR (compressee)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
 
   ! --- 2) factorisation LU, AVEC pivot confine au bloc diagonal ----------
   ! SHOW_PROGRESS=.TRUE. : ici K/NBLK est un pourcentage EXACT (boucle
@@ -104,6 +107,9 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (fin factorisation) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
          ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
   END IF
+  ! A_BLR est factorisee EN PLACE -- cette valeur peut differer de celle
+  ! de l'assemblage (fill-in de la mise a jour de Schur).
+  CALL REPORT_MEMORY_MB(GRID, 'Facteurs LU (compresses)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
 
   ! --- 3) second membre B, distribue par blocs-lignes ET par colonnes sur
   !     NRHS -- formule deterministe, sans communication ---
@@ -117,6 +123,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
 
   ALLOCATE(B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
   CALL FILL_B(A_BLR, GRID, NRHS_LOC, RSTART_MINE, B_LOCAL, MLOC)
+  CALL REPORT_MEMORY_MB(GRID, 'Second membre B', 8_8*INT(MLOC,8)*INT(NRHS_LOC,8))
 
   ! --- 4) resolution 2D, AVEC pivot (applique la meme sequence de swaps
   !     que celle utilisee a la factorisation, deja diffusee a la grille) --

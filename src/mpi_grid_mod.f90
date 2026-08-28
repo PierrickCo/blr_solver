@@ -169,6 +169,37 @@ CONTAINS
   END SUBROUTINE REPORT_THREAD_AFFINITY
 
   !-----------------------------------------------------------------------
+  ! Affiche l'empreinte memoire THEORIQUE (calculee a partir des tailles
+  ! de tableaux, PAS mesuree via l'OS -- voir GET_RSS_KB/bench_utils_mod.f90
+  ! pour la RSS reelle, qui inclut l'overhead allocateur et les copies
+  ! transitoires) d'une quantite donnee (matrice, facteurs LU, second
+  ! membre...), en Mo, sous DEUX formes : le TOTAL agrege sur toute la
+  ! grille (utile pour la capacite globale du cluster) et le MAXIMUM
+  ! par-processus (utile pour verifier que CHAQUE noeud/processus tient
+  ! dans sa RAM disponible -- c'est la contrainte qui bloque reellement un
+  ! job, pas le total). BYTES_LOCAL : empreinte de CE processus SEUL,
+  ! calculee par l'appelant (ex: MLOC*NLOC*8 pour un tableau dense
+  ! COMPLEX(WP), ou MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR) pour du BLR
+  ! compresse) -- reduite ici via MPI_ALLREDUCE (SUM et MAX).
+  !-----------------------------------------------------------------------
+  SUBROUTINE REPORT_MEMORY_MB(GRID, LABEL, BYTES_LOCAL)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    CHARACTER(LEN=*), INTENT(IN)    :: LABEL
+    INTEGER(8), INTENT(IN)          :: BYTES_LOCAL
+    DOUBLE PRECISION :: MB_LOCAL, MB_TOTAL, MB_MAX
+    INTEGER :: IERR
+
+    MB_LOCAL = REAL(BYTES_LOCAL,8) / 1024.0D0 / 1024.0D0
+    CALL MPI_ALLREDUCE(MB_LOCAL, MB_TOTAL, 1, MPI_DOUBLE_PRECISION, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(MB_LOCAL, MB_MAX,   1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (GRID%MYID .EQ. 0) THEN
+      WRITE(6,'(A,A,A,F10.1,A,F10.1,A)') '   ', LABEL, ' : total = ', MB_TOTAL, &
+           ' Mo , max/processus = ', MB_MAX, ' Mo'
+    END IF
+  END SUBROUTINE REPORT_MEMORY_MB
+
+  !-----------------------------------------------------------------------
   ! Lit le masque d'affinite CPU du processus courant (/proc/self/status,
   ! champ "Cpus_allowed", format hexadecimal eventuellement groupe par
   ! virgules pour les masques > 32 bits) et le decode en tableau 0/1
