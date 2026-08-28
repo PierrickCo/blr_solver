@@ -55,13 +55,13 @@ PROGRAM EXAMPLE_BLR_SEQUENTIEL
   ! GET_BLOCK est un callback fourni par l'appelant (voir plus bas) : il
   ! ne calcule qu'UN bloc a la fois, jamais de tableau N x N dense complet
   ! en memoire, meme pour une tres grande matrice.
-  CALL ASSEMBLE_BLR_MATRIX(N, NB, TOL, GET_BLOCK, A_BLR, T_ASM, N_COMP, N_OFF, RANK_SUM)
+  CALL ASSEMBLE_BLR_MATRIX(N, NB, TOL, GET_BLOCK, A_BLR, T_ASM, N_COMP, N_OFF, RANK_SUM, SHOW_PROGRESS=.TRUE.)
   WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
   WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses : ', N_COMP, ' / ', N_OFF, ' (', &
        100.0_WP*REAL(N_COMP,WP)/REAL(MAX(N_OFF,1),WP), ' %)'
 
   ! --- 2) factorisation LU directement sur la matrice compressee --------
-  CALL BLR_MATRIX_LU_FACTOR(A_BLR, TOL, INFO, N_COMP, N_OFF, RANK_SUM, T_FACT)
+  CALL BLR_MATRIX_LU_FACTOR(A_BLR, TOL, INFO, N_COMP, N_OFF, RANK_SUM, T_FACT, SHOW_PROGRESS=.TRUE.)
   IF (INFO .NE. 0) THEN
     WRITE(6,'(A,I0)') ' ERREUR BLR_MATRIX_LU_FACTOR, INFO=', INFO
     STOP 1
@@ -79,7 +79,7 @@ PROGRAM EXAMPLE_BLR_SEQUENTIEL
       B(I,J) = CMPLX(REAL(I,WP)*0.01_WP, -0.3_WP*REAL(J,WP), KIND=WP)
     END DO
   END DO
-  CALL BLR_MATRIX_LU_SOLVE(A_BLR, NRHS, B, N)
+  CALL BLR_MATRIX_LU_SOLVE(A_BLR, NRHS, B, N, SHOW_PROGRESS=.TRUE.)
 
   WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
   DO I = 1, MIN(5, N)

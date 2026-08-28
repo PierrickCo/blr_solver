@@ -37,10 +37,10 @@ blr_kinds_mod.o: $(SRC)/blr_kinds_mod.f90
 
 # --- Reference C : LU par blocs dense, sans compression (NB=N degenere en
 # un seul CGETRF monolithique, voir bench_seq.f90) -----------------------
-test_block_lu: blr_kinds_mod.o block_lu_mod.o test_block_lu.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o block_lu_mod.o test_block_lu.o $(LIBS)
+test_block_lu: blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o test_block_lu.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o test_block_lu.o $(LIBS)
 
-block_lu_mod.o: $(SRC)/block_lu_mod.f90 blr_kinds_mod.o
+block_lu_mod.o: $(SRC)/block_lu_mod.f90 blr_kinds_mod.o progress_bar_mod.o
 	$(FC) $(OPTF) -c $(SRC)/block_lu_mod.f90
 
 test_block_lu.o: $(TEST)/test_block_lu.f90 block_lu_mod.o
@@ -71,10 +71,10 @@ test_mpi_grid.o: $(TEST)/test_mpi_grid.f90 mpi_grid_mod.o
 # Reutilise block_lu_mod.o (compile via FC=ifx) tel quel a l'edition de
 # liens : ifx et mpiifx sont le meme compilateur sous-jacent (mpiifx
 # ajoute seulement les includes/libs MPI), .o/.mod directement compatibles.
-test_mpi_lu_pivot: blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o block_lu_mod.o test_mpi_lu_pivot.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o block_lu_mod.o test_mpi_lu_pivot.o $(MPILIBS)
+test_mpi_lu_pivot: blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o block_lu_mod.o test_mpi_lu_pivot.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o block_lu_mod.o test_mpi_lu_pivot.o $(MPILIBS)
 
-mpi_lu_pivot_mod.o: $(SRC)/mpi_lu_pivot_mod.f90 mpi_grid_mod.o
+mpi_lu_pivot_mod.o: $(SRC)/mpi_lu_pivot_mod.f90 mpi_grid_mod.o progress_bar_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_lu_pivot_mod.f90
 
 test_mpi_lu_pivot.o: $(TEST)/test_mpi_lu_pivot.f90 mpi_lu_pivot_mod.o block_lu_mod.o
@@ -90,8 +90,8 @@ mpi_blr_lu_pivot_bcast_mod.o: $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90 mpi_grid_mod
 # --- Case "dense + OpenMP" : pas de directive OMP a nous (un seul gros
 # CGEMM par panneau, deja thread par MKL) -- ce test MESURE que
 # l'acceleration existe quand meme plutot que de l'affirmer.
-test_openmp_dense: blr_kinds_mod.o block_lu_mod.o test_openmp_dense.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o block_lu_mod.o test_openmp_dense.o $(LIBS)
+test_openmp_dense: blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o test_openmp_dense.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o test_openmp_dense.o $(LIBS)
 
 test_openmp_dense.o: $(TEST)/test_openmp_dense.f90 block_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_openmp_dense.f90
@@ -101,24 +101,24 @@ bench_utils_mod.o: $(SRC)/bench_utils_mod.f90
 	$(FC) $(OPTF) -c $(SRC)/bench_utils_mod.f90
 
 # reference C
-bench_seq: blr_kinds_mod.o block_lu_mod.o bench_utils_mod.o bench_seq.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o block_lu_mod.o bench_utils_mod.o bench_seq.o $(LIBS)
+bench_seq: blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o bench_utils_mod.o bench_seq.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o bench_utils_mod.o bench_seq.o $(LIBS)
 
 bench_seq.o: $(TEST)/bench_seq.f90 block_lu_mod.o bench_utils_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/bench_seq.f90
 
 # reference MPI (dense+pivot + resolution 2D)
-bench_mpi: blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o block_lu_mod.o bench_utils_mod.o bench_mpi.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o block_lu_mod.o bench_utils_mod.o bench_mpi.o $(MPILIBS)
+bench_mpi: blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o block_lu_mod.o bench_utils_mod.o bench_mpi.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o block_lu_mod.o bench_utils_mod.o bench_mpi.o $(MPILIBS)
 
 bench_mpi.o: $(TEST)/bench_mpi.f90 mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o block_lu_mod.o bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/bench_mpi.f90
 
 # --- Resolution MPI distribuee, vraie distribution 2D du second membre --
-test_mpi_lu_solve_2d: blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o test_mpi_lu_solve_2d.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o test_mpi_lu_solve_2d.o $(MPILIBS)
+test_mpi_lu_solve_2d: blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o test_mpi_lu_solve_2d.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o test_mpi_lu_solve_2d.o $(MPILIBS)
 
-mpi_lu_solve_2d_mod.o: $(SRC)/mpi_lu_solve_2d_mod.f90 mpi_grid_mod.o mpi_lu_pivot_mod.o
+mpi_lu_solve_2d_mod.o: $(SRC)/mpi_lu_solve_2d_mod.f90 mpi_grid_mod.o mpi_lu_pivot_mod.o progress_bar_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_lu_solve_2d_mod.f90
 
 test_mpi_lu_solve_2d.o: $(TEST)/test_mpi_lu_solve_2d.f90 mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o
@@ -186,14 +186,14 @@ example_blr_sequentiel: blr_kinds_mod.o blr_compress_mod.o progress_bar_mod.o th
 $(EX)/example_blr_sequentiel.o: $(EX)/example_blr_sequentiel.f90 blr_matrix_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(EX)/example_blr_sequentiel.f90 -o $(EX)/example_blr_sequentiel.o
 
-example_dense_sequentiel: blr_kinds_mod.o block_lu_mod.o $(EX)/example_dense_sequentiel.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o block_lu_mod.o $(EX)/example_dense_sequentiel.o $(LIBS)
+example_dense_sequentiel: blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o $(EX)/example_dense_sequentiel.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o block_lu_mod.o $(EX)/example_dense_sequentiel.o $(LIBS)
 
 $(EX)/example_dense_sequentiel.o: $(EX)/example_dense_sequentiel.f90 block_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(EX)/example_dense_sequentiel.f90 -o $(EX)/example_dense_sequentiel.o
 
-example_mpi_dense: blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o $(EX)/example_mpi_dense.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o $(EX)/example_mpi_dense.o $(MPILIBS)
+example_mpi_dense: blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o $(EX)/example_mpi_dense.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o $(EX)/example_mpi_dense.o $(MPILIBS)
 
 $(EX)/example_mpi_dense.o: $(EX)/example_mpi_dense.f90 mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_mpi_dense.f90 -o $(EX)/example_mpi_dense.o

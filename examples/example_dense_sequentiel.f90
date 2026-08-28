@@ -48,14 +48,17 @@ PROGRAM EXAMPLE_DENSE_SEQUENTIEL
   END DO
 
   ! --- factorisation (A ecrase par L\U, IPIV = permutation des lignes) --
-  CALL BLOCK_LU_FACTOR(N, NB, A, N, IPIV, INFO, N_SWAPS=N_SWAPS)
+  CALL BLOCK_LU_FACTOR(N, NB, A, N, IPIV, INFO, N_SWAPS=N_SWAPS, SHOW_PROGRESS=.TRUE.)
   IF (INFO .NE. 0) THEN
     WRITE(6,'(A,I0)') ' ERREUR BLOCK_LU_FACTOR, INFO=', INFO
     STOP 1
   END IF
   WRITE(6,'(A,I0)') ' Nombre de permutations de lignes (pivot) : ', N_SWAPS
 
-  ! --- resolution, B ecrase par la solution ------------------------------
+  ! --- resolution, B ecrase par la solution -------------------------------
+  ! Pas de barre de progression ici : BLOCK_LU_SOLVE resout en UN SEUL
+  ! appel CTRSM par triangle (pas de boucle par bloc a instrumenter) --
+  ! deja tres rapide (O(N^2), pas O(N^3) comme la factorisation).
   CALL BLOCK_LU_SOLVE(N, NB, NRHS, A, N, IPIV, B, N)
 
   WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X :'

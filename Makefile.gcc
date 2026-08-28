@@ -59,10 +59,10 @@ $(BUILDDIR)/blr_kinds_mod.o: $(SRC)/blr_kinds_mod.f90 $(BUILDDIR)/.dirstamp
 	$(FC) $(OPTF) -c $(SRC)/blr_kinds_mod.f90 -o $@
 
 # --- Reference C ----------------------------------------------------------
-$(BUILDDIR)/test_block_lu: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_block_lu.o
-	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_block_lu.o $(LIBS)
+$(BUILDDIR)/test_block_lu: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_block_lu.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_block_lu.o $(LIBS)
 
-$(BUILDDIR)/block_lu_mod.o: $(SRC)/block_lu_mod.f90 $(BUILDDIR)/blr_kinds_mod.o
+$(BUILDDIR)/block_lu_mod.o: $(SRC)/block_lu_mod.f90 $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o
 	$(FC) $(OPTF) -c $(SRC)/block_lu_mod.f90 -o $@
 
 $(BUILDDIR)/test_block_lu.o: $(TEST)/test_block_lu.f90 $(BUILDDIR)/block_lu_mod.o
@@ -89,10 +89,10 @@ $(BUILDDIR)/test_mpi_grid.o: $(TEST)/test_mpi_grid.f90 $(BUILDDIR)/mpi_grid_mod.
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_grid.f90 -o $@
 
 # --- Reference MPI (base) --------------------------------------------------
-$(BUILDDIR)/test_mpi_lu_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_mpi_lu_pivot.o
-	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_mpi_lu_pivot.o $(MPILIBS)
+$(BUILDDIR)/test_mpi_lu_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_mpi_lu_pivot.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_mpi_lu_pivot.o $(MPILIBS)
 
-$(BUILDDIR)/mpi_lu_pivot_mod.o: $(SRC)/mpi_lu_pivot_mod.f90 $(BUILDDIR)/mpi_grid_mod.o
+$(BUILDDIR)/mpi_lu_pivot_mod.o: $(SRC)/mpi_lu_pivot_mod.f90 $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/progress_bar_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_lu_pivot_mod.f90 -o $@
 
 $(BUILDDIR)/test_mpi_lu_pivot.o: $(TEST)/test_mpi_lu_pivot.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/block_lu_mod.o
@@ -102,8 +102,8 @@ $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o: $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90 
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90 -o $@
 
 # --- Case "dense + OpenMP" --------------------------------------------------
-$(BUILDDIR)/test_openmp_dense: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_openmp_dense.o
-	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_openmp_dense.o $(LIBS)
+$(BUILDDIR)/test_openmp_dense: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_openmp_dense.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/test_openmp_dense.o $(LIBS)
 
 $(BUILDDIR)/test_openmp_dense.o: $(TEST)/test_openmp_dense.f90 $(BUILDDIR)/block_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_openmp_dense.f90 -o $@
@@ -112,23 +112,23 @@ $(BUILDDIR)/test_openmp_dense.o: $(TEST)/test_openmp_dense.f90 $(BUILDDIR)/block
 $(BUILDDIR)/bench_utils_mod.o: $(SRC)/bench_utils_mod.f90 $(BUILDDIR)/.dirstamp
 	$(FC) $(OPTF) -c $(SRC)/bench_utils_mod.f90 -o $@
 
-$(BUILDDIR)/bench_seq: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_seq.o
-	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_seq.o $(LIBS)
+$(BUILDDIR)/bench_seq: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_seq.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_seq.o $(LIBS)
 
 $(BUILDDIR)/bench_seq.o: $(TEST)/bench_seq.f90 $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/bench_seq.f90 -o $@
 
-$(BUILDDIR)/bench_mpi: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_mpi.o
-	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_mpi.o $(MPILIBS)
+$(BUILDDIR)/bench_mpi: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_mpi.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/bench_mpi.o $(MPILIBS)
 
 $(BUILDDIR)/bench_mpi.o: $(TEST)/bench_mpi.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/bench_mpi.f90 -o $@
 
 # --- Resolution MPI distribuee 2D ------------------------------------------
-$(BUILDDIR)/test_mpi_lu_solve_2d: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/test_mpi_lu_solve_2d.o
-	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/test_mpi_lu_solve_2d.o $(MPILIBS)
+$(BUILDDIR)/test_mpi_lu_solve_2d: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/test_mpi_lu_solve_2d.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/test_mpi_lu_solve_2d.o $(MPILIBS)
 
-$(BUILDDIR)/mpi_lu_solve_2d_mod.o: $(SRC)/mpi_lu_solve_2d_mod.f90 $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o
+$(BUILDDIR)/mpi_lu_solve_2d_mod.o: $(SRC)/mpi_lu_solve_2d_mod.f90 $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/progress_bar_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_lu_solve_2d_mod.f90 -o $@
 
 $(BUILDDIR)/test_mpi_lu_solve_2d.o: $(TEST)/test_mpi_lu_solve_2d.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
@@ -190,14 +190,14 @@ $(BUILDDIR)/example_blr_sequentiel: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/blr_
 $(BUILDDIR)/example_blr_sequentiel.o: $(EX)/example_blr_sequentiel.f90 $(BUILDDIR)/blr_matrix_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(EX)/example_blr_sequentiel.f90 -o $@
 
-$(BUILDDIR)/example_dense_sequentiel: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/example_dense_sequentiel.o
-	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/example_dense_sequentiel.o $(LIBS)
+$(BUILDDIR)/example_dense_sequentiel: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/example_dense_sequentiel.o
+	$(FC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/block_lu_mod.o $(BUILDDIR)/example_dense_sequentiel.o $(LIBS)
 
 $(BUILDDIR)/example_dense_sequentiel.o: $(EX)/example_dense_sequentiel.f90 $(BUILDDIR)/block_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(EX)/example_dense_sequentiel.f90 -o $@
 
-$(BUILDDIR)/example_mpi_dense: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/example_mpi_dense.o
-	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/example_mpi_dense.o $(MPILIBS)
+$(BUILDDIR)/example_mpi_dense: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/example_mpi_dense.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/example_mpi_dense.o $(MPILIBS)
 
 $(BUILDDIR)/example_mpi_dense.o: $(EX)/example_mpi_dense.f90 $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_mpi_dense.f90 -o $@

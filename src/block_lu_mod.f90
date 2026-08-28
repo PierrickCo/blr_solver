@@ -55,6 +55,7 @@
 !===============================================================================
 MODULE BLOCK_LU_MOD
   USE BLR_KINDS_MOD, ONLY: WP
+  USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
   IMPLICIT NONE
 
 CONTAINS
@@ -69,22 +70,34 @@ CONTAINS
   ! factorisation. Sert a VERIFIER qu'un test sollicite reellement le pivot
   ! partiel (matrice a diagonale dominante = souvent N_SWAPS~0, peu
   ! probant) plutot que de le supposer -- cf. test/test_pivoting.f90.
+  !
+  ! SHOW_PROGRESS (optionnel) : barre a rafraichissement en place (voir
+  ! progress_bar_mod.f90) -- OK ici, contrairement aux routines MPI de ce
+  ! projet, puisque ce module est sequentiel/OpenMP, attache a un vrai
+  ! terminal (pas de relai stdout par un lanceur MPI qui casserait le
+  ! retour chariot).
   !-----------------------------------------------------------------------
-  SUBROUTINE BLOCK_LU_FACTOR(N, NB, A, LDA, IPIV, INFO, N_SWAPS, MIN_PIVOT)
+  SUBROUTINE BLOCK_LU_FACTOR(N, NB, A, LDA, IPIV, INFO, N_SWAPS, MIN_PIVOT, SHOW_PROGRESS)
     INTEGER, INTENT(IN)             :: N, NB, LDA
     COMPLEX(WP), INTENT(INOUT)      :: A(LDA,N)
     INTEGER, INTENT(OUT)            :: IPIV(N)
     INTEGER, INTENT(OUT)            :: INFO
     INTEGER, INTENT(OUT), OPTIONAL  :: N_SWAPS
     REAL(WP), INTENT(OUT), OPTIONAL :: MIN_PIVOT
+    LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP, 0.0_WP)
-    INTEGER :: KSTART, KEND, KW, IINFO, II, NS
+    INTEGER :: KSTART, KEND, KW, IINFO, II, NS, KPANEL, NPANELS
     REAL(WP) :: MP
+    LOGICAL :: PROGRESS
 
     INFO = 0
     NS = 0
     MP = HUGE(1.0_WP)
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS
+    NPANELS = (N + NB - 1) / NB
+    KPANEL = 0
     KSTART = 1
     DO WHILE (KSTART .LE. N)
       KEND = MIN(KSTART + NB - 1, N)
@@ -122,6 +135,9 @@ CONTAINS
                     -CONE, A(KEND+1,KSTART), LDA, A(KSTART,KEND+1), LDA, &
                     CONE, A(KEND+1,KEND+1), LDA)
       END IF
+
+      KPANEL = KPANEL + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('Factorisation LU par blocs', KPANEL, NPANELS)
 
       KSTART = KEND + 1
     END DO

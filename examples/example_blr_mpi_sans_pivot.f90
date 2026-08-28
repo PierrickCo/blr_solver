@@ -70,23 +70,35 @@ PROGRAM EXAMPLE_BLR_MPI_SANS_PIVOT
   !     processus UNIQUEMENT pour les blocs qu'il possede (distribution
   !     bloc-cyclique 2D sur la grille) -- jamais de matrice N x N dense,
   !     ni locale ni globale, meme transitoirement. ---
+  ! SHOW_PROGRESS=.TRUE. : barre affichee par le processus 0 (approximative
+  ! ici, l'assemblage n'est pas synchronise entre processus).
   CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, T_ASM, &
-                                N_COMPRESSED, N_OFFDIAG, RANK_SUM)
+                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE.)
+  ! N_COMPRESSED/N_OFFDIAG sont deja des sommes GLOBALES (MPI_ALLREDUCE
+  ! interne a MPI_ASSEMBLE_BLR_MATRIX) -- identiques sur tous les
+  ! processus, un seul affichage (rang 0) suffit.
   IF (MYID0.EQ.0) THEN
     WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
-    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (processus 0) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (assemblage) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
          ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
   END IF
 
   ! --- 2) factorisation LU, SANS pivot -----------------------------------
+  ! SHOW_PROGRESS=.TRUE. : ici K/NBLK est un pourcentage EXACT (boucle
+  ! globalement synchronisee par les diffusions a chaque etape K).
   CALL MPI_BLR_MATRIX_LU_FACTOR_NOPIV(GRID, A_BLR, TOL, INFO, &
-                                       N_COMPRESSED, N_OFFDIAG, RANK_SUM, T_FACTOR)
+                                       N_COMPRESSED, N_OFFDIAG, RANK_SUM, T_FACTOR, &
+                                       SHOW_PROGRESS=.TRUE.)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_NOPIV, INFO=', INFO
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
-  IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Factorisation LU : ', T_FACTOR, ' s'
+  IF (MYID0.EQ.0) THEN
+    WRITE(6,'(A,F8.3,A)') ' Factorisation LU : ', T_FACTOR, ' s'
+    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Taux de compression (fin factorisation) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+         ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+  END IF
 
   ! --- 3) second membre B, distribue par blocs-lignes (comme A_BLR, via
   !     NBLKR_LOC/BSTART/BEND) ET par colonnes sur NRHS -- formule
@@ -104,7 +116,9 @@ PROGRAM EXAMPLE_BLR_MPI_SANS_PIVOT
   CALL FILL_B(A_BLR, GRID, NRHS_LOC, RSTART_MINE, B_LOCAL, MLOC)
 
   ! --- 4) resolution 2D --------------------------------------------------
-  CALL MPI_BLR_MATRIX_LU_SOLVE_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1))
+  ! SHOW_PROGRESS=.TRUE. : pourcentage exact, meme raison que la
+  ! factorisation.
+  CALL MPI_BLR_MATRIX_LU_SOLVE_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE.)
 
   ! --- rassemblement de la solution complete sur le processus 0 pour
   !     affichage (dans un cas reel, on garderait X distribue si la suite

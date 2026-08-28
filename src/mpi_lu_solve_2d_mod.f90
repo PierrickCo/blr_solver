@@ -56,6 +56,7 @@ MODULE MPI_LU_SOLVE_2D_MOD
   USE BLR_KINDS_MOD, ONLY: WP
   USE MPI_GRID_MOD
   USE MPI_LU_PIVOT_MOD, ONLY: SWAP_ROWS_RANGE
+  USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE
   IMPLICIT NONE
 
 CONTAINS
@@ -97,8 +98,13 @@ CONTAINS
   ! B_LOCAL : distribue PAR LIGNES comme A (MLOC, meme NUMROC/PR que A) ET
   ! PAR COLONNES sur les seconds membres (NRHS_LOC, RHS_NUMROC/PC ci-dessus)
   ! -- AUCUNE replication residuelle, contrairement a mpi_lu_solve_mod.f90.
+  ! SHOW_PROGRESS (optionnel) : voir MPI_LU_PIVOT_FACTOR ci-dessus pour la
+  ! justification (affichage par paliers, pas par barre en place -- mpirun
+  ! casse le retour chariot). Une seule barre pour les 2 sous-etapes
+  ! (substitution avant + arriere, 2*NBLK etapes), chacune globalement
+  ! synchronisee -- pourcentage exact.
   SUBROUTINE MPI_LU_SOLVE_DISTRIBUTED_2D(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, &
-                                          NRHS, NRHS_LOC, B_LOCAL, LDB)
+                                          NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)     :: GRID
     INTEGER, INTENT(IN)          :: N, NB, MLOC, NLOC
@@ -106,6 +112,7 @@ CONTAINS
     INTEGER, INTENT(IN)          :: IPIV_GLOBAL(N)
     INTEGER, INTENT(IN)          :: NRHS, NRHS_LOC, LDB
     COMPLEX(WP), INTENT(INOUT)   :: B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1))
+    LOGICAL, INTENT(IN), OPTIONAL :: SHOW_PROGRESS
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:)
@@ -114,9 +121,15 @@ CONTAINS
     INTEGER :: NBLK, K, KSTART, KEND, KW
     INTEGER :: PROW_K, PCOL_K, RS, CS
     INTEGER :: RTRAIL0, NROWTRAIL, RHEAD, I, R1, R2, PROW2, C
-    INTEGER :: IERR
+    INTEGER :: IERR, STEP, NSTEPS, LAST_PCT
+    LOGICAL :: PROGRESS
 
     NBLK = (N + NB - 1) / NB
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    STEP = 0
+    NSTEPS = 2 * NBLK
+    LAST_PCT = -5
 
     ! Tranches RHS de TOUTES les colonnes de grille -- calcul local, sans
     ! communication, reutilise a chaque etape pour les RECVCOUNTS/DISPLS.
@@ -209,6 +222,8 @@ CONTAINS
         DEALLOCATE(CONTRIB, CONTRIB_LOC)
       END IF
       DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('Resolution MPI 2D', STEP, NSTEPS, LAST_PCT)
     END DO
 
     ! === 2) U*X = Y (substitution arriere) -- meme schema, tetes au lieu
@@ -275,6 +290,8 @@ CONTAINS
         DEALLOCATE(CONTRIB, CONTRIB_LOC)
       END IF
       DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('Resolution MPI 2D', STEP, NSTEPS, LAST_PCT)
     END DO
 
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)

@@ -81,7 +81,8 @@ PROGRAM EXAMPLE_MPI_DENSE
   END DO
 
   ALLOCATE(IPIV_GLOBAL(N))
-  CALL MPI_LU_PIVOT_FACTOR(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, INFO, N_SWAPS=N_SWAPS)
+  CALL MPI_LU_PIVOT_FACTOR(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, INFO, N_SWAPS=N_SWAPS, &
+                            SHOW_PROGRESS=.TRUE.)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_LU_PIVOT_FACTOR, INFO=', INFO
     CALL MPI_FINALIZE(IERR)
@@ -101,7 +102,7 @@ PROGRAM EXAMPLE_MPI_DENSE
   END DO
 
   CALL MPI_LU_SOLVE_DISTRIBUTED_2D(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, &
-                                    NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1))
+                                    NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE.)
 
   ! --- rassemblement de la solution complete sur le processus 0 pour
   !     affichage (dans un cas reel, on garderait X distribue si la suite

@@ -69,12 +69,21 @@
 MODULE MPI_LU_PIVOT_MOD
   USE BLR_KINDS_MOD, ONLY: WP
   USE MPI_GRID_MOD
+  USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE
   IMPLICIT NONE
 
 CONTAINS
 
+  ! SHOW_PROGRESS (optionnel) : affichage par PALIERS (PRINT_PROGRESS_
+  ! MILESTONE, pas la barre a rafraichissement en place) -- ce module
+  ! tourne sous MPI/mpirun, qui relaie le stdout de chaque processus via
+  ! un pipe et casse le retour chariot (voir progress_bar_mod.f90 et
+  ! mpi_blr_matrix_mod.f90 pour le detail du bug rencontre/corrige).
+  ! K/NBLK est un pourcentage EXACT (boucle globalement synchronisee par
+  ! les diffusions a chaque etape K) -- affiche uniquement par le
+  ! processus 0.
   SUBROUTINE MPI_LU_PIVOT_FACTOR(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, &
-                                  INFO, N_SWAPS, MIN_PIVOT)
+                                  INFO, N_SWAPS, MIN_PIVOT, SHOW_PROGRESS)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)        :: GRID
     INTEGER, INTENT(IN)             :: N, NB, MLOC, NLOC
@@ -83,6 +92,7 @@ CONTAINS
     INTEGER, INTENT(OUT)            :: INFO
     INTEGER, INTENT(OUT), OPTIONAL  :: N_SWAPS
     REAL(WP), INTENT(OUT), OPTIONAL :: MIN_PIVOT
+    LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: PANEL(:,:), RBUF(:,:), SBUF(:,:), DKK(:,:), LBUF(:,:), UBUF(:,:)
@@ -91,7 +101,8 @@ CONTAINS
     INTEGER :: PROW_K, PCOL_K, OWNER_RANK, RS, CS, RSTART0, NROWS_MINE
     INTEGER :: R, RMLOC_R, RSTART0_R, RNROWS_R, I, J, GI
     INTEGER :: LEFT_COUNT, RIGHT_COUNT, RTRAIL0, CTRAIL0, NROWTRAIL, NCOLTRAIL
-    INTEGER :: R1, R2, PROW2, IINFO, INFO_STEP, IERR, NS
+    INTEGER :: R1, R2, PROW2, IINFO, INFO_STEP, IERR, NS, LAST_PCT
+    LOGICAL :: PROGRESS
     INTEGER :: STATUS(MPI_STATUS_SIZE)
     REAL(WP) :: MP
 
@@ -99,6 +110,9 @@ CONTAINS
     NS = 0
     MP = HUGE(1.0_WP)
     NBLK = (N + NB - 1) / NB
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    LAST_PCT = -5
 
     DO K = 1, NBLK
       KSTART = (K-1)*NB + 1
@@ -285,6 +299,8 @@ CONTAINS
 
       IF (NROWTRAIL .GT. 0) DEALLOCATE(LBUF)
       IF (NCOLTRAIL .GT. 0) DEALLOCATE(UBUF)
+
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('Factorisation LU MPI (pivot)', K, NBLK, LAST_PCT)
     END DO
 
     IF (PRESENT(N_SWAPS)) N_SWAPS = NS

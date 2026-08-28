@@ -51,20 +51,20 @@ test_blr_ldlt.o: $(TEST)/test_blr_ldlt.f90 block_ldlt_mod.o blr_ldlt_mod.o
 blr_lu_mod.o: $(SRC)/blr_lu_mod.f90 $(MAIN)/blr_compress_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(SRC)/blr_lu_mod.f90
 
-test_blr_lu: $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_blr_lu.o
-	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_blr_lu.o $(LIBS)
+test_blr_lu: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_blr_lu.o
+	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_blr_lu.o $(LIBS)
 
 test_blr_lu.o: $(TEST)/test_blr_lu.f90 $(MAIN)/block_lu_mod.o blr_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_lu.f90
 
-test_pivoting: $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_pivoting.o
-	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_pivoting.o $(LIBS)
+test_pivoting: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_pivoting.o
+	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_pivoting.o $(LIBS)
 
 test_pivoting.o: $(TEST)/test_pivoting.f90 $(MAIN)/block_lu_mod.o blr_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_pivoting.f90
 
-test_openmp: $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_openmp.o
-	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_openmp.o $(LIBS)
+test_openmp: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_openmp.o
+	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o test_openmp.o $(LIBS)
 
 test_openmp.o: $(TEST)/test_openmp.f90 blr_lu_mod.o $(MAIN)/block_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_openmp.f90
@@ -72,14 +72,14 @@ test_openmp.o: $(TEST)/test_openmp.f90 blr_lu_mod.o $(MAIN)/block_lu_mod.o
 blr_lu_storage_mod.o: $(SRC)/blr_lu_storage_mod.f90 $(MAIN)/block_lu_mod.o blr_lu_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(SRC)/blr_lu_storage_mod.f90
 
-test_blr_lu_storage: $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o test_blr_lu_storage.o
-	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o test_blr_lu_storage.o $(LIBS)
+test_blr_lu_storage: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o test_blr_lu_storage.o
+	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o test_blr_lu_storage.o $(LIBS)
 
 test_blr_lu_storage.o: $(TEST)/test_blr_lu_storage.f90 blr_lu_storage_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_lu_storage.f90
 
-bench_seq_full: $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o $(MAIN)/bench_utils_mod.o bench_seq_full.o
-	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o $(MAIN)/bench_utils_mod.o bench_seq_full.o $(LIBS)
+bench_seq_full: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o $(MAIN)/bench_utils_mod.o bench_seq_full.o
+	$(FC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/blr_compress_mod.o blr_lu_mod.o blr_lu_storage_mod.o $(MAIN)/bench_utils_mod.o bench_seq_full.o $(LIBS)
 
 bench_seq_full.o: $(TEST)/bench_seq_full.f90 blr_lu_storage_mod.o $(MAIN)/bench_utils_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/bench_seq_full.f90
@@ -107,14 +107,14 @@ test_mpi_lu_nopiv.o: $(TEST)/test_mpi_lu_nopiv.f90 mpi_lu_nopiv_mod.o
 mpi_lu_solve_mod.o: $(SRC)/mpi_lu_solve_mod.f90 $(MAIN)/mpi_grid_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(SRC)/mpi_lu_solve_mod.f90
 
-test_mpi_lu_solve: $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_lu_solve_mod.o test_mpi_lu_solve.o
-	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_lu_solve_mod.o test_mpi_lu_solve.o $(MPILIBS)
+test_mpi_lu_solve: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_lu_solve_mod.o test_mpi_lu_solve.o
+	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_lu_solve_mod.o test_mpi_lu_solve.o $(MPILIBS)
 
 test_mpi_lu_solve.o: $(TEST)/test_mpi_lu_solve.f90 $(MAIN)/mpi_lu_pivot_mod.o mpi_lu_solve_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_lu_solve.f90
 
-bench_mpi_full: $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_lu_solve_mod.o $(MAIN)/mpi_lu_solve_2d_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/bench_utils_mod.o bench_mpi_full.o
-	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_lu_solve_mod.o $(MAIN)/mpi_lu_solve_2d_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/bench_utils_mod.o bench_mpi_full.o $(MPILIBS)
+bench_mpi_full: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_lu_solve_mod.o $(MAIN)/mpi_lu_solve_2d_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/bench_utils_mod.o bench_mpi_full.o
+	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_lu_solve_mod.o $(MAIN)/mpi_lu_solve_2d_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/bench_utils_mod.o bench_mpi_full.o $(MPILIBS)
 
 bench_mpi_full.o: $(TEST)/bench_mpi_full.f90 $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_lu_solve_mod.o $(MAIN)/mpi_lu_solve_2d_mod.o $(MAIN)/block_lu_mod.o $(MAIN)/bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/bench_mpi_full.f90
@@ -126,14 +126,14 @@ bench_mpi_full.o: $(TEST)/bench_mpi_full.f90 $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_
 mpi_blr_lu_pivot_mod.o: $(SRC)/mpi_blr_lu_pivot_mod.f90 $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(SRC)/mpi_blr_lu_pivot_mod.f90
 
-test_mpi_blr_lu_pivot: $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot.o
-	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot.o $(MPILIBS)
+test_mpi_blr_lu_pivot: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot.o
+	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o mpi_blr_lu_pivot_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot.o $(MPILIBS)
 
 test_mpi_blr_lu_pivot.o: $(TEST)/test_mpi_blr_lu_pivot.f90 mpi_blr_lu_pivot_mod.o $(MAIN)/block_lu_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_lu_pivot.f90
 
-test_mpi_blr_lu_pivot_bcast: $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot_bcast.o
-	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot_bcast.o $(MPILIBS)
+test_mpi_blr_lu_pivot_bcast: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot_bcast.o
+	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o $(MAIN)/block_lu_mod.o test_mpi_blr_lu_pivot_bcast.o $(MPILIBS)
 
 test_mpi_blr_lu_pivot_bcast.o: $(TEST)/test_mpi_blr_lu_pivot_bcast.f90 $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o $(MAIN)/block_lu_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_lu_pivot_bcast.f90
@@ -142,8 +142,8 @@ test_mpi_blr_lu_pivot_bcast.o: $(TEST)/test_mpi_blr_lu_pivot_bcast.f90 $(MAIN)/m
 mpi_blr_lu_nopiv_mod.o: $(SRC)/mpi_blr_lu_nopiv_mod.f90 $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o mpi_lu_nopiv_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(SRC)/mpi_blr_lu_nopiv_mod.f90
 
-test_mpi_blr_lu_nopiv: $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o mpi_lu_nopiv_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_blr_lu_nopiv_mod.o test_mpi_blr_lu_nopiv.o
-	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o mpi_lu_nopiv_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_blr_lu_nopiv_mod.o test_mpi_blr_lu_nopiv.o $(MPILIBS)
+test_mpi_blr_lu_nopiv: $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o mpi_lu_nopiv_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_blr_lu_nopiv_mod.o test_mpi_blr_lu_nopiv.o
+	$(MPIFC) -o $@ $(OPTF) $(MAIN)/blr_kinds_mod.o $(MAIN)/progress_bar_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o mpi_lu_nopiv_mod.o $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o mpi_blr_lu_nopiv_mod.o test_mpi_blr_lu_nopiv.o $(MPILIBS)
 
 test_mpi_blr_lu_nopiv.o: $(TEST)/test_mpi_blr_lu_nopiv.f90 mpi_blr_lu_nopiv_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_lu_nopiv.f90

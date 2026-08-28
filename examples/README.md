@@ -44,38 +44,44 @@ pas de fichier d'entree), factorise, resout un second membre arbitraire,
 et affiche les premieres valeurs de la solution -- point de depart a
 adapter (callback `GET_BLOCK`, second membre) pour un probleme reel.
 
-## Barres de progression et taux de compression (BLR+MPI avec pivot)
+## Barres de progression et taux de compression
 
-`example_blr_mpi_pivot.f90` active `SHOW_PROGRESS=.TRUE.` sur les 3 etapes
-couteuses (assemblage, factorisation, resolution) et affiche le taux de
-compression (`N_COMPRESSED/N_OFFDIAG`) apres l'assemblage et a la fin de
-la factorisation. Ces deux compteurs sont deja des sommes GLOBALES
-(agregees par `MPI_ALLREDUCE` a l'interieur de `mpi_blr_matrix_mod.f90`) --
+Les 5 exemples activent `SHOW_PROGRESS=.TRUE.` sur chacune de leurs etapes
+couteuses (assemblage, factorisation, resolution) -- couverture complete
+des 5 solveurs de reference, pas seulement BLR+MPI. Seule exception :
+`BLOCK_LU_SOLVE` (reference C, dense sequentiel) n'a pas de barre --
+elle resout en un seul appel `CTRSM` par triangle, sans boucle par bloc a
+instrumenter (deja tres rapide, `O(N^2)`, pas `O(N^3)` comme la
+factorisation).
+
+Les deux exemples BLR+MPI (`example_blr_mpi_sans_pivot.f90`,
+`example_blr_mpi_pivot.f90`) affichent en plus le taux de compression
+(`N_COMPRESSED/N_OFFDIAG`) apres l'assemblage et a la fin de la
+factorisation. Ces deux compteurs sont deja des sommes GLOBALES (agregees
+par `MPI_ALLREDUCE` a l'interieur de `mpi_blr_matrix_mod.f90`) --
 identiques sur tous les processus, affiches une seule fois (rang 0).
 
-L'affichage de progression, lui, n'a la meme garantie que pour la
-factorisation et la resolution : ces deux boucles sont globalement
-synchronisees (un `MPI_BCAST` a chaque etape K), donc `K/NBLK` est un
-pourcentage d'avancement EXACT. L'assemblage, en revanche, n'a aucune
-synchronisation entre processus (chacun assemble ses blocs locaux de son
-cote) -- l'affichage du rang 0 n'est donc qu'une approximation (mais
-fidele, le decoupage bloc-cyclique equilibrant la charge entre
-processus).
+**Deux mecanismes d'affichage distincts** (voir `src/progress_bar_mod.f90`) :
+- **Sequentiel/OpenMP** (`example_blr_sequentiel.f90`,
+  `example_dense_sequentiel.f90`) : `PRINT_PROGRESS_BAR`, une barre a
+  rafraichissement en place (retour chariot `CHAR(13)`) -- fonctionne
+  correctement, attache a un vrai terminal.
+- **MPI** (les 3 autres exemples, et les modules `mpi_lu_pivot_mod.f90`/
+  `mpi_lu_solve_2d_mod.f90`/`mpi_blr_matrix_mod.f90` sous-jacents) :
+  `PRINT_PROGRESS_MILESTONE`, un affichage par PALIERS (une ligne complete
+  tous les 5%) -- `mpirun` relaie le stdout de chaque processus via un
+  pipe, pas un pseudo-terminal, donc le retour chariot n'y est PAS
+  interprete comme "ecraser la ligne precedente" : la barre en place
+  finissait par polluer la sortie d'une ligne par mise a jour (bug
+  constate et corrige) -- d'ou l'affichage par paliers, robuste quel que
+  soit le lanceur.
 
-**Affichage par paliers, pas par barre a rafraichissement en place** :
-les routines MPI utilisent `PRINT_PROGRESS_MILESTONE` (une ligne complete
-tous les 5%), pas `PRINT_PROGRESS_BAR` (barre a base de retour chariot
-`CHAR(13)`, utilisee par le pipeline sequentiel `blr_matrix_mod.f90`) --
-`mpirun` relaie le stdout de chaque processus via un pipe, pas un
-pseudo-terminal, donc le retour chariot n'est PAS interprete comme
-"ecraser la ligne precedente" : chaque appel finirait sur SA PROPRE
-ligne (bug constate et corrige). Voir `src/progress_bar_mod.f90` pour le
-detail des deux mecanismes.
-
-`MPI_ASSEMBLE_BLR_MATRIX` (etape d'assemblage) est PARTAGEE
-par les 2 variantes -- `example_blr_mpi_sans_pivot.f90` beneficie donc
-deja de sa barre de progression. En revanche, `SHOW_PROGRESS` n'a ete
-ajoute qu'aux routines de factorisation/resolution PIVOT
-(`MPI_BLR_MATRIX_LU_FACTOR_PIVOT`/`_SOLVE_PIVOT_2D`) -- les equivalents
-NOPIV (`MPI_BLR_MATRIX_LU_FACTOR_NOPIV`/`_SOLVE_2D`) n'ont pas encore cet
-argument optionnel.
+Pour les 3 boucles de factorisation/resolution MPI (reference MPI et
+BLR+MPI, avec ou sans pivot), le pourcentage affiche est EXACT : chaque
+etape K est globalement synchronisee (un `MPI_BCAST`/diffusion a chaque
+K), donc `K/NBLK` (ou l'equivalent pour la resolution, 2 sous-etapes)
+represente le meme etat sur tous les processus. Seul l'assemblage BLR+MPI
+fait exception : aucune synchronisation entre processus a cette etape
+(chacun assemble ses blocs locaux de son cote) -- l'affichage du rang 0
+n'est donc qu'une approximation (mais fidele, le decoupage bloc-cyclique
+equilibrant la charge entre processus).
