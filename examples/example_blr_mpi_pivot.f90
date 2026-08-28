@@ -22,6 +22,7 @@
 PROGRAM EXAMPLE_BLR_MPI_PIVOT
   USE MPI_BLR_MATRIX_MOD
   USE MPI_LU_SOLVE_2D_MOD, ONLY: GATHER_2D_RHS
+  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
   INCLUDE 'mpif.h'
 
@@ -89,6 +90,18 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! Empreinte THEORIQUE (blocs BLR_BLOCK_T reellement stockes), PAS
   ! mesuree via l'OS.
   CALL REPORT_MEMORY_MB(GRID, 'Matrice A_BLR (compressee)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
+  ! RSS REELLE (mesuree, /proc/self/status) -- forcement >= la valeur
+  ! theorique ci-dessus : elle inclut aussi tout le reste du processus
+  ! (workspaces SVD/QR transitoires par thread, runtime MPI/MKL charge en
+  ! memoire, l'executable lui-meme, l'allocateur qui ne rend jamais toute
+  ! la memoire liberee a l'OS...). Le RATIO RSS/theorique n'est PAS
+  ! constant : a petite echelle (N~2000), l'overhead FIXE (runtime
+  ! MPI/MKL, ~50-70 Mo/processus rien qu'au demarrage) domine largement
+  ! et donne un ratio enorme (>60x, mesure) ; a plus grande echelle
+  ! (N~20000), les donnees elles-memes dominent et le ratio se stabilise
+  ! autour de 2.5-3x (mesure) -- c'est ce second regime qui sert de
+  ! reference pour detecter une VRAIE anomalie (fuite, copie oubliee).
+  CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage)', GET_RSS_KB()*1024_8)
 
   ! --- 2) factorisation LU, AVEC pivot confine au bloc diagonal ----------
   ! SHOW_PROGRESS=.TRUE. : ici K/NBLK est un pourcentage EXACT (boucle
@@ -110,6 +123,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! A_BLR est factorisee EN PLACE -- cette valeur peut differer de celle
   ! de l'assemblage (fill-in de la mise a jour de Schur).
   CALL REPORT_MEMORY_MB(GRID, 'Facteurs LU (compresses)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
+  CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres factorisation)', GET_RSS_KB()*1024_8)
 
   ! --- 3) second membre B, distribue par blocs-lignes ET par colonnes sur
   !     NRHS -- formule deterministe, sans communication ---
@@ -124,6 +138,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ALLOCATE(B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
   CALL FILL_B(A_BLR, GRID, NRHS_LOC, RSTART_MINE, B_LOCAL, MLOC)
   CALL REPORT_MEMORY_MB(GRID, 'Second membre B', 8_8*INT(MLOC,8)*INT(NRHS_LOC,8))
+  CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres allocation B)', GET_RSS_KB()*1024_8)
 
   ! --- 4) resolution 2D, AVEC pivot (applique la meme sequence de swaps
   !     que celle utilisee a la factorisation, deja diffusee a la grille) --

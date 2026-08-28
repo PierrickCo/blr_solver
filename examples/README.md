@@ -73,6 +73,17 @@ membre (les deux BLR+MPI inclus), c'est une simple formule
 `lignes_locales * colonnes_locales * 8 octets` (`COMPLEX(WP)` simple
 precision).
 
+**Comparaison a la RSS reelle** (`example_blr_mpi_pivot.f90` uniquement,
+via `GET_RSS_KB()`/`bench_utils_mod.f90`, meme mecanisme `REPORT_MEMORY_
+MB`) : la RSS mesuree est TOUJOURS superieure a la valeur theorique
+(elle inclut le runtime MPI/MKL charge en memoire, les workspaces
+SVD/QR transitoires par thread, l'executable lui-meme...), mais le
+RATIO n'est PAS constant -- mesure sur ce projet : ~65x a N=2000 (l'
+overhead fixe du runtime domine a cette echelle), ~2.5-3x a N=20000
+(les donnees elles-memes dominent). C'est ce second regime (grande
+echelle) qui sert de reference pour detecter une vraie anomalie (fuite,
+copie transitoire oubliee) -- pas un ratio absolu independant de N.
+
 ## Barres de progression et taux de compression
 
 Les 5 exemples activent `SHOW_PROGRESS=.TRUE.` sur chacune de leurs etapes

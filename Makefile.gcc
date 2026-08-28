@@ -208,10 +208,10 @@ $(BUILDDIR)/example_blr_mpi_sans_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/
 $(BUILDDIR)/example_blr_mpi_sans_pivot.o: $(EX)/example_blr_mpi_sans_pivot.f90 $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_sans_pivot.f90 -o $@
 
-$(BUILDDIR)/example_blr_mpi_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/example_blr_mpi_pivot.o
-	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/example_blr_mpi_pivot.o $(MPILIBS)
+$(BUILDDIR)/example_blr_mpi_pivot: $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/example_blr_mpi_pivot.o
+	$(MPIFC) -o $@ $(OPTF) $(BUILDDIR)/blr_kinds_mod.o $(BUILDDIR)/mpi_grid_mod.o $(BUILDDIR)/blr_compress_mod.o $(BUILDDIR)/progress_bar_mod.o $(BUILDDIR)/thread_control_mod.o $(BUILDDIR)/blr_matrix_mod.o $(BUILDDIR)/mpi_blr_lu_pivot_bcast_mod.o $(BUILDDIR)/mpi_lu_pivot_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/bench_utils_mod.o $(BUILDDIR)/example_blr_mpi_pivot.o $(MPILIBS)
 
-$(BUILDDIR)/example_blr_mpi_pivot.o: $(EX)/example_blr_mpi_pivot.f90 $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o
+$(BUILDDIR)/example_blr_mpi_pivot.o: $(EX)/example_blr_mpi_pivot.f90 $(BUILDDIR)/mpi_blr_matrix_mod.o $(BUILDDIR)/mpi_lu_solve_2d_mod.o $(BUILDDIR)/bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_pivot.f90 -o $@
 
 clean:
