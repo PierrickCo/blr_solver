@@ -1,6 +1,6 @@
 # Exemples canoniques
 
-Cinq programmes courts, un par paradigme du projet (voir le tableau de
+Six programmes courts, un par paradigme du projet (voir le tableau de
 [`README.md`](../README.md)), montrant l'enchainement minimal d'appels
 pour chaque solveur -- sans l'instrumentation de mesure ni la validation
 croisee contre une reference independante des drivers de `test/`/`bench/`
@@ -14,6 +14,7 @@ croisee contre une reference independante des drivers de `test/`/`bench/`
 | `example_mpi_dense.f90` | MPI | MPI, LU dense distribue, pivot, resolution 2D |
 | `example_blr_mpi_sans_pivot.f90` | BLR+MPI | MPI, stockage BLR distribue, sans pivot (diagonale dominante) |
 | `example_blr_mpi_pivot.f90` | BLR+MPI | MPI, stockage BLR distribue, pivot confine au bloc diagonal |
+| `example_blr_mpi_pivot_arena.f90` | BLR+MPI | Identique, stockage bas-rang carve dans un allocateur arena (voir `../README.md`) |
 
 ## Compiler
 

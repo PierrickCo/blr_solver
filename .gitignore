@@ -15,7 +15,10 @@ bench_mpi
 test_mpi_lu_solve_2d
 test_mpi_blr_matrix
 test_mpi_blr_matrix_pivot
+test_mpi_blr_matrix_pivot_arena
 bench_blr_pipeline
+bench_blr_mpi_pivot_compressibility
+bench_blr_mpi_pivot_ratio
 test_blr_matrix_progress
 test_blr_workspace
 
@@ -25,6 +28,8 @@ example_dense_sequentiel
 example_mpi_dense
 example_blr_mpi_sans_pivot
 example_blr_mpi_pivot
+example_blr_mpi_pivot_arena
+example_blr_mpi_pivot_fixedcap
 examples/*.o
 
 # Binaire du micro-benchmark de diagnostic (pas dans le Makefile,

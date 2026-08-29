@@ -65,6 +65,51 @@ MODULE MPI_BLR_MATRIX_MOD
                                                           ! routine), non alloue/non pertinent pour la variante NOPIV.
   END TYPE MPI_BLR_MATRIX_T
 
+  !-----------------------------------------------------------------------
+  ! Variante ARENA de MPI_BLR_MATRIX_T (voir "Peux tu mettre en place le
+  ! seul vrai correctif, arena sur toute la factorisation, tout en gardant
+  ! les executables actuels ?" -- correctif de l'ecart RSS-vs-theorique
+  ! documente dans blr_arena_mod.f90/examples/README.md). SEULE difference
+  ! structurelle : OFFBLK est un tableau de BLR_BLOCK_ARENA_T (composantes
+  ! POINTER, vues carvees dans ARENA) au lieu de BLR_BLOCK_T (composantes
+  ! ALLOCATABLE, un ALLOCATE/DEALLOCATE par bloc et par recompression --
+  ! source de la fragmentation de tas mesuree). DIAGBLK reste ALLOCATABLE
+  ! (dense, jamais recompresse, pas concerne par la fragmentation).
+  !
+  ! Type ENTIEREMENT NOUVEAU : MPI_BLR_MATRIX_T et toutes les routines qui
+  ! l'utilisent (MPI_ASSEMBLE_BLR_MATRIX, MPI_BLR_MATRIX_LU_FACTOR_PIVOT,
+  ! MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D, etc.) restent INCHANGEES -- tous les
+  ! executables existants continuent d'utiliser MPI_BLR_MATRIX_T tel quel,
+  ! permettant une comparaison A/B directe avec les nouvelles routines
+  ! *_ARENA ci-dessous.
+  !-----------------------------------------------------------------------
+  TYPE :: MPI_BLR_MATRIX_ARENA_T
+    INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
+    INTEGER, ALLOCATABLE :: BSTART(:), BEND(:)
+    TYPE(DENSE_PANEL_T), ALLOCATABLE      :: DIAGBLK(:)
+    TYPE(BLR_BLOCK_ARENA_T), ALLOCATABLE  :: OFFBLK(:,:)
+    INTEGER, ALLOCATABLE :: IPIV(:,:)
+    TYPE(BLR_ARENA_T) :: ARENA
+  END TYPE MPI_BLR_MATRIX_ARENA_T
+
+  !-----------------------------------------------------------------------
+  ! Variante "CAPACITE FIXE" (demande explicite : "les blocs LR stoquent
+  ! le maximum de rang que COMPRESS_WORTHWHILE_RATIO le permet ; les
+  ! echanges MPI et les operations associees ne se font que sur le rang
+  ! REEL") -- voir BLR_BLOCK_FIXEDCAP_T (blr_compress_mod.f90) pour le
+  ! principe complet. Contrairement a MPI_BLR_MATRIX_ARENA_T, AUCUN champ
+  ! ARENA ici -- chaque bloc gere sa propre capacite RMAX via de simples
+  ! composantes ALLOCATABLE, aucun allocateur/pool partage, aucun attribut
+  ! TARGET necessaire nulle part dans cette variante.
+  !-----------------------------------------------------------------------
+  TYPE :: MPI_BLR_MATRIX_FIXEDCAP_T
+    INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
+    INTEGER, ALLOCATABLE :: BSTART(:), BEND(:)
+    TYPE(DENSE_PANEL_T), ALLOCATABLE         :: DIAGBLK(:)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), ALLOCATABLE  :: OFFBLK(:,:)
+    INTEGER, ALLOCATABLE :: IPIV(:,:)
+  END TYPE MPI_BLR_MATRIX_FIXEDCAP_T
+
 CONTAINS
 
   !-----------------------------------------------------------------------
@@ -1114,5 +1159,1146 @@ CONTAINS
       RS = RS + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
     END DO
   END FUNCTION LOCAL_ROW_OFFSET
+
+  !=========================================================================
+  ! VARIANTES ARENA (MPI_BLR_MATRIX_ARENA_T) -- voir le type ci-dessus et
+  ! blr_arena_mod.f90/blr_compress_mod.f90 pour la justification complete.
+  ! Chaque routine ci-dessous est le miroir EXACT de sa version non-arena
+  ! (meme algorithme, meme sequence de communications MPI) -- seule la
+  ! mecanique de stockage des blocs hors-diagonale change (carve dans
+  ! ARENA au lieu d'ALLOCATE/DEALLOCATE individuels).
+  !=========================================================================
+
+  !-----------------------------------------------------------------------
+  ! Variante ARENA de l'etape 1 (voir MPI_ASSEMBLE_BLR_MATRIX) --
+  ! COMPRESS_BLOCK_ARENA au lieu de COMPRESS_BLOCK, sinon identique.
+  !
+  ! TARGET sur A_BLR (dummy) : NECESSAIRE, pas juste prudent -- par les
+  ! regles Fortran d'association d'argument, un pointeur carve par
+  ! ARENA_CARVE (au fond de la chaine d'appel, dans COMPRESS_BLOCK_ARENA)
+  ! ne reste valide APRES le retour de cet appel QUE SI l'argument effectif
+  ! passe a ce niveau (ici A_BLR%ARENA) a lui-meme l'attribut TARGET a CE
+  ! niveau d'appel -- ce qui remonte, de proche en proche, jusqu'a exiger
+  ! que A_BLR (dummy ICI) soit TARGET, ET que la variable A_BLR de
+  ! l'appelant (l'exemple) le soit aussi (voir
+  ! example_blr_mpi_pivot_arena.f90). Sans cela, les pointeurs UFAC/VFAC/
+  ! DENSE des blocs deviendraient indefinis des la sortie de cette routine.
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_ARENA(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
+                                            T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
+                                            SHOW_PROGRESS)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    INTEGER, INTENT(IN)             :: N, NB
+    REAL(WP), INTENT(IN)            :: TOL
+    PROCEDURE(GET_BLOCK_IFACE)      :: GET_BLOCK
+    TYPE(MPI_BLR_MATRIX_ARENA_T), INTENT(OUT), TARGET :: A_BLR
+    DOUBLE PRECISION, INTENT(OUT)   :: T_ASSEMBLE_COMPRESS
+    INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
+    INTEGER(8), INTENT(OUT)         :: RANK_SUM
+    LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
+
+    COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
+    INTEGER :: li, lj, I, J, MI, NJ, NC_LOCAL, NO_LOCAL, IERR, NDONE, NTOTAL, LAST_PCT
+    INTEGER(8) :: RS_LOCAL
+    DOUBLE PRECISION :: T0
+    LOGICAL :: PROGRESS
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    NDONE = 0
+    LAST_PCT = -5
+
+    T0 = MPI_WTIME()
+    CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
+    A_BLR%N = N
+    A_BLR%NB = NB
+    A_BLR%NBLKR_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PR, GRID%MYROW)
+    A_BLR%NBLKC_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PC, GRID%MYCOL)
+    ALLOCATE(A_BLR%DIAGBLK(A_BLR%NBLK))
+    ALLOCATE(A_BLR%OFFBLK(MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1)))
+    NTOTAL = A_BLR%NBLKR_LOC * A_BLR%NBLKC_LOC
+
+    NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8
+
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        NJ = A_BLR%BEND(J) - A_BLR%BSTART(J) + 1
+        IF (I .EQ. J) THEN
+          ALLOCATE(A_BLR%DIAGBLK(I)%D(MI,MI))
+          CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), A_BLR%DIAGBLK(I)%D)
+        ELSE
+          ALLOCATE(TMP(MI,NJ))
+          CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMP)
+          CALL COMPRESS_BLOCK_ARENA(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(li,lj), A_BLR%ARENA)
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(MI,NJ)
+          END IF
+          DEALLOCATE(TMP)
+        END IF
+        NDONE = NDONE + 1
+        IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('1) Assemblage+compression arena (rang 0)', NDONE, NTOTAL, LAST_PCT)
+      END DO
+    END DO
+    T_ASSEMBLE_COMPRESS = MPI_WTIME() - T0
+
+    CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(RS_LOCAL, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+  END SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_ARENA
+
+  !-----------------------------------------------------------------------
+  ! Empreinte memoire ANALYTIQUE de la part LOCALE de A_BLR (octets) --
+  ! diagonale (ALLOCATABLE, inchangee) + ARENA_BYTES (voir blr_arena_mod.f90
+  ! -- INCLUT l'espace gaspille par les anciennes versions de blocs jamais
+  ! recuperees : chiffre HONNETE, pas seulement la donnee utile).
+  !-----------------------------------------------------------------------
+  FUNCTION MPI_BLR_MATRIX_ARENA_MEMORY_BYTES(A_BLR) RESULT(NBYTES)
+    TYPE(MPI_BLR_MATRIX_ARENA_T), INTENT(IN) :: A_BLR
+    INTEGER(8) :: NBYTES
+    INTEGER :: K
+    NBYTES = 0_8
+    DO K = 1, A_BLR%NBLK
+      IF (ALLOCATED(A_BLR%DIAGBLK(K)%D)) NBYTES = NBYTES + 8_8*INT(SIZE(A_BLR%DIAGBLK(K)%D),8)
+    END DO
+    NBYTES = NBYTES + ARENA_BYTES(A_BLR%ARENA)
+  END FUNCTION MPI_BLR_MATRIX_ARENA_MEMORY_BYTES
+
+  !-----------------------------------------------------------------------
+  ! DIAGNOSTIC TEMPORAIRE (a retirer une fois l'investigation terminee,
+  ! voir la memoire du projet -- reste ~6x de gaspillage arena apres le
+  ! correctif de reutilisation en place, ~x28 avant) : decompose
+  ! l'empreinte OFFBLK locale (ARENA_BYTES(A_BLR%ARENA)) en 3 categories,
+  ! pour verifier l'hypothese avant de coder quoi que ce soit de plus :
+  !
+  !   USED_BYTES   : taille LOGIQUE actuelle (ce que BLR_BLOCK_BYTES
+  !                  donnerait) -- la donnee VRAIMENT utile.
+  !   SLACK_BYTES  : capacite haute-marque INUTILISEE des blocs ENCORE
+  !                  bas-rang (UFAC_FLAT/VFAC_FLAT plus grands que le rang
+  !                  ACTUEL, souvenir d'un rang plus grand a une etape
+  !                  passee -- jamais retreci, voir ARENA_CARVE_REUSE).
+  !   ORPHAN_BYTES : buffers UFAC_FLAT/VFAC_FLAT ABANDONNES d'un bloc
+  !                  DEVENU dense entre-temps -- la bascule bas-rang->dense
+  !                  est DEFINITIVE (voir SCHUR_UPDATE_BLR_BLOCK_ARENA),
+  !                  donc ces buffers ne seront JAMAIS reutilises, mais
+  !                  restent comptes dans ARENA_BYTES pour toujours.
+  !
+  ! USED+SLACK+ORPHAN doit etre <= ARENA_BYTES(A_BLR%ARENA) ; l'ecart
+  ! residuel (s'il existe) est la fragmentation INTERNE aux chunks de
+  ! l'arena elle-meme (fin de chunk non comblee avant un changement de
+  ! chunk, voir blr_arena_mod.f90/ARENA_CARVE) -- generalement negligeable
+  ! face aux deux categories ci-dessus vu la taille des chunks (16 Mo).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_BLR_MATRIX_ARENA_MEMORY_DIAG(A_BLR, USED_BYTES, SLACK_BYTES, ORPHAN_BYTES)
+    TYPE(MPI_BLR_MATRIX_ARENA_T), INTENT(IN) :: A_BLR
+    INTEGER(8), INTENT(OUT) :: USED_BYTES, SLACK_BYTES, ORPHAN_BYTES
+    INTEGER :: li, lj
+
+    USED_BYTES = 0_8; SLACK_BYTES = 0_8; ORPHAN_BYTES = 0_8
+    DO lj = 1, A_BLR%NBLKC_LOC
+      DO li = 1, A_BLR%NBLKR_LOC
+        ASSOCIATE (B => A_BLR%OFFBLK(li,lj))
+          IF (B%IS_LOWRANK) THEN
+            USED_BYTES = USED_BYTES + 8_8*(INT(B%M,8)*INT(B%RANK,8) + INT(B%RANK,8)*INT(B%N,8))
+            IF (ASSOCIATED(B%UFAC_FLAT)) &
+                 SLACK_BYTES = SLACK_BYTES + 8_8*(SIZE(B%UFAC_FLAT,KIND=8) - INT(B%M,8)*INT(B%RANK,8))
+            IF (ASSOCIATED(B%VFAC_FLAT)) &
+                 SLACK_BYTES = SLACK_BYTES + 8_8*(SIZE(B%VFAC_FLAT,KIND=8) - INT(B%RANK,8)*INT(B%N,8))
+            IF (ASSOCIATED(B%DENSE_FLAT)) ORPHAN_BYTES = ORPHAN_BYTES + 8_8*SIZE(B%DENSE_FLAT,KIND=8)
+          ELSE
+            USED_BYTES = USED_BYTES + 8_8*INT(B%M,8)*INT(B%N,8)
+            IF (ASSOCIATED(B%UFAC_FLAT)) ORPHAN_BYTES = ORPHAN_BYTES + 8_8*SIZE(B%UFAC_FLAT,KIND=8)
+            IF (ASSOCIATED(B%VFAC_FLAT)) ORPHAN_BYTES = ORPHAN_BYTES + 8_8*SIZE(B%VFAC_FLAT,KIND=8)
+          END IF
+        END ASSOCIATE
+      END DO
+    END DO
+  END SUBROUTINE MPI_BLR_MATRIX_ARENA_MEMORY_DIAG
+
+  !-----------------------------------------------------------------------
+  ! Variante ARENA de MPI_BLR_MATRIX_LU_FACTOR_PIVOT -- voir ce dernier
+  ! pour le commentaire algorithmique complet (pivot confine au bloc
+  ! diagonal, CLASWP, etc.), INCHANGE ici. SEULES differences :
+  !   - etape 2 : BLR_BLOCK_ROW_SWAP_ARENA (idem, touche seulement UFAC)
+  !   - etapes 4/5 : BLR_TRSM_*_ARENA (idem, corps strictement identique)
+  !   - etape 6 : le proprietaire fait D'ABORD COPY_ARENA_TO_REGULAR (copie
+  !     profonde du bloc arena vers LRECV/URECV, BLR_BLOCK_T ordinaire),
+  !     PUIS diffuse DEPUIS cette copie via BCAST_BLR_BLOCK -- INCHANGEE,
+  !     jamais modifiee (elle ne sait pas lire un BLR_BLOCK_ARENA_T, type
+  !     different) : reordonner "copie-puis-diffuse" au lieu de
+  !     "diffuse-puis-copie" (ordre de la version non-arena) donne un
+  !     resultat RIGOUREUSEMENT identique (BCAST_BLR_BLOCK, cote racine,
+  !     ne lit jamais BLK%M/N -- seulement IS_LOWRANK/RANK/UFAC/VFAC/DENSE,
+  !     tous deja corrects dans la copie) sans toucher a une routine
+  !     partagee avec les executables existants.
+  !   - etape 7 : SCHUR_UPDATE_BLR_BLOCK_ARENA (carve dans A_BLR%ARENA) --
+  !     pas de USE_MOVE_ALLOC ici, non pertinent : la reaffectation de
+  !     pointeur DANS SCHUR_UPDATE_BLR_BLOCK_ARENA EST deja l'operation
+  !     "zero-copie" que MOVE_ALLOC approchait cote ALLOCATABLE.
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT_ARENA(GRID, A_BLR, TOL, INFO, &
+                                                   N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
+                                                   SHOW_PROGRESS, SHOW_RSS_TRACE)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)          :: GRID
+    TYPE(MPI_BLR_MATRIX_ARENA_T), INTENT(INOUT), TARGET :: A_BLR
+    REAL(WP), INTENT(IN)              :: TOL
+    INTEGER, INTENT(OUT)              :: INFO
+    INTEGER, INTENT(OUT)              :: N_COMPRESSED, N_OFFDIAG
+    INTEGER(8), INTENT(OUT)           :: RANK_SUM
+    INTEGER, INTENT(OUT), OPTIONAL    :: N_SWAPS
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_FACTOR
+    LOGICAL, INTENT(IN), OPTIONAL      :: SHOW_PROGRESS
+    ! Meme role que dans MPI_BLR_MATRIX_LU_FACTOR_PIVOT -- affiche la RSS
+    ! du processus 0 a chaque etape K, cette fois pour MESURER si l'arena
+    ! reduit effectivement l'ecart RSS-vs-theorique (voir memoire projet).
+    LOGICAL, INTENT(IN), OPTIONAL      :: SHOW_RSS_TRACE
+
+    COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
+    TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
+    TYPE(BLR_WORKSPACE_T) :: WS
+    INTEGER, ALLOCATABLE :: IPIV_K(:)
+    INTEGER :: NBLK, K, li, lj, I, J, KW, MI, NJ, IINFO, INFO_STEP
+    INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, NS_LOCAL, li_K, LAST_PCT
+    INTEGER(8) :: RS_LOCAL
+    DOUBLE PRECISION :: T0
+    LOGICAL :: PROGRESS, RSS_TRACE
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    LAST_PCT = -5
+    RSS_TRACE = .FALSE.
+    IF (PRESENT(SHOW_RSS_TRACE)) RSS_TRACE = SHOW_RSS_TRACE .AND. (GRID%MYID.EQ.0)
+
+    T0 = MPI_WTIME()
+    NBLK = A_BLR%NBLK
+    INFO = 0
+    NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8; NS_LOCAL = 0
+    ALLOCATE(LRECV(MAX(A_BLR%NBLKR_LOC,1)), URECV(MAX(A_BLR%NBLKC_LOC,1)))
+    ALLOCATE(A_BLR%IPIV(A_BLR%NB, NBLK))
+    A_BLR%IPIV = 0
+    CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB)
+
+    DO K = 1, NBLK
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = MOD(K-1, GRID%PC)
+      INFO_STEP = 0
+      ALLOCATE(IPIV_K(KW))
+      IPIV_K = 0
+
+      ! 1) facteur diagonal AVEC PIVOT (CGETRF) -- inchange (dense).
+      IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) THEN
+        CALL CGETRF(KW, KW, A_BLR%DIAGBLK(K)%D, KW, IPIV_K, IINFO)
+        IF (IINFO .NE. 0) INFO_STEP = A_BLR%BSTART(K) - 1 + IINFO
+      END IF
+      CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+      IF (INFO_STEP .NE. 0) THEN
+        INFO = INFO_STEP
+        DEALLOCATE(LRECV, URECV, IPIV_K)
+        CALL BLR_WORKSPACE_FREE(WS)
+        RETURN
+      END IF
+
+      CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+      A_BLR%IPIV(1:KW,K) = IPIV_K
+
+      ! 2) propage le pivot -- BLR_BLOCK_ROW_SWAP_ARENA.
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        li_K = (K-1)/GRID%PR + 1
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .EQ. K) CYCLE
+          CALL BLR_BLOCK_ROW_SWAP_ARENA(A_BLR%OFFBLK(li_K,lj), KW, IPIV_K)
+        END DO
+      END IF
+      DO I = 1, KW
+        IF (IPIV_K(I) .NE. I) NS_LOCAL = NS_LOCAL + 1
+      END DO
+      DEALLOCATE(IPIV_K)
+
+      ! 3) DKK -- inchange.
+      ALLOCATE(DKK(KW,KW))
+      IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
+      IF (GRID%MYROW .EQ. PROW_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+      IF (GRID%MYCOL .EQ. PCOL_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+      ! 4) U12 -- BLR_TRSM_LEFT_LOWER_UNIT_ARENA.
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        li = (K-1)/GRID%PR + 1
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          CALL BLR_TRSM_LEFT_LOWER_UNIT_ARENA(DKK, KW, A_BLR%OFFBLK(li,lj))
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(li,lj)%M, A_BLR%OFFBLK(li,lj)%N)
+          END IF
+        END DO
+      END IF
+
+      ! 5) L21 -- BLR_TRSM_RIGHT_UPPER_NONUNIT_ARENA.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        lj = (K-1)/GRID%PC + 1
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          CALL BLR_TRSM_RIGHT_UPPER_NONUNIT_ARENA(A_BLR%OFFBLK(li,lj), DKK, KW)
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(li,lj)%M, A_BLR%OFFBLK(li,lj)%N)
+          END IF
+        END DO
+      END IF
+      DEALLOCATE(DKK)
+
+      ! 6) diffusion des panneaux L/U DEJA COMPRESSES -- copie-puis-diffuse
+      !    (voir commentaire de tete), BCAST_BLR_BLOCK INCHANGEE.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          CALL COPY_ARENA_TO_REGULAR(A_BLR%OFFBLK(li,(K-1)/GRID%PC+1), LRECV(li))
+          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, LRECV(li))
+        END DO
+      ELSE
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, LRECV(li))
+        END DO
+      END IF
+
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          CALL COPY_ARENA_TO_REGULAR(A_BLR%OFFBLK((K-1)/GRID%PR+1,lj), URECV(lj))
+          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj))
+        END DO
+      ELSE
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj))
+        END DO
+      END IF
+
+      ! 7) mise a jour de Schur -- SCHUR_UPDATE_BLR_BLOCK_ARENA.
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (J .LE. K) CYCLE
+        NJ = A_BLR%BEND(J) - A_BLR%BSTART(J) + 1
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+          IF (I .EQ. J) THEN
+            CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, LRECV(li), URECV(lj), A_BLR%DIAGBLK(I)%D, MI)
+          ELSE
+            CALL SCHUR_UPDATE_BLR_BLOCK_ARENA(A_BLR%OFFBLK(li,lj), MI, NJ, KW, LRECV(li), URECV(lj), TOL, &
+                                               A_BLR%ARENA, WS)
+          END IF
+        END DO
+      END DO
+
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('3) Factorisation LU arena (pivot)', K, NBLK, LAST_PCT)
+      IF (RSS_TRACE) WRITE(6,'(A,I4,A,F8.1,A)') '     [RSS trace arena] K=', K, ' : RSS = ', &
+           REAL(GET_RSS_KB(),8)/1024.0D0, ' Mo'
+    END DO
+
+    DEALLOCATE(LRECV, URECV)
+    CALL BLR_WORKSPACE_FREE(WS)
+    IF (PRESENT(T_FACTOR)) T_FACTOR = MPI_WTIME() - T0
+
+    CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(RS_LOCAL, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+    IF (PRESENT(N_SWAPS)) N_SWAPS = NS_LOCAL
+  END SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT_ARENA
+
+  !-----------------------------------------------------------------------
+  ! Variante ARENA de LOCAL_ROW_OFFSET -- corps STRICTEMENT identique,
+  ! dupliquee car Fortran exige un type de dummy exact (pas de conversion
+  ! implicite MPI_BLR_MATRIX_T <-> MPI_BLR_MATRIX_ARENA_T).
+  !-----------------------------------------------------------------------
+  FUNCTION LOCAL_ROW_OFFSET_ARENA(A_BLR, GRID, IGLOBAL) RESULT(RS)
+    TYPE(MPI_BLR_MATRIX_ARENA_T), INTENT(IN) :: A_BLR
+    TYPE(GRID_T), INTENT(IN)                 :: GRID
+    INTEGER, INTENT(IN)                      :: IGLOBAL
+    INTEGER :: RS, li, I
+    RS = 1
+    DO li = 1, (IGLOBAL-1-GRID%MYROW)/GRID%PR
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      RS = RS + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
+    END DO
+  END FUNCTION LOCAL_ROW_OFFSET_ARENA
+
+  !-----------------------------------------------------------------------
+  ! Variante ARENA de MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D -- IDENTIQUE (voir
+  ! ce dernier pour le commentaire algorithmique complet), seule
+  ! BLR_BLOCK_APPLY -> BLR_BLOCK_APPLY_ARENA change (lecture SEULE des
+  ! blocs, aucune creation de pointeur persistant -- TARGET non necessaire
+  ! sur A_BLR ici, contrairement a l'assemblage/factorisation).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_ARENA_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)                 :: GRID
+    TYPE(MPI_BLR_MATRIX_ARENA_T), INTENT(IN) :: A_BLR
+    INTEGER, INTENT(IN)                      :: NRHS, NRHS_LOC, LDB
+    COMPLEX(WP), INTENT(INOUT)               :: B_LOCAL(MAX(LDB,1),MAX(NRHS_LOC,1))
+    LOGICAL, INTENT(IN), OPTIONAL            :: SHOW_PROGRESS
+
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
+    INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
+    INTEGER :: NBLK, K, li, lj, I, J, KW, MI, RS, RE, NROWTRAIL, C, IERR
+    INTEGER :: PROW_K, PCOL_K, STEP, NSTEPS, LAST_PCT
+    LOGICAL :: PROGRESS
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    STEP = 0
+    LAST_PCT = -5
+
+    NBLK = A_BLR%NBLK
+    NSTEPS = 2 * NBLK
+    ALLOCATE(RSTARTS(0:GRID%PC-1), RLOCS(0:GRID%PC-1), RCOUNTS(0:GRID%PC-1), RDISPLS(0:GRID%PC-1))
+    DO C = 0, GRID%PC-1
+      CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
+    END DO
+
+    ! === 0) P*B -- inchange ===
+    DO K = 1, NBLK
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      IF (GRID%MYROW.NE.PROW_K .OR. NRHS_LOC.LE.0) CYCLE
+      RS = LOCAL_ROW_OFFSET_ARENA(A_BLR, GRID, K)
+      DO I = 1, KW
+        IF (A_BLR%IPIV(I,K) .NE. I) THEN
+          CALL CSWAP(NRHS_LOC, B_LOCAL(RS+I-1,1), LDB, B_LOCAL(RS+A_BLR%IPIV(I,K)-1,1), LDB)
+        END IF
+      END DO
+    END DO
+
+    ! === 1) L*Y = P*B (substitution avant) ===
+    DO K = 1, NBLK
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = MOD(K-1, GRID%PC)
+
+      ALLOCATE(XK_FULL(KW,NRHS))
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        ALLOCATE(DKK(KW,KW))
+        IF (GRID%MYCOL .EQ. PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
+        CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+
+        RS = LOCAL_ROW_OFFSET_ARENA(A_BLR, GRID, K)
+        IF (NRHS_LOC .GT. 0) THEN
+          CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, NRHS_LOC, &
+                      CONE, DKK, KW, B_LOCAL(RS,1), LDB)
+        END IF
+        DEALLOCATE(DKK)
+        ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
+        IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                             XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+        DEALLOCATE(XK_LOC)
+      END IF
+      CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+      lj = (K-1)/GRID%PC + 1
+      NROWTRAIL = 0
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        IF (I .GT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END DO
+      IF (NROWTRAIL .GT. 0) THEN
+        ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
+        IF (GRID%MYCOL .EQ. PCOL_K) THEN
+          CONTRIB = CZERO
+          RE = 0
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            IF (I .LE. K) CYCLE
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            CALL BLR_BLOCK_APPLY_ARENA(A_BLR%OFFBLK(li,lj), NRHS, CONE, XK_FULL, KW, CONE, CONTRIB(RE+1,1), NROWTRAIL)
+            RE = RE + MI
+          END DO
+        END IF
+        ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = NROWTRAIL*RLOCS(C); RDISPLS(C) = NROWTRAIL*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_SCATTERV(CONTRIB, RCOUNTS, RDISPLS, MPI_COMPLEX, &
+                           CONTRIB_LOC, NROWTRAIL*NRHS_LOC, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+        IF (NRHS_LOC .GT. 0) THEN
+          RE = 0; RS = 1
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            IF (I .GT. K) THEN
+              B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) = B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) - CONTRIB_LOC(RE+1:RE+MI,1:NRHS_LOC)
+              RE = RE + MI
+            END IF
+            RS = RS + MI
+          END DO
+        END IF
+        DEALLOCATE(CONTRIB, CONTRIB_LOC)
+      END IF
+      DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('4) Resolution arena (pivot)', STEP, NSTEPS, LAST_PCT)
+    END DO
+
+    ! === 2) U*X = Y (substitution arriere) -- AUCUN pivot necessaire ===
+    DO K = NBLK, 1, -1
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = MOD(K-1, GRID%PC)
+
+      ALLOCATE(XK_FULL(KW,NRHS))
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        ALLOCATE(DKK(KW,KW))
+        IF (GRID%MYCOL .EQ. PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
+        CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+
+        RS = LOCAL_ROW_OFFSET_ARENA(A_BLR, GRID, K)
+        IF (NRHS_LOC .GT. 0) THEN
+          CALL CTRSM('Left', 'Upper', 'No transpose', 'Non-unit', KW, NRHS_LOC, &
+                      CONE, DKK, KW, B_LOCAL(RS,1), LDB)
+        END IF
+        DEALLOCATE(DKK)
+        ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
+        IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                             XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+        DEALLOCATE(XK_LOC)
+      END IF
+      CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+      lj = (K-1)/GRID%PC + 1
+      NROWTRAIL = 0
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        IF (I .LT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END DO
+      IF (NROWTRAIL .GT. 0) THEN
+        ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
+        IF (GRID%MYCOL .EQ. PCOL_K) THEN
+          CONTRIB = CZERO
+          RE = 0
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            IF (I .GE. K) CYCLE
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            CALL BLR_BLOCK_APPLY_ARENA(A_BLR%OFFBLK(li,lj), NRHS, CONE, XK_FULL, KW, CONE, CONTRIB(RE+1,1), NROWTRAIL)
+            RE = RE + MI
+          END DO
+        END IF
+        ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = NROWTRAIL*RLOCS(C); RDISPLS(C) = NROWTRAIL*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_SCATTERV(CONTRIB, RCOUNTS, RDISPLS, MPI_COMPLEX, &
+                           CONTRIB_LOC, NROWTRAIL*NRHS_LOC, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+        IF (NRHS_LOC .GT. 0) THEN
+          RE = 0; RS = 1
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            IF (I .LT. K) THEN
+              B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) = B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) - CONTRIB_LOC(RE+1:RE+MI,1:NRHS_LOC)
+              RE = RE + MI
+            END IF
+            RS = RS + MI
+          END DO
+        END IF
+        DEALLOCATE(CONTRIB, CONTRIB_LOC)
+      END IF
+      DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('4) Resolution arena (pivot)', STEP, NSTEPS, LAST_PCT)
+    END DO
+
+    DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
+  END SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_ARENA_2D
+
+  !=========================================================================
+  ! VARIANTES FIXEDCAP (MPI_BLR_MATRIX_FIXEDCAP_T) -- voir le type
+  ! ci-dessus et BLR_BLOCK_FIXEDCAP_T (blr_compress_mod.f90) pour la
+  ! justification complete. Chaque routine ci-dessous est le miroir
+  ! algorithmique EXACT de sa version non-FIXEDCAP -- seule la mecanique
+  ! de stockage des blocs hors-diagonale change (UFAC/VFAC alloues UNE
+  ! SEULE FOIS a la capacite RMAX, jamais realloues ensuite).
+  !=========================================================================
+
+  !-----------------------------------------------------------------------
+  ! Variante FIXEDCAP de l'etape 1 (voir MPI_ASSEMBLE_BLR_MATRIX) --
+  ! COMPRESS_BLOCK (INCHANGEE) produit un BLR_BLOCK_T ordinaire (taille
+  ! exacte) dans un temporaire, immediatement copie (COPY_REGULAR_TO_
+  ! FIXEDCAP) vers la capacite RMAX definitive de A_BLR%OFFBLK(li,lj) --
+  ! AUCUN attribut TARGET necessaire (composantes ALLOCATABLE, pas
+  ! POINTER).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_FIXEDCAP(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
+                                               T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
+                                               SHOW_PROGRESS)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    INTEGER, INTENT(IN)             :: N, NB
+    REAL(WP), INTENT(IN)            :: TOL
+    PROCEDURE(GET_BLOCK_IFACE)      :: GET_BLOCK
+    TYPE(MPI_BLR_MATRIX_FIXEDCAP_T), INTENT(OUT) :: A_BLR
+    DOUBLE PRECISION, INTENT(OUT)   :: T_ASSEMBLE_COMPRESS
+    INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
+    INTEGER(8), INTENT(OUT)         :: RANK_SUM
+    LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
+
+    COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
+    TYPE(BLR_BLOCK_T) :: TMPBLK
+    INTEGER :: li, lj, I, J, MI, NJ, NC_LOCAL, NO_LOCAL, IERR, NDONE, NTOTAL, LAST_PCT
+    INTEGER(8) :: RS_LOCAL
+    DOUBLE PRECISION :: T0
+    LOGICAL :: PROGRESS
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    NDONE = 0
+    LAST_PCT = -5
+
+    T0 = MPI_WTIME()
+    CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
+    A_BLR%N = N
+    A_BLR%NB = NB
+    A_BLR%NBLKR_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PR, GRID%MYROW)
+    A_BLR%NBLKC_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PC, GRID%MYCOL)
+    ALLOCATE(A_BLR%DIAGBLK(A_BLR%NBLK))
+    ALLOCATE(A_BLR%OFFBLK(MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1)))
+    NTOTAL = A_BLR%NBLKR_LOC * A_BLR%NBLKC_LOC
+
+    NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8
+
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        NJ = A_BLR%BEND(J) - A_BLR%BSTART(J) + 1
+        IF (I .EQ. J) THEN
+          ALLOCATE(A_BLR%DIAGBLK(I)%D(MI,MI))
+          CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), A_BLR%DIAGBLK(I)%D)
+        ELSE
+          ALLOCATE(TMP(MI,NJ))
+          CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMP)
+          CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, TMPBLK)
+          CALL COPY_REGULAR_TO_FIXEDCAP(TMPBLK, A_BLR%OFFBLK(li,lj))
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(MI,NJ)
+          END IF
+          DEALLOCATE(TMP)
+        END IF
+        NDONE = NDONE + 1
+        IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('1) Assemblage+compression (rang 0)', NDONE, NTOTAL, LAST_PCT)
+      END DO
+    END DO
+    T_ASSEMBLE_COMPRESS = MPI_WTIME() - T0
+
+    CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(RS_LOCAL, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+  END SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Empreinte memoire ANALYTIQUE de la part LOCALE de A_BLR (octets) --
+  ! CAPACITE REELLEMENT ALLOUEE (M*RMAX+RMAX*N pour un bloc bas-rang, PAS
+  ! M*RANK+RANK*N) : c'est la grandeur comparable a la RSS mesuree, le but
+  ! explicite de cette variante etant d'accepter un peu plus de memoire
+  ! ALLOUEE en echange de ZERO reallocation (donc, en principe, une RSS
+  ! bien plus proche de cette valeur theorique que l'existant).
+  !-----------------------------------------------------------------------
+  FUNCTION MPI_BLR_MATRIX_FIXEDCAP_MEMORY_BYTES(A_BLR) RESULT(NBYTES)
+    TYPE(MPI_BLR_MATRIX_FIXEDCAP_T), INTENT(IN) :: A_BLR
+    INTEGER(8) :: NBYTES
+    INTEGER :: li, lj, K
+    NBYTES = 0_8
+    DO K = 1, A_BLR%NBLK
+      IF (ALLOCATED(A_BLR%DIAGBLK(K)%D)) NBYTES = NBYTES + 8_8*INT(SIZE(A_BLR%DIAGBLK(K)%D),8)
+    END DO
+    DO lj = 1, A_BLR%NBLKC_LOC
+      DO li = 1, A_BLR%NBLKR_LOC
+        ASSOCIATE (B => A_BLR%OFFBLK(li,lj))
+          IF (B%IS_LOWRANK) THEN
+            NBYTES = NBYTES + 8_8*(INT(B%M,8)*INT(B%RMAX,8) + INT(B%RMAX,8)*INT(B%N,8))
+          ELSE IF (ALLOCATED(B%DENSE)) THEN
+            NBYTES = NBYTES + 8_8*INT(B%M,8)*INT(B%N,8)
+          END IF
+        END ASSOCIATE
+      END DO
+    END DO
+  END FUNCTION MPI_BLR_MATRIX_FIXEDCAP_MEMORY_BYTES
+
+  !-----------------------------------------------------------------------
+  ! DIAGNOSTIC : donnee VRAIMENT utile (rang REEL, comme BLR_BLOCK_BYTES),
+  ! par opposition a la capacite ALLOUEE ci-dessus -- la difference est le
+  ! "gaspillage RMAX-vs-RANK" assume par cette variante des la premiere
+  ! compression de chaque bloc (PAS un gaspillage accumule au fil du
+  ! temps comme l'ancien arena carve-systematique : ici il est CONSTANT,
+  ! connu et borne des le depart, jamais aggrave par des reallocations).
+  !-----------------------------------------------------------------------
+  FUNCTION MPI_BLR_MATRIX_FIXEDCAP_USED_BYTES(A_BLR) RESULT(NBYTES)
+    TYPE(MPI_BLR_MATRIX_FIXEDCAP_T), INTENT(IN) :: A_BLR
+    INTEGER(8) :: NBYTES
+    INTEGER :: li, lj, K
+    NBYTES = 0_8
+    DO K = 1, A_BLR%NBLK
+      IF (ALLOCATED(A_BLR%DIAGBLK(K)%D)) NBYTES = NBYTES + 8_8*INT(SIZE(A_BLR%DIAGBLK(K)%D),8)
+    END DO
+    DO lj = 1, A_BLR%NBLKC_LOC
+      DO li = 1, A_BLR%NBLKR_LOC
+        ASSOCIATE (B => A_BLR%OFFBLK(li,lj))
+          IF (B%IS_LOWRANK) THEN
+            NBYTES = NBYTES + 8_8*(INT(B%M,8)*INT(B%RANK,8) + INT(B%RANK,8)*INT(B%N,8))
+          ELSE IF (ALLOCATED(B%DENSE)) THEN
+            NBYTES = NBYTES + 8_8*INT(B%M,8)*INT(B%N,8)
+          END IF
+        END ASSOCIATE
+      END DO
+    END DO
+  END FUNCTION MPI_BLR_MATRIX_FIXEDCAP_USED_BYTES
+
+  !-----------------------------------------------------------------------
+  ! Variante FIXEDCAP de MPI_BLR_MATRIX_LU_FACTOR_PIVOT -- voir ce dernier
+  ! pour le commentaire algorithmique complet (pivot confine au bloc
+  ! diagonal, CLASWP, etc.), INCHANGE ici. SEULES differences :
+  !   - etape 2 : BLR_BLOCK_ROW_SWAP_FIXEDCAP (identique, opere sur les
+  !     lignes de UFAC, jamais paddees)
+  !   - etapes 4/5 : BLR_TRSM_*_FIXEDCAP (identiques cote UFAC, vue
+  !     tranchee cote VFAC -- voir blr_compress_mod.f90)
+  !   - etape 6 : copie-puis-diffuse (COPY_FIXEDCAP_TO_REGULAR, MEME
+  !     pattern que l'arena) vers LRECV/URECV (BLR_BLOCK_T ordinaires,
+  !     EXACTEMENT dimensionnes au rang reel), PUIS BCAST_BLR_BLOCK
+  !     INCHANGEE -- le volume MPI ne depend QUE du rang REEL, jamais de
+  !     RMAX (demande explicite de l'utilisateur).
+  !   - etape 7 : SCHUR_UPDATE_BLR_BLOCK_FIXEDCAP (ecrase en place, ZERO
+  !     reallocation apres la premiere compression du bloc) -- pas de
+  !     USE_MOVE_ALLOC ici, non pertinent (aucune reallocation a eviter).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT_FIXEDCAP(GRID, A_BLR, TOL, INFO, &
+                                                      N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
+                                                      SHOW_PROGRESS, SHOW_RSS_TRACE)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)          :: GRID
+    TYPE(MPI_BLR_MATRIX_FIXEDCAP_T), INTENT(INOUT) :: A_BLR
+    REAL(WP), INTENT(IN)              :: TOL
+    INTEGER, INTENT(OUT)              :: INFO
+    INTEGER, INTENT(OUT)              :: N_COMPRESSED, N_OFFDIAG
+    INTEGER(8), INTENT(OUT)           :: RANK_SUM
+    INTEGER, INTENT(OUT), OPTIONAL    :: N_SWAPS
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_FACTOR
+    LOGICAL, INTENT(IN), OPTIONAL      :: SHOW_PROGRESS
+    LOGICAL, INTENT(IN), OPTIONAL      :: SHOW_RSS_TRACE
+
+    COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
+    TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
+    TYPE(BLR_WORKSPACE_T) :: WS
+    INTEGER, ALLOCATABLE :: IPIV_K(:)
+    INTEGER :: NBLK, K, li, lj, I, J, KW, MI, NJ, IINFO, INFO_STEP
+    INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, NS_LOCAL, li_K, LAST_PCT
+    INTEGER(8) :: RS_LOCAL
+    DOUBLE PRECISION :: T0
+    LOGICAL :: PROGRESS, RSS_TRACE
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    LAST_PCT = -5
+    RSS_TRACE = .FALSE.
+    IF (PRESENT(SHOW_RSS_TRACE)) RSS_TRACE = SHOW_RSS_TRACE .AND. (GRID%MYID.EQ.0)
+
+    T0 = MPI_WTIME()
+    NBLK = A_BLR%NBLK
+    INFO = 0
+    NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8; NS_LOCAL = 0
+    ALLOCATE(LRECV(MAX(A_BLR%NBLKR_LOC,1)), URECV(MAX(A_BLR%NBLKC_LOC,1)))
+    ALLOCATE(A_BLR%IPIV(A_BLR%NB, NBLK))
+    A_BLR%IPIV = 0
+    CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB)
+
+    DO K = 1, NBLK
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = MOD(K-1, GRID%PC)
+      INFO_STEP = 0
+      ALLOCATE(IPIV_K(KW))
+      IPIV_K = 0
+
+      ! 1) facteur diagonal AVEC PIVOT (CGETRF) -- inchange (dense).
+      IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) THEN
+        CALL CGETRF(KW, KW, A_BLR%DIAGBLK(K)%D, KW, IPIV_K, IINFO)
+        IF (IINFO .NE. 0) INFO_STEP = A_BLR%BSTART(K) - 1 + IINFO
+      END IF
+      CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+      IF (INFO_STEP .NE. 0) THEN
+        INFO = INFO_STEP
+        DEALLOCATE(LRECV, URECV, IPIV_K)
+        CALL BLR_WORKSPACE_FREE(WS)
+        RETURN
+      END IF
+
+      CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+      A_BLR%IPIV(1:KW,K) = IPIV_K
+
+      ! 2) propage le pivot -- BLR_BLOCK_ROW_SWAP_FIXEDCAP.
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        li_K = (K-1)/GRID%PR + 1
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .EQ. K) CYCLE
+          CALL BLR_BLOCK_ROW_SWAP_FIXEDCAP(A_BLR%OFFBLK(li_K,lj), KW, IPIV_K)
+        END DO
+      END IF
+      DO I = 1, KW
+        IF (IPIV_K(I) .NE. I) NS_LOCAL = NS_LOCAL + 1
+      END DO
+      DEALLOCATE(IPIV_K)
+
+      ! 3) DKK -- inchange.
+      ALLOCATE(DKK(KW,KW))
+      IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
+      IF (GRID%MYROW .EQ. PROW_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+      IF (GRID%MYCOL .EQ. PCOL_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+      ! 4) U12 -- BLR_TRSM_LEFT_LOWER_UNIT_FIXEDCAP.
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        li = (K-1)/GRID%PR + 1
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          CALL BLR_TRSM_LEFT_LOWER_UNIT_FIXEDCAP(DKK, KW, A_BLR%OFFBLK(li,lj))
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(li,lj)%M, A_BLR%OFFBLK(li,lj)%N)
+          END IF
+        END DO
+      END IF
+
+      ! 5) L21 -- BLR_TRSM_RIGHT_UPPER_NONUNIT_FIXEDCAP.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        lj = (K-1)/GRID%PC + 1
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          CALL BLR_TRSM_RIGHT_UPPER_NONUNIT_FIXEDCAP(A_BLR%OFFBLK(li,lj), DKK, KW)
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(li,lj)%M, A_BLR%OFFBLK(li,lj)%N)
+          END IF
+        END DO
+      END IF
+      DEALLOCATE(DKK)
+
+      ! 6) diffusion des panneaux L/U DEJA COMPRESSES -- copie-puis-diffuse
+      !    (voir commentaire de tete), BCAST_BLR_BLOCK INCHANGEE.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          CALL COPY_FIXEDCAP_TO_REGULAR(A_BLR%OFFBLK(li,(K-1)/GRID%PC+1), LRECV(li))
+          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, LRECV(li))
+        END DO
+      ELSE
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, LRECV(li))
+        END DO
+      END IF
+
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          CALL COPY_FIXEDCAP_TO_REGULAR(A_BLR%OFFBLK((K-1)/GRID%PR+1,lj), URECV(lj))
+          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj))
+        END DO
+      ELSE
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj))
+        END DO
+      END IF
+
+      ! 7) mise a jour de Schur -- SCHUR_UPDATE_BLR_BLOCK_FIXEDCAP.
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (J .LE. K) CYCLE
+        NJ = A_BLR%BEND(J) - A_BLR%BSTART(J) + 1
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+          IF (I .EQ. J) THEN
+            CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, LRECV(li), URECV(lj), A_BLR%DIAGBLK(I)%D, MI)
+          ELSE
+            CALL SCHUR_UPDATE_BLR_BLOCK_FIXEDCAP(A_BLR%OFFBLK(li,lj), MI, NJ, KW, LRECV(li), URECV(lj), TOL, WS)
+          END IF
+        END DO
+      END DO
+
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('3) Factorisation LU fixedcap (pivot)', K, NBLK, LAST_PCT)
+      IF (RSS_TRACE) WRITE(6,'(A,I4,A,F8.1,A)') '     [RSS trace fixedcap] K=', K, ' : RSS = ', &
+           REAL(GET_RSS_KB(),8)/1024.0D0, ' Mo'
+    END DO
+
+    DEALLOCATE(LRECV, URECV)
+    CALL BLR_WORKSPACE_FREE(WS)
+    IF (PRESENT(T_FACTOR)) T_FACTOR = MPI_WTIME() - T0
+
+    CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(RS_LOCAL, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+    IF (PRESENT(N_SWAPS)) N_SWAPS = NS_LOCAL
+  END SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Variante FIXEDCAP de LOCAL_ROW_OFFSET -- corps STRICTEMENT identique,
+  ! dupliquee car Fortran exige un type de dummy exact.
+  !-----------------------------------------------------------------------
+  FUNCTION LOCAL_ROW_OFFSET_FIXEDCAP(A_BLR, GRID, IGLOBAL) RESULT(RS)
+    TYPE(MPI_BLR_MATRIX_FIXEDCAP_T), INTENT(IN) :: A_BLR
+    TYPE(GRID_T), INTENT(IN)                    :: GRID
+    INTEGER, INTENT(IN)                         :: IGLOBAL
+    INTEGER :: RS, li, I
+    RS = 1
+    DO li = 1, (IGLOBAL-1-GRID%MYROW)/GRID%PR
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      RS = RS + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
+    END DO
+  END FUNCTION LOCAL_ROW_OFFSET_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Variante FIXEDCAP de MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D -- IDENTIQUE
+  ! (voir ce dernier pour le commentaire algorithmique complet), seule
+  ! BLR_BLOCK_APPLY -> BLR_BLOCK_APPLY_FIXEDCAP change (lecture SEULE,
+  ! rang REEL uniquement -- voir blr_compress_mod.f90).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_FIXEDCAP_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)                    :: GRID
+    TYPE(MPI_BLR_MATRIX_FIXEDCAP_T), INTENT(IN) :: A_BLR
+    INTEGER, INTENT(IN)                         :: NRHS, NRHS_LOC, LDB
+    COMPLEX(WP), INTENT(INOUT)                  :: B_LOCAL(MAX(LDB,1),MAX(NRHS_LOC,1))
+    LOGICAL, INTENT(IN), OPTIONAL               :: SHOW_PROGRESS
+
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
+    INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
+    INTEGER :: NBLK, K, li, lj, I, J, KW, MI, RS, RE, NROWTRAIL, C, IERR
+    INTEGER :: PROW_K, PCOL_K, STEP, NSTEPS, LAST_PCT
+    LOGICAL :: PROGRESS
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    STEP = 0
+    LAST_PCT = -5
+
+    NBLK = A_BLR%NBLK
+    NSTEPS = 2 * NBLK
+    ALLOCATE(RSTARTS(0:GRID%PC-1), RLOCS(0:GRID%PC-1), RCOUNTS(0:GRID%PC-1), RDISPLS(0:GRID%PC-1))
+    DO C = 0, GRID%PC-1
+      CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
+    END DO
+
+    ! === 0) P*B -- inchange ===
+    DO K = 1, NBLK
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      IF (GRID%MYROW.NE.PROW_K .OR. NRHS_LOC.LE.0) CYCLE
+      RS = LOCAL_ROW_OFFSET_FIXEDCAP(A_BLR, GRID, K)
+      DO I = 1, KW
+        IF (A_BLR%IPIV(I,K) .NE. I) THEN
+          CALL CSWAP(NRHS_LOC, B_LOCAL(RS+I-1,1), LDB, B_LOCAL(RS+A_BLR%IPIV(I,K)-1,1), LDB)
+        END IF
+      END DO
+    END DO
+
+    ! === 1) L*Y = P*B (substitution avant) ===
+    DO K = 1, NBLK
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = MOD(K-1, GRID%PC)
+
+      ALLOCATE(XK_FULL(KW,NRHS))
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        ALLOCATE(DKK(KW,KW))
+        IF (GRID%MYCOL .EQ. PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
+        CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+
+        RS = LOCAL_ROW_OFFSET_FIXEDCAP(A_BLR, GRID, K)
+        IF (NRHS_LOC .GT. 0) THEN
+          CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, NRHS_LOC, &
+                      CONE, DKK, KW, B_LOCAL(RS,1), LDB)
+        END IF
+        DEALLOCATE(DKK)
+        ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
+        IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                             XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+        DEALLOCATE(XK_LOC)
+      END IF
+      CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+      lj = (K-1)/GRID%PC + 1
+      NROWTRAIL = 0
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        IF (I .GT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END DO
+      IF (NROWTRAIL .GT. 0) THEN
+        ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
+        IF (GRID%MYCOL .EQ. PCOL_K) THEN
+          CONTRIB = CZERO
+          RE = 0
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            IF (I .LE. K) CYCLE
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            CALL BLR_BLOCK_APPLY_FIXEDCAP(A_BLR%OFFBLK(li,lj), NRHS, CONE, XK_FULL, KW, CONE, CONTRIB(RE+1,1), NROWTRAIL)
+            RE = RE + MI
+          END DO
+        END IF
+        ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = NROWTRAIL*RLOCS(C); RDISPLS(C) = NROWTRAIL*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_SCATTERV(CONTRIB, RCOUNTS, RDISPLS, MPI_COMPLEX, &
+                           CONTRIB_LOC, NROWTRAIL*NRHS_LOC, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+        IF (NRHS_LOC .GT. 0) THEN
+          RE = 0; RS = 1
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            IF (I .GT. K) THEN
+              B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) = B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) - CONTRIB_LOC(RE+1:RE+MI,1:NRHS_LOC)
+              RE = RE + MI
+            END IF
+            RS = RS + MI
+          END DO
+        END IF
+        DEALLOCATE(CONTRIB, CONTRIB_LOC)
+      END IF
+      DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('4) Resolution fixedcap (pivot)', STEP, NSTEPS, LAST_PCT)
+    END DO
+
+    ! === 2) U*X = Y (substitution arriere) -- AUCUN pivot necessaire ===
+    DO K = NBLK, 1, -1
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = MOD(K-1, GRID%PC)
+
+      ALLOCATE(XK_FULL(KW,NRHS))
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        ALLOCATE(DKK(KW,KW))
+        IF (GRID%MYCOL .EQ. PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
+        CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+
+        RS = LOCAL_ROW_OFFSET_FIXEDCAP(A_BLR, GRID, K)
+        IF (NRHS_LOC .GT. 0) THEN
+          CALL CTRSM('Left', 'Upper', 'No transpose', 'Non-unit', KW, NRHS_LOC, &
+                      CONE, DKK, KW, B_LOCAL(RS,1), LDB)
+        END IF
+        DEALLOCATE(DKK)
+        ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
+        IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                             XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+        DEALLOCATE(XK_LOC)
+      END IF
+      CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+      lj = (K-1)/GRID%PC + 1
+      NROWTRAIL = 0
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        IF (I .LT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END DO
+      IF (NROWTRAIL .GT. 0) THEN
+        ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
+        IF (GRID%MYCOL .EQ. PCOL_K) THEN
+          CONTRIB = CZERO
+          RE = 0
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            IF (I .GE. K) CYCLE
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            CALL BLR_BLOCK_APPLY_FIXEDCAP(A_BLR%OFFBLK(li,lj), NRHS, CONE, XK_FULL, KW, CONE, CONTRIB(RE+1,1), NROWTRAIL)
+            RE = RE + MI
+          END DO
+        END IF
+        ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
+        DO C = 0, GRID%PC-1
+          RCOUNTS(C) = NROWTRAIL*RLOCS(C); RDISPLS(C) = NROWTRAIL*(RSTARTS(C)-1)
+        END DO
+        CALL MPI_SCATTERV(CONTRIB, RCOUNTS, RDISPLS, MPI_COMPLEX, &
+                           CONTRIB_LOC, NROWTRAIL*NRHS_LOC, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+        IF (NRHS_LOC .GT. 0) THEN
+          RE = 0; RS = 1
+          DO li = 1, A_BLR%NBLKR_LOC
+            I = (li-1)*GRID%PR + GRID%MYROW + 1
+            MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+            IF (I .LT. K) THEN
+              B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) = B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) - CONTRIB_LOC(RE+1:RE+MI,1:NRHS_LOC)
+              RE = RE + MI
+            END IF
+            RS = RS + MI
+          END DO
+        END IF
+        DEALLOCATE(CONTRIB, CONTRIB_LOC)
+      END IF
+      DEALLOCATE(XK_FULL)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('4) Resolution fixedcap (pivot)', STEP, NSTEPS, LAST_PCT)
+    END DO
+
+    DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
+  END SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_FIXEDCAP_2D
 
 END MODULE MPI_BLR_MATRIX_MOD

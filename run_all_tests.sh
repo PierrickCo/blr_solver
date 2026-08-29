@@ -93,6 +93,7 @@ run_test test_mpi_lu_pivot         mpirun -np 4 "$BINDIR/test_mpi_lu_pivot" 2 2 
 run_test test_mpi_lu_solve_2d      mpirun -np 4 "$BINDIR/test_mpi_lu_solve_2d" 2 2 500 50 20
 run_test test_mpi_blr_matrix       mpirun -np 4 "$BINDIR/test_mpi_blr_matrix" 2 2 1000 100 20 1e-4
 run_test test_mpi_blr_matrix_pivot mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 20 1e-4
+run_test test_mpi_blr_matrix_pivot_arena mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot_arena" 2 2 1000 100 20 1e-4
 
 echo "=== Benchmarks (fumee -- petite echelle) ==="
 run_bench bench_seq  "$BINDIR/bench_seq" 1000 20 100 1e-4

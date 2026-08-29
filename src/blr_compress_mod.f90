@@ -50,12 +50,46 @@
 MODULE BLR_COMPRESS_MOD
   USE BLR_KINDS_MOD, ONLY: WP
   USE OMP_LIB, ONLY: OMP_GET_WTIME
+  USE BLR_ARENA_MOD
   IMPLICIT NONE
 
   ! Fraction de MIN(M,N) en-dessous de laquelle la compression est jugee
   ! "rentable". Expose en PARAMETER modifiable si besoin de retuner plus
   ! tard sans casser l'interface des routines.
-  REAL(WP), PARAMETER :: COMPRESS_WORTHWHILE_RATIO = 0.8_WP
+  !
+  ! 0.5 = seuil d'EQUILIBRE MEMOIRE bas-rang/dense (stockage bas-rang =
+  ! R*(M+N), dense = M*N ; egaux pour R = M*N/(M+N), soit M/2 pour un
+  ! bloc carre -- voir blr_compress_mod.f90/SCHUR_UPDATE_BLR_BLOCK_ARENA,
+  ! meme raisonnement deja applique au plafond de croissance de l'arena).
+  ! PRECEDEMMENT 0.8 (choix tune calcul : un GEMM bas-rang a rang R coute
+  ! O(M*N*R), toujours moins cher qu'un GEMM dense O(M*N*NB) tant que
+  ! R<NB, donc accepter un rang plus eleve que le seuil memoire restait,
+  ! en theorie, un gain FLOPs). MESURE (bench/sweep_compressibility.sh,
+  ! voir memoire du projet) : avec 0.8, la zone de compressibilite
+  ! MARGINALE (rang final proche de l'ancien RMAX, ex. ~121 sur 200) est
+  ! en pratique la PLUS LENTE de tout le balayage (16.3s, plus de 2x le
+  ! cas totalement dense ~7-8s) -- l'algorithme tente la QR+SVD complete
+  ! de FAST_RECOMPRESS pour un resultat qui, une fois accepte, coute de
+  ! toute facon PLUS de memoire que le repli dense (R>M/2). 0.5 evite ce
+  ! "pire des deux mondes" : le test rapide RTOT.GT.RMAX (avant la QR+SVD
+  ! couteuse) rejette plus tot les blocs qui n'auraient de toute facon pas
+  ! ete memoire-rentables.
+  ! Variable de module (PAS PARAMETER) : valeur par defaut utilisee par
+  ! TOUS les appelants existants (tous les benchmarks/tests, sauf
+  ! test/bench_blr_mpi_pivot_ratio.f90 qui la surcharge explicitement pour
+  ! son propre balayage), modifiable a l'execution via
+  ! SET_COMPRESS_WORTHWHILE_RATIO ci-dessous.
+  !
+  ! 1/3 (MESURE, voir bench/sweep_compress_ratio.sh au point marginal
+  ! EPS=1e-6, memoire du projet) : plus prudent que 0.5 (l'equilibre
+  ! MEMOIRE bas-rang/dense strict, R=MIN(M,N)/2) -- accepte un rang encore
+  ! PLUS BAS avant de basculer en dense, ce qui reste dans le plateau
+  ! "rapide" du temps de factorisation (~3.7-3.9s mesures, RATIO 0.1-0.5)
+  ! au lieu de s'approcher de la zone ou le temps commence deja a grimper
+  ! (~4.6s a 0.6, ~12.7-20s a 0.8-0.9) -- marge de securite deliberee sur
+  ! le temps, au prix de quelques opportunites de compression memoire-
+  ! rentables (rang entre M/3 et M/2) desormais rejetees.
+  REAL(WP) :: COMPRESS_WORTHWHILE_RATIO = 1.0_WP/3.0_WP
 
   TYPE :: BLR_BLOCK_T
     LOGICAL :: IS_LOWRANK = .FALSE.
@@ -63,6 +97,68 @@ MODULE BLR_COMPRESS_MOD
     COMPLEX(WP), ALLOCATABLE :: DENSE(:,:)         ! si IS_LOWRANK = .FALSE.
     COMPLEX(WP), ALLOCATABLE :: UFAC(:,:), VFAC(:,:)  ! si IS_LOWRANK = .TRUE.
   END TYPE BLR_BLOCK_T
+
+  ! Variante ARENA de BLR_BLOCK_T (composantes POINTEUR, vues carvees dans
+  ! un BLR_ARENA_T partage au lieu d'ALLOCATABLE individuel) -- voir la
+  ! section "VARIANTES ARENA" en fin de fichier pour le detail et le
+  ! compromis assume (blr_arena_mod.f90).
+  TYPE :: BLR_BLOCK_ARENA_T
+    LOGICAL :: IS_LOWRANK = .FALSE.
+    INTEGER :: M = 0, N = 0, RANK = 0
+    COMPLEX(WP), POINTER :: DENSE(:,:) => NULL()
+    COMPLEX(WP), POINTER :: UFAC(:,:) => NULL(), VFAC(:,:) => NULL()
+    ! Handles PERSISTANTS (1D) vers le buffer arena REELLEMENT carve pour
+    ! DENSE/UFAC/VFAC -- SIZE(xxx_FLAT) est la CAPACITE actuelle (peut etre
+    ! PLUS GRANDE que la forme logique ci-dessus, ex. UFAC(1:M,1:R) est une
+    ! vue sur un PREFIXE de UFAC_FLAT si R a deja ete plus grand par le
+    ! passe). Permet a ARENA_CARVE_REUSE (blr_arena_mod.f90) de reutiliser
+    ! le meme buffer d'une recompression a l'autre au lieu d'en carver un
+    ! nouveau a chaque fois -- correctif du gaspillage x28 mesure avec le
+    ! carve-systematique (voir SCHUR_UPDATE_BLR_BLOCK_ARENA plus bas).
+    COMPLEX(WP), POINTER :: DENSE_FLAT(:) => NULL()
+    COMPLEX(WP), POINTER :: UFAC_FLAT(:) => NULL(), VFAC_FLAT(:) => NULL()
+  END TYPE BLR_BLOCK_ARENA_T
+
+  !-----------------------------------------------------------------------
+  ! Variante "CAPACITE FIXE" (demande explicite : "les blocs LR stoquent
+  ! le maximum de rang que COMPRESS_WORTHWHILE_RATIO le permet ; les
+  ! echanges MPI et les operations associees ne se font que sur le rang
+  ! REEL") -- approche DIFFERENTE de l'arena pour le meme probleme
+  ! (fragmentation de tas due aux ALLOCATE/DEALLOCATE de taille VARIABLE a
+  ! chaque recompression, voir la memoire du projet).
+  !
+  ! PRINCIPE : UFAC/VFAC sont alloues UNE SEULE FOIS par bloc, a la
+  ! capacite MAXIMALE RMAX = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*
+  ! MIN(M,N))-1) plutot qu'a la taille EXACTE du rang courant -- puisque
+  ! FAST_RECOMPRESS garantit RANK<=RMAX en permanence (sinon bascule en
+  ! dense, voir SCHUR_UPDATE_BLR_BLOCK_FIXEDCAP), cette capacite reste
+  ! TOUJOURS suffisante pour TOUTE recompression future du meme bloc :
+  ! JAMAIS de reallocation apres la premiere, contrairement a
+  ! BLR_BLOCK_T (taille exacte, realloue a CHAQUE etape K) ou meme a
+  ! l'arena (carve-ou-reutilise, mais peut encore grandir par doublement).
+  ! Row-major/column-major : seul le SECOND indice de UFAC (le rang) est
+  ! "gaspille" au-dela du rang reel -- le PREMIER indice (M, jamais
+  ! paddes) rend tous les calculs sur UFAC directement reutilisables tels
+  ! quels (le stride BLAS reste M). VFAC, a l'inverse, a son PREMIER
+  ! indice (le rang) paddé a RMAX -- toute operation BLAS qui le
+  ! reference doit passer la VUE tranchee VFAC(1:RANK,:) explicitement
+  ! (Fortran gere alors automatiquement la copie temporaire correcte,
+  ! aucune gestion manuelle de leading dimension necessaire).
+  !
+  ! MPI/calcul restent bornes au rang REEL (jamais RMAX) : la diffusion
+  ! (COPY_FIXEDCAP_TO_REGULAR + BCAST_BLR_BLOCK, INCHANGEE, meme pattern
+  ! que l'arena) copie SEULEMENT les RANK premieres colonnes/lignes vers
+  ! un BLR_BLOCK_T ordinaire EXACTEMENT dimensionne avant l'envoi -- le
+  ! volume MPI et le cout des TRSM/GEMM ne dependent QUE du rang reel,
+  ! jamais de la capacite allouee.
+  !-----------------------------------------------------------------------
+  TYPE :: BLR_BLOCK_FIXEDCAP_T
+    LOGICAL :: IS_LOWRANK = .FALSE.
+    INTEGER :: M = 0, N = 0, RANK = 0, RMAX = 0
+    COMPLEX(WP), ALLOCATABLE :: DENSE(:,:)
+    COMPLEX(WP), ALLOCATABLE :: UFAC(:,:)   ! (M,RMAX) une fois alloue, jamais realloue ensuite
+    COMPLEX(WP), ALLOCATABLE :: VFAC(:,:)   ! (RMAX,N) idem
+  END TYPE BLR_BLOCK_FIXEDCAP_T
 
   !-----------------------------------------------------------------------
   ! REUTILISATION DES TABLEAUX DE TRAVAIL TRANSITOIRES (demande explicite :
@@ -97,6 +193,19 @@ MODULE BLR_COMPRESS_MOD
   END TYPE BLR_WORKSPACE_T
 
 CONTAINS
+
+  !-----------------------------------------------------------------------
+  ! Surcharge COMPRESS_WORTHWHILE_RATIO (voir sa declaration ci-dessus) --
+  ! a appeler AVANT assemblage/factorisation pour un run donne (ex. un
+  ! benchmark qui balaie ce ratio, voir bench/sweep_compress_ratio.sh). Ne
+  ! touche a AUCUN autre etat -- un run qui n'appelle jamais cette
+  ! routine garde la valeur par defaut, comportement IDENTIQUE a avant
+  ! que COMPRESS_WORTHWHILE_RATIO devienne modifiable.
+  !-----------------------------------------------------------------------
+  SUBROUTINE SET_COMPRESS_WORTHWHILE_RATIO(R)
+    REAL(WP), INTENT(IN) :: R
+    COMPRESS_WORTHWHILE_RATIO = R
+  END SUBROUTINE SET_COMPRESS_WORTHWHILE_RATIO
 
   !-----------------------------------------------------------------------
   ! Alloue un workspace reutilisable pour des blocs de taille au plus
@@ -963,5 +1072,767 @@ CONTAINS
     NRM = SQRT(MAX(REAL(TR,WP), 0.0_WP))
     DEALLOCATE(G, H)
   END FUNCTION BLR_BLOCK_NORM
+
+  !===========================================================================
+  ! VARIANTES "ARENA" -- voir blr_arena_mod.f90 pour le principe general et
+  ! le compromis assume (pas de compaction, memoire des anciennes versions
+  ! de blocs jamais recuperee). Type PARALLELE a BLR_BLOCK_T (composantes
+  ! POINTEUR, vues carvees dans un BLR_ARENA_T partage, au lieu de
+  ! ALLOCATABLE) + copies des fonctions qui touchent le stockage d'un bloc
+  ! -- Fortran exige une correspondance de type EXACTE entre argument reel
+  ! et factice, meme quand le corps est identique a la version non-arena.
+  !
+  ! Utilisees UNIQUEMENT par MPI_BLR_MATRIX_LU_FACTOR_PIVOT_ARENA
+  ! (mpi_blr_matrix_mod.f90, nouveau) -- AUCUNE fonction/type existant(e)
+  ! ci-dessus n'est modifie(e), les solveurs actuels (A/B/MPI/C/BLR+MPI,
+  ! avec et sans pivot) restent inchanges et continuent d'utiliser
+  ! BLR_BLOCK_T tel quel.
+  !
+  ! Les panneaux TRANSITOIRES (diffuses via BCAST_BLR_BLOCK, duree de vie
+  ! d'UNE etape K -- LRECV/URECV cote appelant, PBLK ici) restent des
+  ! BLR_BLOCK_T ORDINAIRES (ALLOCATABLE) : seul le stockage PERSISTANT
+  ! (A_BLR%OFFBLK, qui doit survivre a toutes les etapes futures) a besoin
+  ! d'etre arena-compatible -- voir COPY_ARENA_TO_REGULAR pour le point de
+  ! passage entre les deux mondes.
+  !===========================================================================
+
+  !-----------------------------------------------------------------------
+  ! Copie une vue arena (POINTEUR) vers un BLR_BLOCK_T ALLOCATABLE
+  ! independant -- point de passage vers le monde "transitoire" ordinaire
+  ! (ex. avant de diffuser un panneau via l'existant BCAST_BLR_BLOCK, qui
+  ! attend un BLR_BLOCK_T). Vraie copie de donnees (pas un partage de
+  ! pointeur) -- MEME COUT que ce que le code non-arena fait deja
+  ! aujourd'hui ("LRECV(li) = A_BLR%OFFBLK(...)", une copie identique),
+  ! aucun surcout supplementaire introduit.
+  !-----------------------------------------------------------------------
+  SUBROUTINE COPY_ARENA_TO_REGULAR(SRC, DST)
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(IN) :: SRC
+    TYPE(BLR_BLOCK_T), INTENT(OUT)      :: DST
+    DST%IS_LOWRANK = SRC%IS_LOWRANK
+    DST%M = SRC%M; DST%N = SRC%N; DST%RANK = SRC%RANK
+    IF (SRC%IS_LOWRANK) THEN
+      ALLOCATE(DST%UFAC(SRC%M,SRC%RANK), DST%VFAC(SRC%RANK,SRC%N))
+      DST%UFAC = SRC%UFAC
+      DST%VFAC = SRC%VFAC
+    ELSE
+      ALLOCATE(DST%DENSE(SRC%M,SRC%N))
+      DST%DENSE = SRC%DENSE
+    END IF
+  END SUBROUTINE COPY_ARENA_TO_REGULAR
+
+  !-----------------------------------------------------------------------
+  ! Equivalent COMPRESS_BLOCK -- ecrit dans une vue carvee de ARENA au
+  ! lieu d'ALLOUER BLK%DENSE/UFAC/VFAC directement. Utilise a l'assemblage
+  ! initial (MPI_ASSEMBLE_BLR_MATRIX_ARENA). Corps IDENTIQUE a
+  ! COMPRESS_BLOCK a l'exception des 3 endroits qui ecrivent le resultat
+  ! final (marques ci-dessous).
+  !-----------------------------------------------------------------------
+  SUBROUTINE COMPRESS_BLOCK_ARENA(M, N, B, LDB, TOL, BLK, ARENA, WS)
+    INTEGER, INTENT(IN)          :: M, N, LDB
+    COMPLEX(WP), INTENT(IN)      :: B(LDB,N)
+    REAL(WP), INTENT(IN)         :: TOL
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(OUT) :: BLK
+    TYPE(BLR_ARENA_T), INTENT(INOUT), TARGET :: ARENA
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
+
+    COMPLEX(WP), ALLOCATABLE, TARGET :: BCOPY_LOC(:,:), UFULL_LOC(:,:), VTFULL_LOC(:,:), CWORK_LOC(:)
+    REAL(WP), ALLOCATABLE, TARGET :: S_LOC(:), RWORK_LOC(:)
+    COMPLEX(WP), POINTER :: BCOPY(:,:), UFULL(:,:), VTFULL(:,:), CWORK(:)
+    REAL(WP), POINTER :: S(:), RWORK(:)
+    COMPLEX(WP), POINTER :: FLAT(:)
+    INTEGER :: MN, LDW, LDV, LWORK, INFO, R, I
+    REAL(WP) :: THRESH
+
+    BLK%M = M
+    BLK%N = N
+    MN = MIN(M,N)
+
+    IF (TOL .LE. 0.0_WP .OR. MN .EQ. 0) THEN
+      BLK%IS_LOWRANK = .FALSE.
+      FLAT => ARENA_CARVE_REUSE(ARENA, BLK%DENSE_FLAT, INT(M,8)*INT(N,8))   ! <-- carve/reutilise
+      BLK%DENSE(1:M,1:N) => FLAT
+      IF (M.GT.0 .AND. N.GT.0) BLK%DENSE = B(1:M,1:N)
+      RETURN
+    END IF
+
+    IF (PRESENT(WS)) THEN
+      LDW = WS%MAXDIM
+      LDV = WS%MAXDIM
+      BCOPY  => WS%BCOPY
+      UFULL  => WS%UFULL
+      VTFULL => WS%VTFULL
+      S      => WS%S1
+      RWORK  => WS%RWORK1
+      CWORK  => WS%CWORK1
+      LWORK  = SIZE(CWORK)
+    ELSE
+      LDW = M
+      LDV = MN
+      ALLOCATE(BCOPY_LOC(M,N), UFULL_LOC(M,MN), VTFULL_LOC(MN,N), S_LOC(MN), RWORK_LOC(5*MN))
+      BCOPY => BCOPY_LOC; UFULL => UFULL_LOC; VTFULL => VTFULL_LOC; S => S_LOC; RWORK => RWORK_LOC
+      ALLOCATE(CWORK_LOC(1))
+      LWORK = -1
+      CALL CGESVD('S', 'S', M, N, BCOPY, LDW, S, UFULL, LDW, VTFULL, LDV, CWORK_LOC, LWORK, RWORK, INFO)
+      LWORK = INT(REAL(CWORK_LOC(1)))
+      DEALLOCATE(CWORK_LOC)
+      ALLOCATE(CWORK_LOC(MAX(LWORK,1)))
+      CWORK => CWORK_LOC
+    END IF
+
+    BCOPY(1:M,1:N) = B(1:M,1:N)
+    CALL CGESVD('S', 'S', M, N, BCOPY, LDW, S, UFULL, LDW, VTFULL, LDV, &
+                 CWORK, LWORK, RWORK, INFO)
+
+    IF (INFO .NE. 0) THEN
+      ! SVD non convergee (rarissime) : repli securise sur le mode dense
+      BLK%IS_LOWRANK = .FALSE.
+      FLAT => ARENA_CARVE_REUSE(ARENA, BLK%DENSE_FLAT, INT(M,8)*INT(N,8))   ! <-- carve/reutilise
+      BLK%DENSE(1:M,1:N) => FLAT
+      BLK%DENSE = B(1:M,1:N)
+      IF (.NOT. PRESENT(WS)) DEALLOCATE(BCOPY_LOC, UFULL_LOC, VTFULL_LOC, S_LOC, RWORK_LOC, CWORK_LOC)
+      RETURN
+    END IF
+
+    THRESH = TOL * MAX(S(1), TINY(1.0_WP))
+    R = 0
+    DO I = 1, MN
+      IF (S(I) .GT. THRESH) R = R + 1
+    END DO
+    R = MAX(R, 1)
+
+    IF (REAL(R,WP) .LT. COMPRESS_WORTHWHILE_RATIO*REAL(MN,WP)) THEN
+      BLK%IS_LOWRANK = .TRUE.
+      BLK%RANK = R
+      FLAT => ARENA_CARVE_REUSE(ARENA, BLK%UFAC_FLAT, INT(M,8)*INT(R,8))   ! <-- carve/reutilise UFAC
+      BLK%UFAC(1:M,1:R) => FLAT
+      FLAT => ARENA_CARVE_REUSE(ARENA, BLK%VFAC_FLAT, INT(R,8)*INT(N,8))   ! <-- carve/reutilise VFAC
+      BLK%VFAC(1:R,1:N) => FLAT
+      BLK%UFAC = UFULL(1:M,1:R)
+      DO I = 1, R
+        BLK%VFAC(I,1:N) = S(I) * VTFULL(I,1:N)
+      END DO
+    ELSE
+      BLK%IS_LOWRANK = .FALSE.
+      FLAT => ARENA_CARVE_REUSE(ARENA, BLK%DENSE_FLAT, INT(M,8)*INT(N,8))   ! <-- carve/reutilise
+      BLK%DENSE(1:M,1:N) => FLAT
+      BLK%DENSE = B(1:M,1:N)
+    END IF
+
+    IF (.NOT. PRESENT(WS)) DEALLOCATE(BCOPY_LOC, UFULL_LOC, VTFULL_LOC, S_LOC, RWORK_LOC, CWORK_LOC)
+  END SUBROUTINE COMPRESS_BLOCK_ARENA
+
+  !-----------------------------------------------------------------------
+  ! Equivalents EXPAND_BLOCK / BLR_BLOCK_ROW_SWAP / BLR_TRSM_*/
+  ! BLR_BLOCK_APPLY, corps STRICTEMENT IDENTIQUE aux versions non-arena --
+  ! seule la declaration de type de BLK differe (Fortran l'exige).
+  !-----------------------------------------------------------------------
+  SUBROUTINE EXPAND_BLOCK_ARENA(BLK, OUT, LDOUT)
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(IN) :: BLK
+    INTEGER, INTENT(IN)           :: LDOUT
+    COMPLEX(WP), INTENT(OUT)      :: OUT(LDOUT,BLK%N)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, BLK%N, BLK%RANK, &
+                  CONE, BLK%UFAC, BLK%M, BLK%VFAC, BLK%RANK, CZERO, OUT, LDOUT)
+    ELSE
+      OUT(1:BLK%M,1:BLK%N) = BLK%DENSE
+    END IF
+  END SUBROUTINE EXPAND_BLOCK_ARENA
+
+  SUBROUTINE BLR_BLOCK_ROW_SWAP_ARENA(BLK, KW, IPIV)
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(INOUT) :: BLK
+    INTEGER, INTENT(IN) :: KW, IPIV(KW)
+    INTEGER :: I
+    IF (BLK%M .EQ. 0 .OR. BLK%N .EQ. 0) RETURN
+    IF (BLK%IS_LOWRANK) THEN
+      DO I = 1, KW
+        IF (IPIV(I) .NE. I) CALL CSWAP(BLK%RANK, BLK%UFAC(I,1), KW, BLK%UFAC(IPIV(I),1), KW)
+      END DO
+    ELSE
+      DO I = 1, KW
+        IF (IPIV(I) .NE. I) CALL CSWAP(BLK%N, BLK%DENSE(I,1), KW, BLK%DENSE(IPIV(I),1), KW)
+      END DO
+    END IF
+  END SUBROUTINE BLR_BLOCK_ROW_SWAP_ARENA
+
+  SUBROUTINE BLR_TRSM_LEFT_LOWER_UNIT_ARENA(DKK, KW, BLK)
+    INTEGER, INTENT(IN)             :: KW
+    COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(INOUT) :: BLK
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, BLK%RANK, CONE, DKK, KW, BLK%UFAC, KW)
+    ELSE
+      CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, BLK%N, CONE, DKK, KW, BLK%DENSE, KW)
+    END IF
+  END SUBROUTINE BLR_TRSM_LEFT_LOWER_UNIT_ARENA
+
+  SUBROUTINE BLR_TRSM_RIGHT_UPPER_NONUNIT_ARENA(BLK, DKK, KW)
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(INOUT) :: BLK
+    INTEGER, INTENT(IN)             :: KW
+    COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', BLK%RANK, KW, CONE, DKK, KW, BLK%VFAC, BLK%RANK)
+    ELSE
+      CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', BLK%M, KW, CONE, DKK, KW, BLK%DENSE, BLK%M)
+    END IF
+  END SUBROUTINE BLR_TRSM_RIGHT_UPPER_NONUNIT_ARENA
+
+  SUBROUTINE BLR_BLOCK_APPLY_ARENA(BLK, NRHS, ALPHA, X, LDX, BETA, Y, LDY)
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(IN) :: BLK
+    INTEGER, INTENT(IN)           :: NRHS, LDX, LDY
+    COMPLEX(WP), INTENT(IN)       :: ALPHA, BETA
+    COMPLEX(WP), INTENT(IN)       :: X(LDX,NRHS)
+    COMPLEX(WP), INTENT(INOUT)    :: Y(LDY,NRHS)
+
+    COMPLEX(WP), PARAMETER :: CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: T(:,:)
+
+    IF (BLK%M.EQ.0 .OR. BLK%N.EQ.0) RETURN
+
+    IF (BLK%IS_LOWRANK) THEN
+      ALLOCATE(T(BLK%RANK,NRHS))
+      CALL CGEMM('No transpose', 'No transpose', BLK%RANK, NRHS, BLK%N, &
+                  (1.0_WP,0.0_WP), BLK%VFAC, BLK%RANK, X, LDX, CZERO, T, BLK%RANK)
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, NRHS, BLK%RANK, &
+                  ALPHA, BLK%UFAC, BLK%M, T, BLK%RANK, BETA, Y, LDY)
+      DEALLOCATE(T)
+    ELSE
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, NRHS, BLK%N, &
+                  ALPHA, BLK%DENSE, BLK%M, X, LDX, BETA, Y, LDY)
+    END IF
+  END SUBROUTINE BLR_BLOCK_APPLY_ARENA
+
+  !-----------------------------------------------------------------------
+  ! Equivalent FAST_RECOMPRESS -- corps IDENTIQUE (meme algorithme QR+SVD
+  ! du "coeur", memes buffers de travail via WS) a l'exception du calcul
+  ! du resultat final NEWBLK%UFAC/VFAC, carve dans ARENA au lieu d'etre
+  ! ALLOUE directement (seul endroit modifie, marque ci-dessous). Les
+  ! arguments d'entree UA/VA/PU/PV restent de simples tableaux (pas de
+  ! type BLR_BLOCK_T/BLR_BLOCK_ARENA_T ici) -- deja reutilisable tel quel
+  ! par l'appelant, qu'il lise depuis un bloc ordinaire ou arena.
+  !-----------------------------------------------------------------------
+  SUBROUTINE FAST_RECOMPRESS_ARENA(MI, NJ, RA, UA, VA, RP, PU, PV, TOL, RMAX, NEWBLK, OK, ARENA, &
+                                    UFAC_FLAT, VFAC_FLAT, WS)
+    INTEGER, INTENT(IN)            :: MI, NJ, RA, RP, RMAX
+    COMPLEX(WP), INTENT(IN)        :: UA(MI,RA), VA(RA,NJ), PU(MI,RP), PV(RP,NJ)
+    REAL(WP), INTENT(IN)           :: TOL
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(OUT) :: NEWBLK
+    LOGICAL, INTENT(OUT)           :: OK
+    TYPE(BLR_ARENA_T), INTENT(INOUT), TARGET :: ARENA
+    ! Handles PERSISTANTS du bloc ABLK appelant (voir BLR_BLOCK_ARENA_T) --
+    ! passes ici pour permettre a ARENA_CARVE_REUSE de reutiliser le buffer
+    ! DEJA carve pour ABLK%UFAC/VFAC lors d'un appel PRECEDENT, au lieu
+    ! d'en carver un nouveau a chaque recompression (voir blr_arena_mod.f90
+    ! /ARENA_CARVE_REUSE). SANS RISQUE d'aliasing : UA/VA (== l'ANCIEN
+    ! contenu de ABLK%UFAC/VFAC) sont entierement recopies dans UCAT/VCATT
+    ! (buffers de travail SEPARES) des le debut de cette routine, AVANT
+    ! que le resultat final ne soit ecrit dans ce meme buffer reutilise --
+    ! l'ancien contenu n'est plus necessaire au moment de l'ecriture.
+    COMPLEX(WP), POINTER, INTENT(INOUT) :: UFAC_FLAT(:), VFAC_FLAT(:)
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
+
+    INTEGER :: RTOT, R, I, LWORK, INFO, LDU, LDVQ, LDSQ, LDSV
+    COMPLEX(WP), ALLOCATABLE, TARGET :: UCAT_LOC(:,:), VCATT_LOC(:,:), TAUU_LOC(:), TAUV_LOC(:)
+    COMPLEX(WP), ALLOCATABLE, TARGET :: RU_LOC(:,:), RV_LOC(:,:), W_LOC(:,:), UW_LOC(:,:), VWH_LOC(:,:)
+    COMPLEX(WP), ALLOCATABLE, TARGET :: SVWH_LOC(:,:), CWORK_LOC(:)
+    REAL(WP), ALLOCATABLE, TARGET    :: SW_LOC(:), RWORK_LOC(:)
+    COMPLEX(WP), POINTER :: UCAT(:,:), VCATT(:,:), TAUU(:), TAUV(:)
+    COMPLEX(WP), POINTER :: RU(:,:), RV(:,:), WMAT(:,:), UW(:,:), VWH(:,:), SVWH(:,:), CWORK(:)
+    REAL(WP), POINTER :: SW(:), RWORK(:)
+    COMPLEX(WP), POINTER :: FLAT(:)
+    REAL(WP) :: THRESH
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+
+    RTOT = RA + RP
+    IF (RTOT .GE. MIN(MI,NJ) .OR. RTOT .GT. RMAX) THEN
+      OK = .FALSE.
+      RETURN
+    END IF
+
+    IF (PRESENT(WS)) THEN
+      LDU = WS%MAXDIM; LDVQ = WS%MAXDIM; LDSQ = WS%MAXDIM
+      UCAT => WS%UCAT; VCATT => WS%VCATT; TAUU => WS%TAUU; TAUV => WS%TAUV
+      RU => WS%RU; RV => WS%RV; WMAT => WS%WMAT; UW => WS%UW; VWH => WS%VWH
+      SW => WS%SW; RWORK => WS%RWORK2; CWORK => WS%CWORK2
+      LWORK = SIZE(CWORK)
+    ELSE
+      LDU = MI; LDVQ = NJ; LDSQ = RTOT
+      ALLOCATE(UCAT_LOC(MI,RTOT), VCATT_LOC(NJ,RTOT), TAUU_LOC(RTOT), TAUV_LOC(RTOT))
+      ALLOCATE(RU_LOC(RTOT,RTOT), RV_LOC(RTOT,RTOT), W_LOC(RTOT,RTOT), UW_LOC(RTOT,RTOT), VWH_LOC(RTOT,RTOT))
+      ALLOCATE(SW_LOC(RTOT), RWORK_LOC(5*RTOT))
+      UCAT => UCAT_LOC; VCATT => VCATT_LOC; TAUU => TAUU_LOC; TAUV => TAUV_LOC
+      RU => RU_LOC; RV => RV_LOC; WMAT => W_LOC; UW => UW_LOC; VWH => VWH_LOC
+      SW => SW_LOC; RWORK => RWORK_LOC
+      ALLOCATE(CWORK_LOC(1))
+      LWORK = -1
+      CALL CGEQRF(MI, RTOT, UCAT, LDU, TAUU, CWORK_LOC, LWORK, INFO)
+      LWORK = INT(REAL(CWORK_LOC(1)))
+      CALL CUNGQR(MI, RTOT, RTOT, UCAT, LDU, TAUU, CWORK_LOC, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      CALL CGEQRF(NJ, RTOT, VCATT, LDVQ, TAUV, CWORK_LOC, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      CALL CUNGQR(NJ, RTOT, RTOT, VCATT, LDVQ, TAUV, CWORK_LOC, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      CALL CGESVD('S', 'S', RTOT, RTOT, WMAT, LDSQ, SW, UW, LDSQ, VWH, LDSQ, CWORK_LOC, -1, RWORK, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      DEALLOCATE(CWORK_LOC)
+      ALLOCATE(CWORK_LOC(MAX(LWORK,1)))
+      CWORK => CWORK_LOC
+    END IF
+
+    UCAT(1:MI,1:RA)      = UA
+    UCAT(1:MI,RA+1:RTOT) = -PU
+
+    DO I = 1, RA
+      VCATT(1:NJ,I) = VA(I,1:NJ)
+    END DO
+    DO I = 1, RP
+      VCATT(1:NJ,RA+I) = PV(I,1:NJ)
+    END DO
+
+    CALL CGEQRF(MI, RTOT, UCAT, LDU, TAUU, CWORK, LWORK, INFO)
+    RU(1:RTOT,1:RTOT) = CZERO
+    DO I = 1, RTOT
+      RU(1:I,I) = UCAT(1:I,I)
+    END DO
+    CALL CUNGQR(MI, RTOT, RTOT, UCAT, LDU, TAUU, CWORK, LWORK, INFO)
+
+    CALL CGEQRF(NJ, RTOT, VCATT, LDVQ, TAUV, CWORK, LWORK, INFO)
+    RV(1:RTOT,1:RTOT) = CZERO
+    DO I = 1, RTOT
+      RV(1:I,I) = VCATT(1:I,I)
+    END DO
+    CALL CUNGQR(NJ, RTOT, RTOT, VCATT, LDVQ, TAUV, CWORK, LWORK, INFO)
+
+    CALL CGEMM('No transpose', 'Transpose', RTOT, RTOT, RTOT, CONE, &
+                RU, LDSQ, RV, LDSQ, CZERO, WMAT, LDSQ)
+
+    CALL CGESVD('S', 'S', RTOT, RTOT, WMAT, LDSQ, SW, UW, LDSQ, VWH, LDSQ, CWORK, LWORK, RWORK, INFO)
+
+    IF (INFO .NE. 0) THEN
+      OK = .FALSE.
+      IF (.NOT. PRESENT(WS)) DEALLOCATE(UCAT_LOC, VCATT_LOC, TAUU_LOC, TAUV_LOC, RU_LOC, RV_LOC, &
+                                         W_LOC, UW_LOC, VWH_LOC, SW_LOC, RWORK_LOC, CWORK_LOC)
+      RETURN
+    END IF
+
+    THRESH = TOL * MAX(SW(1), TINY(1.0_WP))
+    R = 0
+    DO I = 1, RTOT
+      IF (SW(I) .GT. THRESH) R = R + 1
+    END DO
+    R = MAX(R, 1)
+
+    IF (R .GT. RMAX) THEN
+      OK = .FALSE.
+    ELSE
+      OK = .TRUE.
+      NEWBLK%IS_LOWRANK = .TRUE.
+      NEWBLK%M = MI; NEWBLK%N = NJ; NEWBLK%RANK = R
+      ! RCAP = MIN(MI,NJ)/2, PAS RMAX : plafond de croissance amortie (voir
+      ! ARENA_CARVE_REUSE/blr_arena_mod.f90) choisi au point d'EQUILIBRE
+      ! MEMOIRE bas-rang/dense (stockage bas-rang = R*(M+N), dense = M*N ;
+      ! egaux pour R = M*N/(M+N), soit M/2 pour un bloc carre) -- PAS
+      ! RMAX (~0.8*MIN(MI,NJ), plafond ALGORITHMIQUE de
+      ! COMPRESS_WORTHWHILE_RATIO, tune pour le cout CALCUL, pas memoire).
+      ! Un rang R.LE.RCAP est de toute facon TOUJOURS moins cher que le
+      ! bloc dense final -- garantit qu'un bloc qui finit par basculer en
+      ! dense (voir SCHUR_UPDATE_BLR_BLOCK_ARENA) n'aura jamais engage,
+      ! via ce plafond de croissance, plus que ce que coute le bloc dense
+      ! lui-meme. Au-dela de RCAP (rang REELLEMENT necessaire plus grand,
+      ! toujours possible jusqu'a RMAX), ARENA_CARVE_REUSE carve alors
+      ! EXACTEMENT le besoin (le garde-fou CEILING=MAX(CAP_MAX,NELEMS) de
+      ! ARENA_CARVE_REUSE l'assure), sans jamais refuser la place.
+      FLAT => ARENA_CARVE_REUSE(ARENA, UFAC_FLAT, INT(MI,8)*INT(R,8), INT(MI,8)*INT(MAX(1,MIN(MI,NJ)/2),8))
+      NEWBLK%UFAC(1:MI,1:R) => FLAT
+      CALL CGEMM('No transpose', 'No transpose', MI, R, RTOT, CONE, &
+                  UCAT, LDU, UW, LDSQ, CZERO, NEWBLK%UFAC, MI)
+
+      IF (PRESENT(WS)) THEN
+        LDSV = WS%MAXDIM
+        SVWH => WS%SVWH
+      ELSE
+        LDSV = R
+        ALLOCATE(SVWH_LOC(R,RTOT))
+        SVWH => SVWH_LOC
+      END IF
+      DO I = 1, R
+        SVWH(I,1:RTOT) = SW(I) * VWH(I,1:RTOT)
+      END DO
+      FLAT => ARENA_CARVE_REUSE(ARENA, VFAC_FLAT, INT(R,8)*INT(NJ,8), INT(MAX(1,MIN(MI,NJ)/2),8)*INT(NJ,8))
+      NEWBLK%VFAC(1:R,1:NJ) => FLAT
+      CALL CGEMM('No transpose', 'Transpose', R, NJ, RTOT, CONE, &
+                  SVWH, LDSV, VCATT, LDVQ, CZERO, NEWBLK%VFAC, R)
+      IF (.NOT. PRESENT(WS)) DEALLOCATE(SVWH_LOC)
+    END IF
+
+    IF (.NOT. PRESENT(WS)) DEALLOCATE(UCAT_LOC, VCATT_LOC, TAUU_LOC, TAUV_LOC, RU_LOC, RV_LOC, &
+                                       W_LOC, UW_LOC, VWH_LOC, SW_LOC, RWORK_LOC, CWORK_LOC)
+  END SUBROUTINE FAST_RECOMPRESS_ARENA
+
+  !-----------------------------------------------------------------------
+  ! Equivalent SCHUR_UPDATE_BLR_BLOCK -- ABLK est ici BLR_BLOCK_ARENA_T
+  ! (stockage PERSISTANT). LBLK/UBLK (panneaux DIFFUSES, transitoires,
+  ! duree de vie d'une etape K) restent des BLR_BLOCK_T ORDINAIRES, tout
+  ! comme PBLK (produit L*U, purement local a cet appel) -- voir le
+  ! commentaire de tete de la section arena. Cas succes bas-rang : la
+  ! "reaffectation" de ABLK est une SIMPLE COPIE DE POINTEUR (zero copie
+  ! de donnees, zero (re)allocation) -- c'est le gain recherche par
+  ! rapport a "ABLK = NEWBLK" (reallocation+copie implicite, voir
+  ! SCHUR_UPDATE_BLR_BLOCK/USE_MOVE_ALLOC). L'ancienne vue de ABLK devient
+  ! simplement orpheline dans l'arena (jamais recuperee -- compromis
+  ! assume, voir blr_arena_mod.f90).
+  !-----------------------------------------------------------------------
+  SUBROUTINE SCHUR_UPDATE_BLR_BLOCK_ARENA(ABLK, MI, NJ, KW, LBLK, UBLK, TOL, ARENA, WS, T_PRODUCT, T_RECOMP)
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(INOUT) :: ABLK
+    INTEGER, INTENT(IN)              :: MI, NJ, KW
+    TYPE(BLR_BLOCK_T), INTENT(IN)    :: LBLK, UBLK
+    REAL(WP), INTENT(IN)             :: TOL
+    TYPE(BLR_ARENA_T), INTENT(INOUT), TARGET :: ARENA
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
+    DOUBLE PRECISION, INTENT(INOUT), OPTIONAL :: T_PRODUCT, T_RECOMP
+
+    TYPE(BLR_BLOCK_T) :: PBLK
+    TYPE(BLR_BLOCK_ARENA_T) :: NEWBLK
+    COMPLEX(WP), POINTER :: FLAT(:), DENSE_VIEW(:,:)
+    INTEGER :: RMAX
+    LOGICAL :: OK
+    DOUBLE PRECISION :: TT0
+
+    IF (MI.EQ.0 .OR. NJ.EQ.0 .OR. KW.EQ.0) RETURN
+
+    IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
+    CALL COMPUTE_LU_PRODUCT(MI, NJ, KW, LBLK, UBLK, PBLK)
+    IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (OMP_GET_WTIME() - TT0)
+
+    IF (ABLK%IS_LOWRANK .AND. PBLK%IS_LOWRANK) THEN
+      RMAX = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(MIN(MI,NJ),WP)) - 1)
+      IF (PRESENT(T_RECOMP)) TT0 = OMP_GET_WTIME()
+      IF (PRESENT(WS)) THEN
+        CALL FAST_RECOMPRESS_ARENA(MI, NJ, ABLK%RANK, ABLK%UFAC, ABLK%VFAC, &
+                              PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, ARENA, &
+                              ABLK%UFAC_FLAT, ABLK%VFAC_FLAT, WS)
+      ELSE
+        CALL FAST_RECOMPRESS_ARENA(MI, NJ, ABLK%RANK, ABLK%UFAC, ABLK%VFAC, &
+                              PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, ARENA, &
+                              ABLK%UFAC_FLAT, ABLK%VFAC_FLAT)
+      END IF
+      IF (PRESENT(T_RECOMP)) T_RECOMP = T_RECOMP + (OMP_GET_WTIME() - TT0)
+      IF (OK) THEN
+        ABLK%IS_LOWRANK = .TRUE.
+        ABLK%M = MI; ABLK%N = NJ; ABLK%RANK = NEWBLK%RANK
+        ABLK%UFAC => NEWBLK%UFAC   ! copie de POINTEUR seulement
+        ABLK%VFAC => NEWBLK%VFAC
+        NULLIFY(ABLK%DENSE)
+        RETURN
+      END IF
+      ! rang recompresse trop grand -> tombe dans le repli dense ci-dessous
+    END IF
+
+    ! cas 1 (ou repli du cas 2) : A ou L*U non basse-rang -> dense.
+    !
+    ! ABLK DEJA dense (le cas DE LOIN le plus frequent en pratique une fois
+    ! qu'un bloc est tombe en repli -- ce meme algorithme, arena ou non,
+    ! n'y revient JAMAIS ensuite : la branche bas-rang ci-dessus exige
+    ! ABLK%IS_LOWRANK, donc un bloc dense le reste pour toujours) : mise a
+    ! jour EN PLACE via SUBTRACT_PRODUCT_DENSE (meme principe que
+    ! SCHUR_UPDATE_BLOCK pour les blocs diagonaux, CGEMM BETA=1) --
+    ! ABLK%DENSE_FLAT (deja de la BONNE taille MI*NJ, fixe pour ce slot de
+    ! bloc) est reutilise TEL QUEL, ZERO carve, ZERO copie intermediaire.
+    ! C'est le correctif du gaspillage x28 mesure avec le carve-systematique
+    ! (voir la memoire du projet) : sans cette branche, EXPAND_BLOCK_ARENA
+    ! recopierait ABLK%DENSE dans un NOUVEAU buffer a CHAQUE etape K ou ce
+    ! bloc est touche, alors que son contenu est deja exactement la ou il
+    ! doit etre.
+    IF (.NOT. ABLK%IS_LOWRANK) THEN
+      IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
+      CALL SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, ABLK%DENSE)
+      ABLK%M = MI; ABLK%N = NJ
+      IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (OMP_GET_WTIME() - TT0)
+      RETURN
+    END IF
+
+    ! ABLK actuellement bas-rang -> PREMIERE bascule vers dense pour ce
+    ! bloc (n'arrivera plus jamais ensuite, voir ci-dessus). IMPORTANT
+    ! (ordre) : EXPAND_BLOCK_ARENA doit lire l'ANCIEN contenu de ABLK
+    ! (UFAC/VFAC) AVANT qu'on ne redirige ses pointeurs -- DENSE_VIEW est
+    ! carve/reutilise depuis ABLK%DENSE_FLAT, un buffer TOUJOURS DISTINCT
+    ! de UFAC/VFAC (jamais utilise tant que le bloc etait bas-rang), donc
+    ! sans aucun risque d'aliasing avec la lecture qui suit.
+    IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
+    FLAT => ARENA_CARVE_REUSE(ARENA, ABLK%DENSE_FLAT, INT(MI,8)*INT(NJ,8))
+    DENSE_VIEW(1:MI,1:NJ) => FLAT
+    CALL EXPAND_BLOCK_ARENA(ABLK, DENSE_VIEW, MI)
+    CALL SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, DENSE_VIEW)
+    ABLK%IS_LOWRANK = .FALSE.
+    ABLK%M = MI; ABLK%N = NJ
+    NULLIFY(ABLK%UFAC, ABLK%VFAC)
+    ABLK%DENSE => DENSE_VIEW
+    IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (OMP_GET_WTIME() - TT0)
+  END SUBROUTINE SCHUR_UPDATE_BLR_BLOCK_ARENA
+
+  !=========================================================================
+  ! VARIANTES FIXEDCAP (BLR_BLOCK_FIXEDCAP_T) -- voir le type ci-dessus
+  ! pour la justification complete. Contrairement a l'arena (composantes
+  ! POINTER, necessitant l'attribut TARGET propage), UFAC/VFAC/DENSE sont
+  ! ici de simples ALLOCATABLE -- aucune contrainte TARGET, affectation de
+  ! tableau ordinaire.
+  !=========================================================================
+
+  !-----------------------------------------------------------------------
+  ! Copie un bloc COMPRESS_BLOCK ordinaire (taille exacte) vers un bloc
+  ! FIXEDCAP (capacite RMAX) -- utilise a l'assemblage (COMPRESS_BLOCK
+  ! INCHANGEE, puis cette copie carve la capacite definitive du bloc pour
+  ! TOUTE la suite de la factorisation). RMAX recalcule ICI (pas encore
+  ! connu a l'assemblage) via COMPRESS_WORTHWHILE_RATIO -- MAX(...,
+  ! SRC%RANK) en garde-fou : le seuil d'acceptation de COMPRESS_BLOCK
+  ! (R < RATIO*MN, inegalite stricte) et la formule RMAX (INT(RATIO*MN)-1)
+  ! peuvent differer de 1 par arrondi ; la capacite allouee doit rester AU
+  ! MOINS aussi grande que le rang REELLEMENT accepte.
+  !-----------------------------------------------------------------------
+  SUBROUTINE COPY_REGULAR_TO_FIXEDCAP(SRC, DST)
+    TYPE(BLR_BLOCK_T), INTENT(IN) :: SRC
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(OUT) :: DST
+    DST%IS_LOWRANK = SRC%IS_LOWRANK
+    DST%M = SRC%M; DST%N = SRC%N; DST%RANK = SRC%RANK
+    IF (SRC%IS_LOWRANK) THEN
+      DST%RMAX = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(MIN(SRC%M,SRC%N),WP)) - 1)
+      DST%RMAX = MAX(DST%RMAX, SRC%RANK)
+      ALLOCATE(DST%UFAC(SRC%M,DST%RMAX), DST%VFAC(DST%RMAX,SRC%N))
+      DST%UFAC(1:SRC%M,1:SRC%RANK) = SRC%UFAC
+      DST%VFAC(1:SRC%RANK,1:SRC%N) = SRC%VFAC
+    ELSE
+      ALLOCATE(DST%DENSE(SRC%M,SRC%N))
+      DST%DENSE = SRC%DENSE
+    END IF
+  END SUBROUTINE COPY_REGULAR_TO_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Copie profonde d'un bloc FIXEDCAP vers un BLR_BLOCK_T ordinaire,
+  ! EXACTEMENT dimensionne au rang REEL (ignore la capacite RMAX) --
+  ! utilise avant diffusion MPI (BCAST_BLR_BLOCK, INCHANGEE, ne sait pas
+  ! lire un BLR_BLOCK_FIXEDCAP_T) : le volume envoye ne depend QUE du rang
+  ! reel, jamais de la capacite allouee.
+  !-----------------------------------------------------------------------
+  SUBROUTINE COPY_FIXEDCAP_TO_REGULAR(SRC, DST)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(IN) :: SRC
+    TYPE(BLR_BLOCK_T), INTENT(OUT)         :: DST
+    DST%IS_LOWRANK = SRC%IS_LOWRANK
+    DST%M = SRC%M; DST%N = SRC%N; DST%RANK = SRC%RANK
+    IF (SRC%IS_LOWRANK) THEN
+      ALLOCATE(DST%UFAC(SRC%M,SRC%RANK), DST%VFAC(SRC%RANK,SRC%N))
+      DST%UFAC = SRC%UFAC(1:SRC%M,1:SRC%RANK)
+      DST%VFAC = SRC%VFAC(1:SRC%RANK,1:SRC%N)
+    ELSE
+      ALLOCATE(DST%DENSE(SRC%M,SRC%N))
+      DST%DENSE = SRC%DENSE
+    END IF
+  END SUBROUTINE COPY_FIXEDCAP_TO_REGULAR
+
+  !-----------------------------------------------------------------------
+  ! Equivalent EXPAND_BLOCK -- BLK%UFAC/VFAC sont declares (M,RMAX)/
+  ! (RMAX,N) mais seules les RANK premieres colonnes/lignes sont valides :
+  ! la vue tranchee VFAC(1:RANK,:) force Fortran a passer une copie
+  ! temporaire CORRECTEMENT dimensionnee/stridee a CGEMM (le premier
+  ! indice de VFAC, paddé a RMAX, ne peut pas etre utilise tel quel comme
+  ! leading dimension) ; UFAC(1:M,1:RANK) est deja contigu (seul le
+  ! SECOND indice est paddé), la vue est gratuite (aucune copie).
+  !-----------------------------------------------------------------------
+  SUBROUTINE EXPAND_BLOCK_FIXEDCAP(BLK, OUT, LDOUT)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(IN) :: BLK
+    INTEGER, INTENT(IN)           :: LDOUT
+    COMPLEX(WP), INTENT(OUT)      :: OUT(LDOUT,BLK%N)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, BLK%N, BLK%RANK, &
+                  CONE, BLK%UFAC(1:BLK%M,1:BLK%RANK), BLK%M, BLK%VFAC(1:BLK%RANK,1:BLK%N), BLK%RANK, &
+                  CZERO, OUT, LDOUT)
+    ELSE
+      OUT(1:BLK%M,1:BLK%N) = BLK%DENSE
+    END IF
+  END SUBROUTINE EXPAND_BLOCK_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Equivalent BLR_BLOCK_ROW_SWAP -- corps STRICTEMENT identique cote
+  ! bas-rang : le swap porte sur les LIGNES de UFAC (premier indice,
+  ! JAMAIS paddé), le stride BLAS (KW = M) est inchange que UFAC soit
+  ! declare (M,RANK) ou (M,RMAX). Cote dense, DENSE n'est de toute facon
+  ! jamais paddé (taille fixe M*N, voir le type).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_BLOCK_ROW_SWAP_FIXEDCAP(BLK, KW, IPIV)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(INOUT) :: BLK
+    INTEGER, INTENT(IN) :: KW, IPIV(KW)
+    INTEGER :: I
+    IF (BLK%M .EQ. 0 .OR. BLK%N .EQ. 0) RETURN
+    IF (BLK%IS_LOWRANK) THEN
+      DO I = 1, KW
+        IF (IPIV(I) .NE. I) CALL CSWAP(BLK%RANK, BLK%UFAC(I,1), KW, BLK%UFAC(IPIV(I),1), KW)
+      END DO
+    ELSE
+      DO I = 1, KW
+        IF (IPIV(I) .NE. I) CALL CSWAP(BLK%N, BLK%DENSE(I,1), KW, BLK%DENSE(IPIV(I),1), KW)
+      END DO
+    END IF
+  END SUBROUTINE BLR_BLOCK_ROW_SWAP_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Equivalent BLR_TRSM_LEFT_LOWER_UNIT -- opere sur UFAC (premier indice
+  ! M jamais paddé) : passer BLK%UFAC tel quel avec N=BLK%RANK suffit,
+  ! CTRSM ne touche que les BLK%RANK premieres colonnes quel que soit
+  ! RMAX -- AUCUN changement necessaire par rapport a la version
+  ! BLR_BLOCK_T (seule la declaration de type de BLK differe).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_TRSM_LEFT_LOWER_UNIT_FIXEDCAP(DKK, KW, BLK)
+    INTEGER, INTENT(IN)             :: KW
+    COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(INOUT) :: BLK
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, BLK%RANK, CONE, DKK, KW, BLK%UFAC, KW)
+    ELSE
+      CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, BLK%N, CONE, DKK, KW, BLK%DENSE, KW)
+    END IF
+  END SUBROUTINE BLR_TRSM_LEFT_LOWER_UNIT_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Equivalent BLR_TRSM_RIGHT_UPPER_NONUNIT -- ICI, contrairement a UFAC,
+  ! VFAC a son PREMIER indice (le rang) paddé a RMAX : passer BLK%VFAC
+  ! TEL QUEL avec LDB=BLK%RANK serait FAUX (le stride physique reel est
+  ! RMAX, pas RANK -- corruption memoire). La vue tranchee
+  ! BLK%VFAC(1:BLK%RANK,:) force Fortran a passer une copie temporaire
+  ! CORRECTEMENT dimensionnee (LDB=BLK%RANK devient alors exact pour cette
+  ! copie), et a la recopier dans BLK%VFAC(1:BLK%RANK,:) en sortie (BLK
+  ! est INTENT(INOUT), CTRSM modifie ce facteur en place).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_TRSM_RIGHT_UPPER_NONUNIT_FIXEDCAP(BLK, DKK, KW)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(INOUT) :: BLK
+    INTEGER, INTENT(IN)             :: KW
+    COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', BLK%RANK, KW, CONE, DKK, KW, &
+                  BLK%VFAC(1:BLK%RANK,1:KW), BLK%RANK)
+    ELSE
+      CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', BLK%M, KW, CONE, DKK, KW, BLK%DENSE, BLK%M)
+    END IF
+  END SUBROUTINE BLR_TRSM_RIGHT_UPPER_NONUNIT_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Equivalent BLR_BLOCK_APPLY -- lecture SEULE de UFAC/VFAC (INTENT(IN)),
+  ! meme raisonnement que EXPAND_BLOCK_FIXEDCAP pour la vue tranchee de
+  ! VFAC.
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_BLOCK_APPLY_FIXEDCAP(BLK, NRHS, ALPHA, X, LDX, BETA, Y, LDY)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(IN) :: BLK
+    INTEGER, INTENT(IN)           :: NRHS, LDX, LDY
+    COMPLEX(WP), INTENT(IN)       :: ALPHA, BETA
+    COMPLEX(WP), INTENT(IN)       :: X(LDX,NRHS)
+    COMPLEX(WP), INTENT(INOUT)    :: Y(LDY,NRHS)
+
+    COMPLEX(WP), PARAMETER :: CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: T(:,:)
+
+    IF (BLK%M.EQ.0 .OR. BLK%N.EQ.0) RETURN
+
+    IF (BLK%IS_LOWRANK) THEN
+      ALLOCATE(T(BLK%RANK,NRHS))
+      CALL CGEMM('No transpose', 'No transpose', BLK%RANK, NRHS, BLK%N, &
+                  (1.0_WP,0.0_WP), BLK%VFAC(1:BLK%RANK,1:BLK%N), BLK%RANK, X, LDX, CZERO, T, BLK%RANK)
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, NRHS, BLK%RANK, &
+                  ALPHA, BLK%UFAC(1:BLK%M,1:BLK%RANK), BLK%M, T, BLK%RANK, BETA, Y, LDY)
+      DEALLOCATE(T)
+    ELSE
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, NRHS, BLK%N, &
+                  ALPHA, BLK%DENSE, BLK%M, X, LDX, BETA, Y, LDY)
+    END IF
+  END SUBROUTINE BLR_BLOCK_APPLY_FIXEDCAP
+
+  !-----------------------------------------------------------------------
+  ! Equivalent SCHUR_UPDATE_BLR_BLOCK -- ABLK est ici BLR_BLOCK_FIXEDCAP_T
+  ! (stockage PERSISTANT, capacite RMAX fixee a la premiere compression).
+  ! LBLK/UBLK (panneaux diffuses, transitoires) et PBLK/NEWBLK (locaux a
+  ! cet appel) restent des BLR_BLOCK_T ORDINAIRES -- FAST_RECOMPRESS
+  ! (INCHANGEE) est reutilisee TELLE QUELLE en lui passant des VUES
+  ! tranchees de ABLK%UFAC/VFAC comme UA/VA (dummy arguments a forme
+  ! EXPLICITE UA(MI,RA)/VA(RA,NJ) : Fortran gere automatiquement la copie
+  ! temporaire correcte pour VA, aucune gestion manuelle de leading
+  ! dimension necessaire) -- elle produit un NEWBLK ORDINAIRE (taille
+  ! exacte, transitoire), qu'on RECOPIE ENSUITE dans ABLK%UFAC/VFAC EN
+  ! PLACE (ECRASEMENT, PAS de nouvelle ALLOCATE) : NEWBLK%RANK<=ABLK%RMAX
+  ! est GARANTI par le test RTOT.GT.RMAX de FAST_RECOMPRESS -- c'est la
+  ! PROPRIETE CLE de cette variante, AUCUNE reallocation de la memoire
+  ! persistante apres la toute premiere compression du bloc.
+  !
+  ! Repli dense : une fois dense, TOUJOURS dense ensuite (meme garde
+  ! ABLK%IS_LOWRANK que la version non-FIXEDCAP) -- mise a jour directe EN
+  ! PLACE via SUBTRACT_PRODUCT_DENSE des le 2e passage (ZERO allocation,
+  ! comme SCHUR_UPDATE_BLOCK pour les blocs diagonaux) ; la PREMIERE
+  ! bascule alloue ABLK%DENSE(MI,NJ) (taille fixe, jamais realloue
+  ! ensuite) et LIBERE UFAC/VFAC (rendus a glibc -- un chunk de taille
+  ! COMMUNE a tous les blocs du meme calibre, immediatement reutilisable
+  ! par la PROCHAINE premiere compression d'un autre bloc, contrairement a
+  ! l'arena qui ne recupere jamais cet espace).
+  !-----------------------------------------------------------------------
+  SUBROUTINE SCHUR_UPDATE_BLR_BLOCK_FIXEDCAP(ABLK, MI, NJ, KW, LBLK, UBLK, TOL, WS, T_PRODUCT, T_RECOMP)
+    TYPE(BLR_BLOCK_FIXEDCAP_T), INTENT(INOUT) :: ABLK
+    INTEGER, INTENT(IN)              :: MI, NJ, KW
+    TYPE(BLR_BLOCK_T), INTENT(IN)    :: LBLK, UBLK
+    REAL(WP), INTENT(IN)             :: TOL
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
+    DOUBLE PRECISION, INTENT(INOUT), OPTIONAL :: T_PRODUCT, T_RECOMP
+
+    TYPE(BLR_BLOCK_T) :: PBLK, NEWBLK
+    LOGICAL :: OK
+    DOUBLE PRECISION :: TT0
+
+    IF (MI.EQ.0 .OR. NJ.EQ.0 .OR. KW.EQ.0) RETURN
+
+    IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
+    CALL COMPUTE_LU_PRODUCT(MI, NJ, KW, LBLK, UBLK, PBLK)
+    IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (OMP_GET_WTIME() - TT0)
+
+    IF (ABLK%IS_LOWRANK .AND. PBLK%IS_LOWRANK) THEN
+      IF (PRESENT(T_RECOMP)) TT0 = OMP_GET_WTIME()
+      IF (PRESENT(WS)) THEN
+        CALL FAST_RECOMPRESS(MI, NJ, ABLK%RANK, ABLK%UFAC(1:MI,1:ABLK%RANK), ABLK%VFAC(1:ABLK%RANK,1:NJ), &
+                              PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, ABLK%RMAX, NEWBLK, OK, WS)
+      ELSE
+        CALL FAST_RECOMPRESS(MI, NJ, ABLK%RANK, ABLK%UFAC(1:MI,1:ABLK%RANK), ABLK%VFAC(1:ABLK%RANK,1:NJ), &
+                              PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, ABLK%RMAX, NEWBLK, OK)
+      END IF
+      IF (PRESENT(T_RECOMP)) T_RECOMP = T_RECOMP + (OMP_GET_WTIME() - TT0)
+      IF (OK) THEN
+        ABLK%IS_LOWRANK = .TRUE.
+        ABLK%RANK = NEWBLK%RANK
+        ABLK%UFAC(1:MI,1:NEWBLK%RANK) = NEWBLK%UFAC   ! ECRASEMENT en place, PAS de (re)ALLOCATE
+        ABLK%VFAC(1:NEWBLK%RANK,1:NJ) = NEWBLK%VFAC
+        RETURN
+      END IF
+      ! rang recompresse trop grand -> tombe dans le repli dense ci-dessous
+    END IF
+
+    IF (.NOT. ABLK%IS_LOWRANK) THEN
+      ! deja dense (cas le plus frequent une fois la bascule faite) :
+      ! mise a jour EN PLACE, ZERO allocation.
+      IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
+      CALL SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, ABLK%DENSE)
+      IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (OMP_GET_WTIME() - TT0)
+      RETURN
+    END IF
+
+    ! PREMIERE bascule bas-rang -> dense pour ce bloc (n'arrivera plus
+    ! jamais ensuite, voir ci-dessus).
+    IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
+    ALLOCATE(ABLK%DENSE(MI,NJ))
+    CALL EXPAND_BLOCK_FIXEDCAP(ABLK, ABLK%DENSE, MI)
+    CALL SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, ABLK%DENSE)
+    ABLK%IS_LOWRANK = .FALSE.
+    DEALLOCATE(ABLK%UFAC, ABLK%VFAC)
+    IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (OMP_GET_WTIME() - TT0)
+  END SUBROUTINE SCHUR_UPDATE_BLR_BLOCK_FIXEDCAP
 
 END MODULE BLR_COMPRESS_MOD

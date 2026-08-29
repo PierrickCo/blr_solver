@@ -30,7 +30,7 @@ LIBMKL = -L$(MKLROOT)/lib -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core
 LIBS   = $(LIBMKL) -lpthread -lm -ldl
 MPILIBS = -L$(IMPI_LIBDIR) $(LIBS)
 
-all: test_block_lu test_blr_compress test_mpi_grid test_mpi_lu_pivot test_openmp_dense test_mpi_lu_solve_2d test_blr_matrix_progress test_blr_workspace test_mpi_blr_matrix test_mpi_blr_matrix_pivot bench_seq bench_mpi bench_blr_pipeline
+all: test_block_lu test_blr_compress test_mpi_grid test_mpi_lu_pivot test_openmp_dense test_mpi_lu_solve_2d test_blr_matrix_progress test_blr_workspace test_mpi_blr_matrix test_mpi_blr_matrix_pivot test_mpi_blr_matrix_pivot_arena bench_seq bench_mpi bench_blr_pipeline bench_blr_mpi_pivot_compressibility bench_blr_mpi_pivot_ratio
 
 blr_kinds_mod.o: $(SRC)/blr_kinds_mod.f90
 	$(FC) $(OPTF) -c $(SRC)/blr_kinds_mod.f90
@@ -48,13 +48,16 @@ test_block_lu.o: $(TEST)/test_block_lu.f90 block_lu_mod.o
 
 # --- Bibliotheque d'algebre par blocs full/low-rank (base de A/B et de
 # BLR+MPI) ----------------------------------------------------------------
-test_blr_compress: blr_kinds_mod.o blr_compress_mod.o test_blr_compress.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o test_blr_compress.o $(LIBS)
+test_blr_compress: blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o test_blr_compress.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o test_blr_compress.o $(LIBS)
 
-blr_compress_mod.o: $(SRC)/blr_compress_mod.f90 blr_kinds_mod.o
+blr_arena_mod.o: $(SRC)/blr_arena_mod.f90 blr_kinds_mod.o
+	$(FC) $(OPTF) -c $(SRC)/blr_arena_mod.f90
+
+blr_compress_mod.o: $(SRC)/blr_compress_mod.f90 blr_kinds_mod.o blr_arena_mod.o
 	$(FC) $(OPTF) -c $(SRC)/blr_compress_mod.f90
 
-test_blr_compress.o: $(TEST)/test_blr_compress.f90 blr_compress_mod.o
+test_blr_compress.o: $(TEST)/test_blr_compress.f90 blr_compress_mod.o blr_arena_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_compress.f90
 
 # --- Grille de processus + distribution bloc-cyclique 2D (base MPI) -----
@@ -84,7 +87,7 @@ test_mpi_lu_pivot.o: $(TEST)/test_mpi_lu_pivot.f90 mpi_lu_pivot_mod.o block_lu_m
 # reutilisee par mpi_blr_matrix_mod.f90 (diffusion de panneaux DEJA
 # compresses) -- sa propre routine de factorisation top-level (proposition
 # 3 historique) n'est plus testee ici, voir legacy/ pour son test dedie.
-mpi_blr_lu_pivot_bcast_mod.o: $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90 mpi_grid_mod.o blr_compress_mod.o mpi_lu_pivot_mod.o
+mpi_blr_lu_pivot_bcast_mod.o: $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90 mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o mpi_lu_pivot_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_lu_pivot_bcast_mod.f90
 
 # --- Case "dense + OpenMP" : pas de directive OMP a nous (un seul gros
@@ -128,47 +131,65 @@ test_mpi_lu_solve_2d.o: $(TEST)/test_mpi_lu_solve_2d.f90 mpi_lu_pivot_mod.o mpi_
 # BLR_BLOCK_T (jamais dense), panneaux L/U diffuses deja compresses,
 # resolution 2D complete -- variantes SANS et AVEC pivot confine au bloc
 # diagonal --------------------------------------------------------------
-test_mpi_blr_matrix: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix.o $(MPILIBS)
+test_mpi_blr_matrix: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix.o $(MPILIBS)
 
-mpi_blr_matrix_mod.o: $(SRC)/mpi_blr_matrix_mod.f90 mpi_grid_mod.o blr_compress_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o progress_bar_mod.o bench_utils_mod.o
+mpi_blr_matrix_mod.o: $(SRC)/mpi_blr_matrix_mod.f90 mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o progress_bar_mod.o bench_utils_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_matrix_mod.f90
 
 test_mpi_blr_matrix.o: $(TEST)/test_mpi_blr_matrix.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_matrix.f90
 
-test_mpi_blr_matrix_pivot: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix_pivot.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix_pivot.o $(MPILIBS)
+test_mpi_blr_matrix_pivot: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix_pivot.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix_pivot.o $(MPILIBS)
 
 test_mpi_blr_matrix_pivot.o: $(TEST)/test_mpi_blr_matrix_pivot.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_matrix_pivot.f90
+
+test_mpi_blr_matrix_pivot_arena: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix_pivot_arena.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o test_mpi_blr_matrix_pivot_arena.o $(MPILIBS)
+
+test_mpi_blr_matrix_pivot_arena.o: $(TEST)/test_mpi_blr_matrix_pivot_arena.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/test_mpi_blr_matrix_pivot_arena.f90
+
+bench_blr_mpi_pivot_compressibility: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o bench_blr_mpi_pivot_compressibility.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o bench_blr_mpi_pivot_compressibility.o $(MPILIBS)
+
+bench_blr_mpi_pivot_compressibility.o: $(TEST)/bench_blr_mpi_pivot_compressibility.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/bench_blr_mpi_pivot_compressibility.f90
+
+bench_blr_mpi_pivot_ratio: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o bench_blr_mpi_pivot_ratio.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o bench_blr_mpi_pivot_ratio.o $(MPILIBS)
+
+bench_blr_mpi_pivot_ratio.o: $(TEST)/bench_blr_mpi_pivot_ratio.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(TEST)/bench_blr_mpi_pivot_ratio.f90
 
 # --- References A/B : pipeline "matrice compressee de bout en bout" -----
 progress_bar_mod.o: $(SRC)/progress_bar_mod.f90
 	$(FC) $(OPTF) -c $(SRC)/progress_bar_mod.f90
 
-bench_blr_pipeline: blr_kinds_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o bench_utils_mod.o bench_blr_pipeline.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o bench_utils_mod.o bench_blr_pipeline.o $(LIBS)
+bench_blr_pipeline: blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o bench_utils_mod.o bench_blr_pipeline.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o bench_utils_mod.o bench_blr_pipeline.o $(LIBS)
 
 thread_control_mod.o: $(SRC)/thread_control_mkl.f90
 	$(FC) $(OPTF) -c $(SRC)/thread_control_mkl.f90 -o thread_control_mod.o
 
-blr_matrix_mod.o: $(SRC)/blr_matrix_mod.f90 blr_compress_mod.o progress_bar_mod.o thread_control_mod.o
+blr_matrix_mod.o: $(SRC)/blr_matrix_mod.f90 blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o
 	$(FC) $(OPTF) -c $(SRC)/blr_matrix_mod.f90
 
 bench_blr_pipeline.o: $(TEST)/bench_blr_pipeline.f90 blr_matrix_mod.o bench_utils_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/bench_blr_pipeline.f90
 
-test_blr_matrix_progress: blr_kinds_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o test_blr_matrix_progress.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o test_blr_matrix_progress.o $(LIBS)
+test_blr_matrix_progress: blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o test_blr_matrix_progress.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o test_blr_matrix_progress.o $(LIBS)
 
 test_blr_matrix_progress.o: $(TEST)/test_blr_matrix_progress.f90 blr_matrix_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_matrix_progress.f90
 
-test_blr_workspace: blr_kinds_mod.o blr_compress_mod.o test_blr_workspace.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o test_blr_workspace.o $(LIBS)
+test_blr_workspace: blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o test_blr_workspace.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o test_blr_workspace.o $(LIBS)
 
-test_blr_workspace.o: $(TEST)/test_blr_workspace.f90 blr_compress_mod.o
+test_blr_workspace.o: $(TEST)/test_blr_workspace.f90 blr_compress_mod.o blr_arena_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(TEST)/test_blr_workspace.f90
 
 # --- Exemples canoniques (examples/) : programmes simplifies, un par
@@ -178,10 +199,10 @@ test_blr_workspace.o: $(TEST)/test_blr_workspace.f90 blr_compress_mod.o
 # construits ci-dessus, comme legacy/Makefile.
 EX = examples
 
-examples: example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot
+examples: example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot example_blr_mpi_pivot_arena example_blr_mpi_pivot_fixedcap
 
-example_blr_sequentiel: blr_kinds_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o $(EX)/example_blr_sequentiel.o
-	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o $(EX)/example_blr_sequentiel.o $(LIBS)
+example_blr_sequentiel: blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o $(EX)/example_blr_sequentiel.o
+	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o $(EX)/example_blr_sequentiel.o $(LIBS)
 
 $(EX)/example_blr_sequentiel.o: $(EX)/example_blr_sequentiel.f90 blr_matrix_mod.o
 	$(FC) $(OPTF) $(INCS) -c $(EX)/example_blr_sequentiel.f90 -o $(EX)/example_blr_sequentiel.o
@@ -198,18 +219,30 @@ example_mpi_dense: blr_kinds_mod.o progress_bar_mod.o mpi_grid_mod.o mpi_lu_pivo
 $(EX)/example_mpi_dense.o: $(EX)/example_mpi_dense.f90 mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_mpi_dense.f90 -o $(EX)/example_mpi_dense.o
 
-example_blr_mpi_sans_pivot: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_sans_pivot.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_sans_pivot.o $(MPILIBS)
+example_blr_mpi_sans_pivot: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_sans_pivot.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_sans_pivot.o $(MPILIBS)
 
 $(EX)/example_blr_mpi_sans_pivot.o: $(EX)/example_blr_mpi_sans_pivot.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_sans_pivot.f90 -o $(EX)/example_blr_mpi_sans_pivot.o
 
-example_blr_mpi_pivot: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot.o
-	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot.o $(MPILIBS)
+example_blr_mpi_pivot: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot.o $(MPILIBS)
 
 $(EX)/example_blr_mpi_pivot.o: $(EX)/example_blr_mpi_pivot.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_pivot.f90 -o $(EX)/example_blr_mpi_pivot.o
 
+example_blr_mpi_pivot_arena: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot_arena.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot_arena.o $(MPILIBS)
+
+$(EX)/example_blr_mpi_pivot_arena.o: $(EX)/example_blr_mpi_pivot_arena.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_pivot_arena.f90 -o $(EX)/example_blr_mpi_pivot_arena.o
+
+example_blr_mpi_pivot_fixedcap: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot_fixedcap.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot_fixedcap.o $(MPILIBS)
+
+$(EX)/example_blr_mpi_pivot_fixedcap.o: $(EX)/example_blr_mpi_pivot_fixedcap.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_pivot_fixedcap.f90 -o $(EX)/example_blr_mpi_pivot_fixedcap.o
+
 clean:
-	$(RM) *.o *.mod test_block_lu test_blr_compress test_mpi_grid test_mpi_lu_pivot test_openmp_dense test_mpi_lu_solve_2d bench_seq bench_mpi bench_blr_pipeline test_blr_matrix_progress test_blr_workspace test_mpi_blr_matrix test_mpi_blr_matrix_pivot
-	$(RM) $(EX)/*.o example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot
+	$(RM) *.o *.mod test_block_lu test_blr_compress test_mpi_grid test_mpi_lu_pivot test_openmp_dense test_mpi_lu_solve_2d bench_seq bench_mpi bench_blr_pipeline test_blr_matrix_progress test_blr_workspace test_mpi_blr_matrix test_mpi_blr_matrix_pivot test_mpi_blr_matrix_pivot_arena bench_blr_mpi_pivot_compressibility bench_blr_mpi_pivot_ratio
+	$(RM) $(EX)/*.o example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot example_blr_mpi_pivot_arena example_blr_mpi_pivot_fixedcap
