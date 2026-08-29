@@ -125,3 +125,51 @@ fait exception : aucune synchronisation entre processus a cette etape
 (chacun assemble ses blocs locaux de son cote) -- l'affichage du rang 0
 n'est donc qu'une approximation (mais fidele, le decoupage bloc-cyclique
 equilibrant la charge entre processus).
+
+## Investigation de l'ecart RSS-vs-theorique (`example_blr_mpi_pivot.f90`)
+
+A N=20000/NB=500/grille 2x2, la factorisation ajoute ~49 Mo/processus de
+RSS reelle alors que le stockage BLR (theorique) ne grossit que de ~10 Mo
+(remplissage/fill-in) -- un ecart de ~39 Mo non explique par les donnees
+elles-memes. Quatre hypotheses ciblees ont ete testees, TOUTES ecartees
+ou negligeables :
+
+1. **Cache interne MKL** (`mkl_free_buffers()`, appele apres la
+   factorisation) -- ~15% de l'ecart recupere, pas la cause principale.
+2. **Fragmentation en haut de tas** (`malloc_trim(0)`, glibc) -- ~0%
+   recupere (il ne peut agir que sur la memoire libre CONTIGUE en haut du
+   tas, pas les trous au milieu).
+3. **Reallocation implicite Fortran** (`ABLK = NEWBLK` declenche une
+   reallocation+copie supplementaire meme si `NEWBLK` est deja a la bonne
+   taille) -- corrige via `MOVE_ALLOC` (voir `SCHUR_UPDATE_BLR_BLOCK`,
+   `blr_compress_mod.f90`, argument optionnel `USE_MOVE_ALLOC`,
+   propage par `MPI_BLR_MATRIX_LU_FACTOR_PIVOT`) -- resultat numerique
+   IDENTIQUE (verifie bit-a-bit), mais ~0% de gain memoire mesure.
+4. **Seuil `mmap` glibc** (`mallopt(M_MMAP_THRESHOLD, ...)`, testé puis
+   retire -- voir l'historique git) -- l'appel reussit (code retour 1)
+   mais ~0% d'effet, tres probablement parce que le runtime Fortran
+   d'Intel (`ifx`) ne route pas les `ALLOCATE`/`DEALLOCATE` par le
+   `malloc()` de glibc que ce reglage controle (non confirme -- non
+   teste sous gfortran, qui route typiquement `ALLOCATE` directement par
+   `malloc()`).
+
+**Conclusion** : un tracage RSS par etape K (`SHOW_RSS_TRACE`, argument
+optionnel de `MPI_BLR_MATRIX_LU_FACTOR_PIVOT`, actif dans cet exemple)
+montre une croissance CONTINUE qui RALENTIT et se stabilise vers la fin
+de la factorisation -- une signature de fragmentation proportionnelle au
+VOLUME de travail (le nombre de blocs mis a jour a chaque etape diminue
+mecaniquement quand la sous-matrice traINante retrecit), pas d'une fuite
+qui grossirait sans lien avec le travail restant. Aucun allocateur
+standard (glibc, jemalloc, tcmalloc) ne peut compacter (deplacer) de la
+memoire encore utilisee -- seule une reecriture manuelle (arena/pool
+dedie sur toute la duree de la factorisation, pas juste une etape --
+le stockage des blocs doit survivre au-dela d'une seule etape K)
+offrirait une garantie reelle, avec son propre compromis (memoire
+gaspillee par les anciennes versions de blocs jamais recuperees) --
+chantier volontairement laisse de cote pour l'instant, le rapport
+effort/gain n'etant pas demontre.
+
+`USE_MOVE_ALLOC` est conserve (defaut `.FALSE.`, aucun changement de
+comportement) car c'est une bonne pratique defensive independante du
+gain memoire observe ici. `SHOW_RSS_TRACE` est conserve comme outil de
+diagnostic permanent (defaut `.FALSE.`, cout nul).

@@ -27,6 +27,10 @@ example_blr_mpi_sans_pivot
 example_blr_mpi_pivot
 examples/*.o
 
+# Binaire du micro-benchmark de diagnostic (pas dans le Makefile,
+# compile manuellement -- voir test/bench_arena_hypothesis.f90)
+bench_arena_hypothesis
+
 # Binaires legacy/
 legacy/test_ldlt
 legacy/test_blr_ldlt

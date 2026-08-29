@@ -51,6 +51,7 @@ MODULE MPI_BLR_MATRIX_MOD
   USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE, DENSE_PANEL_T
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE
+  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
 
   TYPE :: MPI_BLR_MATRIX_T
@@ -438,7 +439,7 @@ CONTAINS
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
                                              N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                             SHOW_PROGRESS)
+                                             SHOW_PROGRESS, SHOW_RSS_TRACE, USE_MOVE_ALLOC)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)          :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(INOUT) :: A_BLR
@@ -449,6 +450,19 @@ CONTAINS
     INTEGER, INTENT(OUT), OPTIONAL    :: N_SWAPS
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_FACTOR
     LOGICAL, INTENT(IN), OPTIONAL     :: SHOW_PROGRESS
+    ! DIAGNOSTIC TEMPORAIRE (a retirer une fois l'investigation terminee,
+    ! voir la memoire du projet -- ecart RSS-vs-theorique apres factori-
+    ! sation, causes MKL/malloc_trim ecartees) : affiche la RSS du
+    ! processus 0 A CHAQUE etape K, pour voir la FORME de la croissance
+    ! (reguliere = fragmentation continue plausible ; par sauts ponctuels
+    ! = plutot un redimensionnement de workspace qui grossit sans jamais
+    ! retrecir). N'affecte AUCUN resultat -- uniquement des WRITE.
+    LOGICAL, INTENT(IN), OPTIONAL     :: SHOW_RSS_TRACE
+    ! USE_MOVE_ALLOC (optionnel, defaut .FALSE.) : transmis tel quel a
+    ! SCHUR_UPDATE_BLR_BLOCK (voir blr_compress_mod.f90) -- evite la
+    ! reallocation implicite de "ABLK = NEWBLK" au profit d'un transfert
+    ! de propriete (MOVE_ALLOC). Resultat numerique IDENTIQUE.
+    LOGICAL, INTENT(IN), OPTIONAL     :: USE_MOVE_ALLOC
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
@@ -458,7 +472,7 @@ CONTAINS
     INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, NS_LOCAL, li_K, LAST_PCT
     INTEGER(8) :: RS_LOCAL
     DOUBLE PRECISION :: T0
-    LOGICAL :: PROGRESS
+    LOGICAL :: PROGRESS, RSS_TRACE
 
     ! Boucle K=1..NBLK GLOBALEMENT synchronisee (MPI_BCAST a chaque etape,
     ! voir plus bas) -- contrairement a l'assemblage, K/NBLK est ici un
@@ -468,6 +482,8 @@ CONTAINS
     PROGRESS = .FALSE.
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
     LAST_PCT = -5
+    RSS_TRACE = .FALSE.
+    IF (PRESENT(SHOW_RSS_TRACE)) RSS_TRACE = SHOW_RSS_TRACE .AND. (GRID%MYID.EQ.0)
 
     T0 = MPI_WTIME()
     NBLK = A_BLR%NBLK
@@ -610,12 +626,15 @@ CONTAINS
           IF (I .EQ. J) THEN
             CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, LRECV(li), URECV(lj), A_BLR%DIAGBLK(I)%D, MI)
           ELSE
-            CALL SCHUR_UPDATE_BLR_BLOCK(A_BLR%OFFBLK(li,lj), MI, NJ, KW, LRECV(li), URECV(lj), TOL, WS)
+            CALL SCHUR_UPDATE_BLR_BLOCK(A_BLR%OFFBLK(li,lj), MI, NJ, KW, LRECV(li), URECV(lj), TOL, WS, &
+                                         USE_MOVE_ALLOC=USE_MOVE_ALLOC)
           END IF
         END DO
       END DO
 
       IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('3) Factorisation LU (pivot)', K, NBLK, LAST_PCT)
+      IF (RSS_TRACE) WRITE(6,'(A,I4,A,F8.1,A)') '     [RSS trace] K=', K, ' : RSS = ', &
+           REAL(GET_RSS_KB(),8)/1024.0D0, ' Mo'
     END DO
 
     DEALLOCATE(LRECV, URECV)

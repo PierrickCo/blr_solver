@@ -16,8 +16,16 @@
 ! test/test_mpi_blr_matrix_pivot.f90 pour la version qui verifie aussi la
 ! correction contre une reference independante).
 !
-! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL]
-!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4)
+! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [USE_MOVE_ALLOC]
+!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 USE_MOVE_ALLOC=0)
+!         USE_MOVE_ALLOC=1 : SCHUR_UPDATE_BLR_BLOCK transfere la propriete
+!         des tableaux via MOVE_ALLOC au lieu de "ABLK=NEWBLK" (qui
+!         declenche une reallocation+copie implicite supplementaire) --
+!         resultat numerique IDENTIQUE, bonne pratique defensive
+!         independante du gain memoire (voir la memoire du projet :
+!         mesure a N=20000, l'effet sur la RSS s'est avere negligeable,
+!         mais le correctif reste correct et sans risque, garde par
+!         defaut desactive pour ne rien changer au comportement existant).
 !===============================================================================
 PROGRAM EXAMPLE_BLR_MPI_PIVOT
   USE MPI_BLR_MATRIX_MOD
@@ -36,8 +44,10 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   INTEGER :: N_COMPRESSED, N_OFFDIAG, li, I
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR
+  INTEGER :: USE_MOVE_ALLOC_INT
+  LOGICAL :: USE_MOVE_ALLOC_FLAG
 
-  N = 4000; NB = 200; NRHS = 4; TOL = 1.0E-4_WP
+  N = 4000; NB = 200; NRHS = 4; TOL = 1.0E-4_WP; USE_MOVE_ALLOC_INT = 0
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
@@ -61,6 +71,10 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   IF (COMMAND_ARGUMENT_COUNT() .GE. 6) THEN
     CALL GET_COMMAND_ARGUMENT(6, ARG); READ(ARG,*) TOL
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 7) THEN
+    CALL GET_COMMAND_ARGUMENT(7, ARG); READ(ARG,*) USE_MOVE_ALLOC_INT
+  END IF
+  USE_MOVE_ALLOC_FLAG = (USE_MOVE_ALLOC_INT .NE. 0)
 
   CALL GRID_INIT(GRID, MPI_COMM_WORLD, PR, PC, IERR)
   IF (IERR .NE. 0) THEN
@@ -68,8 +82,17 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
-  IF (MYID0.EQ.0) WRITE(6,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2)') &
-       ' Grille ', PR, 'x', PC, ' , N=', N, ' , NB=', NB, ' , NRHS=', NRHS, ' , TOL=', TOL
+  IF (MYID0.EQ.0) WRITE(6,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2,A,L1)') &
+       ' Grille ', PR, 'x', PC, ' , N=', N, ' , NB=', NB, ' , NRHS=', NRHS, ' , TOL=', TOL, &
+       ' , USE_MOVE_ALLOC=', USE_MOVE_ALLOC_FLAG
+
+  ! RSS DE REFERENCE : capturee AVANT toute allocation de donnees (A_BLR,
+  ! B_LOCAL...) -- isole le cout FIXE du runtime deja charge en memoire a
+  ! ce stade (Intel MPI, MKL, le Fortran runtime lui-meme) de la
+  ! croissance imputable a NOTRE code. Comparer (RSS_apres - RSS_reference)
+  ! a la valeur theorique est un test plus honnete que RSS_apres seule,
+  ! qui melange les deux.
+  CALL REPORT_MEMORY_MB(GRID, 'RSS de reference (avant donnees)', GET_RSS_KB()*1024_8)
 
   ! --- 1) assemblage BLR distribue (matrice "anti-diagonale forte / diagonale
   !     naturelle faible" -- force un vrai pivotage, chaotique/peu compressible :
@@ -108,7 +131,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! globalement synchronisee par les MPI_BCAST a chaque etape K).
   CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
                                        N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                       SHOW_PROGRESS=.TRUE.)
+                                       SHOW_PROGRESS=.FALSE., SHOW_RSS_TRACE=.TRUE., &
+                                       USE_MOVE_ALLOC=USE_MOVE_ALLOC_FLAG)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT, INFO=', INFO
     CALL MPI_FINALIZE(IERR)

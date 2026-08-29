@@ -631,21 +631,38 @@ CONTAINS
   ! pour les appelants existants (blr_matrix_mod.f90 sous !$OMP PARALLEL DO,
   ! qui ne les passe pas).
   !-----------------------------------------------------------------------
-  SUBROUTINE SCHUR_UPDATE_BLR_BLOCK(ABLK, MI, NJ, KW, LBLK, UBLK, TOL, WS, T_PRODUCT, T_RECOMP)
+  ! USE_MOVE_ALLOC (optionnel, defaut .FALSE. = comportement INCHANGE) :
+  ! DIAGNOSTIC/OPTIMISATION EN COURS D'EVALUATION (voir la memoire du
+  ! projet -- ecart RSS-vs-theorique de MPI_BLR_MATRIX_LU_FACTOR_PIVOT).
+  ! Par defaut, "ABLK = NEWBLK" (assignation Fortran de type derive a
+  ! composantes ALLOCATABLE) declenche une REALLOCATION IMPLICITE de
+  ! ABLK%UFAC/VFAC a la forme de NEWBLK PUIS une COPIE -- meme si NEWBLK
+  ! vient d'etre alloue a la bonne taille, c'est un DEUXIEME cycle
+  ! allocation/copie en plus du premier (dans FAST_RECOMPRESS). Avec
+  ! USE_MOVE_ALLOC=.TRUE., on desalloue explicitement l'ancien contenu de
+  ! ABLK puis on TRANSFERE la propriete des tableaux de NEWBLK/DENSE_TMP
+  ! vers ABLK via MOVE_ALLOC (aucune copie, aucune reallocation
+  ! supplementaire) -- resultat numerique IDENTIQUE, seul le nombre de
+  ! cycles allocate/deallocate change.
+  SUBROUTINE SCHUR_UPDATE_BLR_BLOCK(ABLK, MI, NJ, KW, LBLK, UBLK, TOL, WS, T_PRODUCT, T_RECOMP, USE_MOVE_ALLOC)
     TYPE(BLR_BLOCK_T), INTENT(INOUT) :: ABLK
     INTEGER, INTENT(IN)              :: MI, NJ, KW
     TYPE(BLR_BLOCK_T), INTENT(IN)    :: LBLK, UBLK
     REAL(WP), INTENT(IN)             :: TOL
     TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
     DOUBLE PRECISION, INTENT(INOUT), OPTIONAL :: T_PRODUCT, T_RECOMP
+    LOGICAL, INTENT(IN), OPTIONAL     :: USE_MOVE_ALLOC
 
     TYPE(BLR_BLOCK_T) :: PBLK, NEWBLK, DENSEBLK
     COMPLEX(WP), ALLOCATABLE :: DENSE_TMP(:,:)
     INTEGER :: RMAX
-    LOGICAL :: OK
+    LOGICAL :: OK, MOVEALLOC_ON
     DOUBLE PRECISION :: TT0
 
     IF (MI.EQ.0 .OR. NJ.EQ.0 .OR. KW.EQ.0) RETURN
+
+    MOVEALLOC_ON = .FALSE.
+    IF (PRESENT(USE_MOVE_ALLOC)) MOVEALLOC_ON = USE_MOVE_ALLOC
 
     IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
     CALL COMPUTE_LU_PRODUCT(MI, NJ, KW, LBLK, UBLK, PBLK)
@@ -664,7 +681,20 @@ CONTAINS
       END IF
       IF (PRESENT(T_RECOMP)) T_RECOMP = T_RECOMP + (OMP_GET_WTIME() - TT0)
       IF (OK) THEN
-        ABLK = NEWBLK
+        IF (MOVEALLOC_ON) THEN
+          ! transfert de propriete (NEWBLK%UFAC/VFAC deja alloues a la
+          ! bonne taille dans FAST_RECOMPRESS) -- AUCUNE copie, AUCUNE
+          ! reallocation supplementaire, contrairement a "ABLK = NEWBLK".
+          IF (ALLOCATED(ABLK%UFAC))  DEALLOCATE(ABLK%UFAC)
+          IF (ALLOCATED(ABLK%VFAC))  DEALLOCATE(ABLK%VFAC)
+          IF (ALLOCATED(ABLK%DENSE)) DEALLOCATE(ABLK%DENSE)
+          CALL MOVE_ALLOC(NEWBLK%UFAC, ABLK%UFAC)
+          CALL MOVE_ALLOC(NEWBLK%VFAC, ABLK%VFAC)
+          ABLK%IS_LOWRANK = .TRUE.
+          ABLK%M = MI; ABLK%N = NJ; ABLK%RANK = NEWBLK%RANK
+        ELSE
+          ABLK = NEWBLK
+        END IF
         RETURN
       END IF
       ! rang recompresse trop grand -> tombe dans le repli dense ci-dessous
@@ -675,10 +705,22 @@ CONTAINS
     ALLOCATE(DENSE_TMP(MI,NJ))
     CALL EXPAND_BLOCK(ABLK, DENSE_TMP, MI)
     CALL SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, DENSE_TMP)
-    DENSEBLK%IS_LOWRANK = .FALSE.
-    DENSEBLK%M = MI; DENSEBLK%N = NJ
-    CALL MOVE_ALLOC(DENSE_TMP, DENSEBLK%DENSE)
-    ABLK = DENSEBLK
+    IF (MOVEALLOC_ON) THEN
+      ! meme principe : DENSE_TMP est deja a la bonne taille, transfert
+      ! direct vers ABLK%DENSE au lieu de passer par un DENSEBLK
+      ! intermediaire puis "ABLK = DENSEBLK".
+      IF (ALLOCATED(ABLK%UFAC))  DEALLOCATE(ABLK%UFAC)
+      IF (ALLOCATED(ABLK%VFAC))  DEALLOCATE(ABLK%VFAC)
+      IF (ALLOCATED(ABLK%DENSE)) DEALLOCATE(ABLK%DENSE)
+      CALL MOVE_ALLOC(DENSE_TMP, ABLK%DENSE)
+      ABLK%IS_LOWRANK = .FALSE.
+      ABLK%M = MI; ABLK%N = NJ
+    ELSE
+      DENSEBLK%IS_LOWRANK = .FALSE.
+      DENSEBLK%M = MI; DENSEBLK%N = NJ
+      CALL MOVE_ALLOC(DENSE_TMP, DENSEBLK%DENSE)
+      ABLK = DENSEBLK
+    END IF
     IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (OMP_GET_WTIME() - TT0)
   END SUBROUTINE SCHUR_UPDATE_BLR_BLOCK
 
