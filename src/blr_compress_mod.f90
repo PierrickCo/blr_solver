@@ -368,6 +368,312 @@ CONTAINS
   END SUBROUTINE COMPRESS_BLOCK
 
   !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- orthonormalise en place les COLONNES de A (ROWS x COLS,
+  ! ROWS>=COLS) via CGEQRF+CUNGQR. Appelee a CHAQUE demi-etape de RSVD_
+  ! RANGE_SVD (pas seulement a la fin) -- voir son commentaire pour
+  ! pourquoi c'est necessaire en simple precision des que NPOWER>1.
+  !-----------------------------------------------------------------------
+  SUBROUTINE ORTHONORMALIZE_COLS(A, ROWS, COLS)
+    INTEGER, INTENT(IN)          :: ROWS, COLS
+    COMPLEX(WP), INTENT(INOUT)   :: A(ROWS,COLS)
+    COMPLEX(WP), ALLOCATABLE :: TAU(:), CWORK(:)
+    INTEGER :: INFO, LWORK
+
+    ALLOCATE(TAU(COLS))
+    ALLOCATE(CWORK(1)); LWORK = -1
+    CALL CGEQRF(ROWS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    LWORK = INT(REAL(CWORK(1))); DEALLOCATE(CWORK); ALLOCATE(CWORK(MAX(LWORK,1)))
+    CALL CGEQRF(ROWS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    DEALLOCATE(CWORK); ALLOCATE(CWORK(1)); LWORK = -1
+    CALL CUNGQR(ROWS, COLS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    LWORK = INT(REAL(CWORK(1))); DEALLOCATE(CWORK); ALLOCATE(CWORK(MAX(LWORK,1)))
+    CALL CUNGQR(ROWS, COLS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    DEALLOCATE(CWORK, TAU)
+  END SUBROUTINE ORTHONORMALIZE_COLS
+
+  !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- coeur PARTAGE de la SVD randomisee (schema Halko-
+  ! Martinsson-Tropp : projection aleatoire + iterations de puissance +
+  ! QR + petite SVD), factorise ICI pour etre appele soit UNE FOIS a taille
+  ! de sous-espace L FIXE (COMPRESS_BLOCK_RSVD, rang cible connu), soit EN
+  ! BOUCLE a L CROISSANT (COMPRESS_BLOCK_RSVD_ADAPTIVE, rang inconnu) --
+  ! une seule implementation des GEMM/QR/SVD, aucune duplication entre les
+  ! deux routines publiques.
+  !
+  ! ALGORITHME (L colonnes de sous-espace) :
+  !   1) Omega (N x L) matrice ALEATOIRE (parties reelle/imaginaire
+  !      uniformes independantes, PAS besoin de gaussien strict pour un
+  !      bon sous-espace d'echantillonnage en pratique).
+  !   2) Y = B*Omega (M x L), puis NPOWER iterations de puissance
+  !      Y <- B*(B^H*Y) (ameliore la qualite quand les valeurs
+  !      singulieres decroissent lentement -- coute 2 GEMM(M,N,L)
+  !      supplementaires par iteration).
+  !   3) Q = orthonormalisation de Y (CGEQRF+CUNGQR) -- base du sous-
+  !      espace image approxime de B.
+  !   4) B_proj = Q^H*B (L x N, PETIT) -- SVD COMPLETE de B_proj (CGESVD)
+  !      coute O(L*N*L) au lieu de O(M*N*min(M,N)) pour B directement :
+  !      c'est le remplacement du cout domine, PROPORTIONNEL a L/min(M,N).
+  !   5) UFULL = Q*Uhat (M x L) -- S(1:L) et VTHAT(1:L,:) approximent les L
+  !      premieres valeurs/vecteurs singuliers de B (de plus en plus mal
+  !      approximes en approchant l'indice L, d'ou la marge d'echantillon-
+  !      nage OVERSAMPLE consommee par les appelants).
+  !-----------------------------------------------------------------------
+  SUBROUTINE RSVD_RANGE_SVD(M, N, B, LDB, L, NPOWER, S, UFULL, VTHAT)
+    INTEGER, INTENT(IN)         :: M, N, LDB, L, NPOWER
+    COMPLEX(WP), INTENT(IN)     :: B(LDB,N)
+    REAL(WP), INTENT(OUT)       :: S(L)
+    COMPLEX(WP), INTENT(OUT)    :: UFULL(M,L), VTHAT(L,N)
+
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: OMEGA(:,:), Y(:,:), Z(:,:), BPROJ(:,:)
+    COMPLEX(WP), ALLOCATABLE :: UHAT(:,:), CWORK(:)
+    REAL(WP), ALLOCATABLE    :: RWORK(:), RE_PART(:,:), IM_PART(:,:)
+    INTEGER :: IP, INFO, LWORK
+
+    ! 1) Omega (N x L) aleatoire, parties reelle/imaginaire uniformes sur
+    ! [-1,1) independantes.
+    ALLOCATE(OMEGA(N,L), RE_PART(N,L), IM_PART(N,L))
+    CALL RANDOM_NUMBER(RE_PART)
+    CALL RANDOM_NUMBER(IM_PART)
+    OMEGA = CMPLX(2.0_WP*RE_PART-1.0_WP, 2.0_WP*IM_PART-1.0_WP, KIND=WP)
+    DEALLOCATE(RE_PART, IM_PART)
+
+    ! 2) Y = B*Omega, ORTHONORMALISE IMMEDIATEMENT (voir ORTHONORMALIZE_
+    ! COLS), puis NPOWER iterations de puissance -- CHAQUE demi-iteration
+    ! (Z=B^H*Y puis Y=B*Z) est RE-orthonormalisee AUSSITOT, jamais
+    ! seulement a la toute fin. BOGUE CORRIGE (mesure) : sans cette
+    ! re-orthonormalisation intermediaire, la plage dynamique de Y/Z
+    ! explose au fil des iterations (le rapport des valeurs singulieres
+    ! extremes est porte a la puissance 2*IP+1) -- en simple precision
+    ! (WP), ca degrade CATASTROPHIQUEMENT la precision des qu'on depasse
+    ! NPOWER=1 (mesure : erreur relative x30 pire entre NPOWER=1 et
+    ! NPOWER=3 sur un cas reel, voir test/bench_rsvd_compress.f90) plutot
+    ! que de l'ameliorer comme prevu par la theorie (qui suppose une
+    ! arithmetique a precision infinie ou re-orthonormalisee a chaque
+    ! etape).
+    ALLOCATE(Y(M,L))
+    CALL CGEMM('No transpose', 'No transpose', M, L, N, CONE, B, LDB, OMEGA, N, CZERO, Y, M)
+    DEALLOCATE(OMEGA)
+    CALL ORTHONORMALIZE_COLS(Y, M, L)
+    DO IP = 1, NPOWER
+      ALLOCATE(Z(N,L))
+      CALL CGEMM('Conjugate transpose', 'No transpose', N, L, M, CONE, B, LDB, Y, M, CZERO, Z, N)
+      CALL ORTHONORMALIZE_COLS(Z, N, L)
+      CALL CGEMM('No transpose', 'No transpose', M, L, N, CONE, B, LDB, Z, N, CZERO, Y, M)
+      CALL ORTHONORMALIZE_COLS(Y, M, L)
+      DEALLOCATE(Z)
+    END DO
+    ! Y contient maintenant Q (M x L), colonnes orthonormees (par
+    ! construction : derniere operation de la boucle, ou de l'etape
+    ! initiale si NPOWER=0).
+
+    ! 4) B_proj = Q^H*B (L x N, PETIT) -- SVD COMPLETE de ce petit systeme.
+    ALLOCATE(BPROJ(L,N))
+    CALL CGEMM('Conjugate transpose', 'No transpose', L, N, M, CONE, Y, M, B, LDB, CZERO, BPROJ, L)
+
+    ALLOCATE(UHAT(L,L), RWORK(5*L))
+    ALLOCATE(CWORK(1)); LWORK = -1
+    CALL CGESVD('S', 'S', L, N, BPROJ, L, S, UHAT, L, VTHAT, L, CWORK, LWORK, RWORK, INFO)
+    LWORK = INT(REAL(CWORK(1))); DEALLOCATE(CWORK); ALLOCATE(CWORK(MAX(LWORK,1)))
+    CALL CGESVD('S', 'S', L, N, BPROJ, L, S, UHAT, L, VTHAT, L, CWORK, LWORK, RWORK, INFO)
+    DEALLOCATE(CWORK, BPROJ, RWORK)
+
+    ! 5) UFULL = Q*Uhat (M x L).
+    CALL CGEMM('No transpose', 'No transpose', M, L, L, CONE, Y, M, UHAT, L, CZERO, UFULL, M)
+    DEALLOCATE(Y, UHAT)
+  END SUBROUTINE RSVD_RANGE_SVD
+
+  !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- SVD randomisee a RANG CIBLE FIXE, PREMIERE PASSE
+  ! demandee explicitement pour mesurer l'ordre de grandeur du gain face a
+  ! COMPRESS_BLOCK (CGESVD complet, mesure : ~90-95% du temps d'assemblage
+  ! a N=20000, voir bench/bench_blr_mpi_pivot_ooc_compare.f90) -- RANK_
+  ! TARGET choisi par l'APPELANT (typiquement en copiant le rang deja
+  ! trouve par COMPRESS_BLOCK pour une comparaison a rang EGAL). Voir
+  ! COMPRESS_BLOCK_RSVD_ADAPTIVE ci-dessous pour la version SANS rang
+  ! connu a l'avance (le cas d'usage reel). Routine INDEPENDANTE de
+  ! COMPRESS_BLOCK, n'affecte AUCUN code existant.
+  !
+  ! GARANTIE : PROBABILISTE, pas deterministe (contrairement a CGESVD) --
+  ! l'erreur d'approximation depend du tirage aleatoire d'Omega ET de la
+  ! decroissance reelle des valeurs singulieres de B. Ne PAS utiliser tel
+  ! quel en production sans validation de la marge d'erreur (voir
+  ! test/bench_rsvd_compress.f90 pour la mesure temps ET precision).
+  !-----------------------------------------------------------------------
+  SUBROUTINE COMPRESS_BLOCK_RSVD(M, N, B, LDB, RANK_TARGET, OVERSAMPLE, NPOWER, BLK)
+    INTEGER, INTENT(IN)            :: M, N, LDB, RANK_TARGET, OVERSAMPLE, NPOWER
+    COMPLEX(WP), INTENT(IN)        :: B(LDB,N)
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: BLK
+
+    COMPLEX(WP), ALLOCATABLE :: UFULL(:,:), VTHAT(:,:)
+    REAL(WP), ALLOCATABLE    :: S(:)
+    INTEGER :: L, R, I
+
+    L = MIN(RANK_TARGET + OVERSAMPLE, MIN(M,N))
+    R = MIN(RANK_TARGET, L)
+    BLK%M = M; BLK%N = N
+
+    ALLOCATE(UFULL(M,L), VTHAT(L,N), S(L))
+    CALL RSVD_RANGE_SVD(M, N, B, LDB, L, NPOWER, S, UFULL, VTHAT)
+
+    BLK%IS_LOWRANK = .TRUE.
+    BLK%RANK = R
+    ALLOCATE(BLK%UFAC(M,R), BLK%VFAC(R,N))
+    BLK%UFAC = UFULL(1:M,1:R)
+    DO I = 1, R
+      BLK%VFAC(I,1:N) = S(I) * VTHAT(I,1:N)
+    END DO
+    DEALLOCATE(UFULL, VTHAT, S)
+  END SUBROUTINE COMPRESS_BLOCK_RSVD
+
+  !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- SVD randomisee ADAPTATIVE : rang PAS connu a l'avance,
+  ! decouvert en faisant CROITRE la taille du sous-espace d'echantillon
+  ! (doublement) jusqu'a ce qu'un CRITERE D'ARRET base sur la marge de
+  ! sur-echantillonnage restante indique une confiance suffisante -- voir
+  ! COMPRESS_BLOCK_RSVD ci-dessus pour la version a rang deja connu.
+  !
+  ! CRITERE D'ARRET (heuristique PRATIQUE, PAS le critere probabiliste
+  ! rigoureux de Halko-Martinsson-Tropp Algorithme 4.2, qui necessiterait
+  ! un Gram-Schmidt incremental colonne par colonne avec estimateur
+  ! d'erreur par vecteurs de sondage supplementaires -- plus complexe a
+  ! implementer correctement, laisse comme etape ulterieure si celui-ci
+  ! s'avere insuffisant en pratique) : a sous-espace de taille L, on compte
+  ! R = nombre de valeurs singulieres approximees S(1:L) au-dessus du
+  ! seuil TOL*S(1) (MEME regle que COMPRESS_BLOCK). Si R <= L-OVERSAMPLE,
+  ! il reste une marge de sur-echantillonnage NON consommee -- signe que
+  ! le sous-espace est assez grand pour avoir capture toutes les
+  ! directions significatives (les L-R dernieres colonnes, dans la zone de
+  ! marge, ont ete jugees NON significatives). Si R depasse ce seuil, la
+  ! marge est "epuisee" -- signe qu'il pourrait exister des directions
+  ! significatives AU-DELA de L qu'on n'a pas encore vues : on DOUBLE L et
+  ! on recommence. Arret aussi si L atteint LCAP (= seuil COMPRESS_
+  ! WORTHWHILE_RATIO*min(M,N), le MEME plafond que COMPRESS_BLOCK utilise
+  ! pour son repli dense -- au-dela, la compression ne vaudrait de toute
+  ! facon pas le coup) : reste alors DENSE, comme COMPRESS_BLOCK.
+  !
+  ! GARANTIE : PROBABILISTE ET HEURISTIQUE (le critere d'arret lui-meme
+  ! n'a pas de borne de confiance formelle, contrairement au vrai
+  ! algorithme adaptatif HMT). MESURE (test/bench_rsvd_compress.f90, cas
+  ! limite volontairement difficile -- rang juste en-dessous du seuil de
+  ! COMPRESS_WORTHWHILE_RATIO) : le rang trouve correspond EXACTEMENT au
+  ! rang de reference (COMPRESS_BLOCK) et l'erreur de reconstruction est
+  ! QUASI IDENTIQUE (ratio 1.00), y compris avec un OVERSAMPLE reduit a 2
+  ! (2 doublements de sous-espace necessaires dans ce cas). Ce resultat
+  ! depend d'un point CRITIQUE (voir RSVD_RANGE_SVD/ORTHONORMALIZE_COLS) :
+  ! chaque demi-etape d'iteration de puissance doit etre RE-orthonormalisee
+  ! immediatement -- un bogue initial (orthonormalisation UNIQUEMENT en
+  ! fin de calcul) donnait une erreur x30 a x2000 PIRE des que NPOWER>1 en
+  ! simple precision, corrige depuis. Reste malgre tout une garantie
+  ! HEURISTIQUE, pas une preuve -- valider par mesure sur le cas d'usage
+  ! reel avant tout usage en production.
+  !-----------------------------------------------------------------------
+  SUBROUTINE COMPRESS_BLOCK_RSVD_ADAPTIVE(M, N, B, LDB, TOL, BLK, OVERSAMPLE, NPOWER, L_INIT, N_GROWTHS)
+    INTEGER, INTENT(IN)            :: M, N, LDB
+    COMPLEX(WP), INTENT(IN)        :: B(LDB,N)
+    REAL(WP), INTENT(IN)           :: TOL
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: BLK
+    INTEGER, INTENT(IN), OPTIONAL  :: OVERSAMPLE, NPOWER, L_INIT
+    ! N_GROWTHS (optionnel, INTENT(OUT)) : nombre de doublements de L avant
+    ! arret -- diagnostic pratique pour juger si le critere d'arret
+    ! converge vite (0-1 doublement, cas courant) ou tatonne (plusieurs
+    ! doublements, signe que le sous-espace initial etait mal dimensionne).
+    INTEGER, INTENT(OUT), OPTIONAL :: N_GROWTHS
+
+    COMPLEX(WP), ALLOCATABLE :: UFULL(:,:), VTHAT(:,:)
+    REAL(WP), ALLOCATABLE    :: S(:)
+    INTEGER :: OVS, NPOW, MN, L, LCAP, LNEW, R, I, IGROW
+    REAL(WP) :: THRESH
+    LOGICAL :: MARGIN_OK
+
+    OVS = 10; IF (PRESENT(OVERSAMPLE)) OVS = OVERSAMPLE
+    NPOW = 1; IF (PRESENT(NPOWER)) NPOW = NPOWER
+    MN = MIN(M,N)
+    BLK%M = M; BLK%N = N
+
+    ! Meme plafond que COMPRESS_BLOCK (blr_arena_mod-like RMAX) : au-dela,
+    ! la compression n'est de toute facon pas rentable, inutile de faire
+    ! grossir le sous-espace plus loin.
+    LCAP = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(MN,WP)) - 1)
+    LCAP = MAX(LCAP, OVS+1)   ! garde-fou : LCAP doit rester > OVS pour que le critere d'arret ait un sens
+
+    ! ZONE MORTE CARACTERISEE (mesure sur bloc a spectre PRESCRIT, rang
+    ! exact connu par construction, voir test/bench_rsvd_compress.f90
+    ! RANK_WANT) : pour tout rang REEL dans (LCAP-OVERSAMPLE, seuil reel de
+    ! COMPRESS_BLOCK] (ex. M=N=400, OVERSAMPLE=10 -> rangs 123 a 133), la
+    ! marge R<=L-OVERSAMPLE ne peut JAMAIS etre satisfaite avant que L
+    ! n'atteigne LCAP (L ne grossit jamais au-dela) -- l'adaptatif abandonne
+    ! et replie SYSTEMATIQUEMENT en dense (0/20 tirages, PAS une question de
+    ! chance), alors que COMPRESS_BLOCK compresserait correctement ces
+    ! blocs. Repli dense = reconstruction EXACTE, donc pas de corruption,
+    ! seulement une occasion de gain RSVD manquee sur cette bande etroite
+    ! (~OVERSAMPLE valeurs de rang, pres du seuil COMPRESS_WORTHWHILE_
+    ! RATIO). Comportement accepte tel quel (pas de correctif demande) --
+    ! reduire OVERSAMPLE reduirait cette bande mais aussi la marge de
+    ! securite statistique du critere d'arret ailleurs.
+
+    ! BOGUE CORRIGE (mesure sur un bloc DELIBEREMENT non compressible,
+    ! voir test/bench_rsvd_compress.f90) : la version initiale ne
+    ! distinguait PAS "la marge R<=L-OVERSAMPLE a ete satisfaite" (rang
+    ! DIGNE DE CONFIANCE) de "on a atteint le plafond LCAP/MN SANS jamais
+    ! satisfaire la marge" (on a simplement ABANDONNE, R n'a AUCUNE valeur
+    ! probante) -- comme R est de toute facon toujours <= LCAP < RATIO*MN
+    ! par construction, l'ancien test final (R < RATIO*MN) etait donc
+    ! TOUJOURS vrai des qu'on atteignait le plafond, meme pour un bloc
+    ! FRANCHEMENT plein rang : mesure -> RANG INVENTE = LCAP avec une
+    ! erreur de reconstruction de 28.6% (au lieu du repli dense correct,
+    ! erreur nulle). MARGIN_OK trace desormais EXPLICITEMENT laquelle des
+    ! deux conditions d'arret a declenche la sortie de boucle.
+    L = MIN(2*OVS, MN, LCAP)
+    IGROW = 0
+    MARGIN_OK = .FALSE.
+    DO
+      IF (ALLOCATED(UFULL)) DEALLOCATE(UFULL, VTHAT, S)
+      ALLOCATE(UFULL(M,L), VTHAT(L,N), S(L))
+      CALL RSVD_RANGE_SVD(M, N, B, LDB, L, NPOW, S, UFULL, VTHAT)
+
+      THRESH = TOL * MAX(S(1), TINY(1.0_WP))
+      R = 0
+      DO I = 1, L
+        IF (S(I) .GT. THRESH) R = R + 1
+      END DO
+
+      IF (R .LE. L-OVS) THEN
+        MARGIN_OK = .TRUE.
+        EXIT
+      END IF
+      IF (L .GE. LCAP .OR. L .GE. MN) EXIT   ! plafond atteint, marge JAMAIS satisfaite -- abandon
+      LNEW = MIN(2*L, MN, LCAP)
+      IF (LNEW .LE. L) EXIT   ! plus de marge de croissance possible
+      L = LNEW
+      IGROW = IGROW + 1
+    END DO
+    IF (PRESENT(N_GROWTHS)) N_GROWTHS = IGROW
+
+    IF (MARGIN_OK) THEN
+      ! Rang DIGNE DE CONFIANCE (marge de sur-echantillonnage non
+      ! consommee) -- R est de toute facon <= L <= LCAP < RATIO*MN a ce
+      ! stade, la compression est automatiquement rentable.
+      BLK%IS_LOWRANK = .TRUE.
+      BLK%RANK = R
+      ALLOCATE(BLK%UFAC(M,R), BLK%VFAC(R,N))
+      BLK%UFAC = UFULL(1:M,1:R)
+      DO I = 1, R
+        BLK%VFAC(I,1:N) = S(I) * VTHAT(I,1:N)
+      END DO
+    ELSE
+      ! Repli dense, EXACTEMENT comme COMPRESS_BLOCK -- pas de SVD
+      ! supplementaire : soit la marge n'a jamais ete satisfaite avant le
+      ! plafond (bloc pas assez compressible, R n'est PAS fiable), soit le
+      ! bloc est trop petit pour meme atteindre LCAP.
+      BLK%IS_LOWRANK = .FALSE.
+      ALLOCATE(BLK%DENSE(M,N))
+      BLK%DENSE = B(1:M,1:N)
+    END IF
+    DEALLOCATE(UFULL, VTHAT, S)
+  END SUBROUTINE COMPRESS_BLOCK_RSVD_ADAPTIVE
+
+  !-----------------------------------------------------------------------
   ! Reconstruit la forme dense d'un bloc (compresse ou non) -- utilise pour
   ! les tests et pour EXPAND explicite si besoin.
   !-----------------------------------------------------------------------
