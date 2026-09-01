@@ -48,9 +48,10 @@ MODULE MPI_BLR_MATRIX_MOD
   USE BLR_KINDS_MOD, ONLY: WP
   USE MPI_GRID_MOD
   USE BLR_COMPRESS_MOD
+  USE BLR_OOC_MOD
   USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE, DENSE_PANEL_T
-  USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE
+  USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE, PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
 
@@ -110,6 +111,122 @@ MODULE MPI_BLR_MATRIX_MOD
     INTEGER, ALLOCATABLE :: IPIV(:,:)
   END TYPE MPI_BLR_MATRIX_FIXEDCAP_T
 
+  !-----------------------------------------------------------------------
+  ! Variante OUT-OF-CORE (demande explicite : ne plus etre limite par la
+  ! RAM disponible, ni pour la matrice assemblee, ni pour les facteurs LU
+  ! apres remplissage de Schur, ni pour un second membre massif) -- basee
+  ! sur l'algorithme CLASSIQUE (pas l'arena : le cycle allocate/deallocate
+  ! individuel de BLR_BLOCK_T se prete naturellement a l'eviction disque,
+  ! contrairement a l'arena qui ne libere jamais un bloc individuellement
+  ! -- voir la memoire du projet).
+  !
+  ! DIAGBLK/OFFBLK ne contiennent plus les donnees directement (UFAC/VFAC/
+  ! DENSE) mais un DESCRIPTEUR LEGER (OOC_BLOCK_DESC_T, blr_ooc_mod.f90 --
+  ! M/N/RANG/IS_LOWRANK + position sur le fichier scratch) : toujours
+  ! resident, negligeable en RAM quel que soit N. Les donnees REELLES
+  ! vivent sur STORE_A (fichier scratch local a CE processus, jamais
+  ! partage -- chaque processus ne possede deja que ses propres blocs
+  ! locaux dans la distribution 2D-cyclique existante). CACHE_A borne la
+  ! RAM consommee par les blocs EFFECTIVEMENT residents a un instant donne,
+  ! bornee par MAX_MB_PER_PROCESS (parametre utilisateur) -- CACHE_A pour
+  ! les blocs hors-diagonale (OFFBLK), CACHE_D pour les blocs diagonaux
+  ! (DIAGBLK). Les deux n'ecrivent sur disque qu'a l'eviction, et TOUJOURS
+  ! EN PLACE (OOC_WRITE_BLOCK_FIXED, voir blr_ooc_mod.f90) : premier appel
+  ! reserve le PIRE CAS DENSE (M*N, jamais la taille bas-rang courante),
+  ! garantissant qu'un rang qui grossit plus tard (mise a jour de Schur :
+  ! le rang n'est PAS garanti decroissant) tient toujours dans la place
+  ! reservee -- aucun octet orphelin, ni pour DIAGBLK (toujours dense, M*N
+  ! est deja sa taille reelle) ni pour OFFBLK (bas-rang, mais toujours
+  ! strictement plus petit que M*N par construction de COMPRESS_WORTHWHILE_
+  ! RATIO, voir blr_compress_mod.f90).
+  !
+  ! DIMENSIONNER MAX_MB_PER_PROCESS (mesure sur N=20000, NB=400, grille
+  ! 2x2, voir bench/bench_blr_mpi_pivot_ooc_compare.f90) : un budget
+  ! INSUFFISANT face a l'ensemble de travail REEL du processus ne degrade
+  ! pas gracieusement -- il fait THRASHER le cache LRU, avec un cout
+  ! disproportionne par rapport a l'ecart de RAM economise. Cause : un bloc
+  ! hors-diagonale n'est retouche par une mise a jour de Schur qu'une fois
+  ! tous les ~NBLK pas de la factorisation, et la TOTALITE de l'ensemble de
+  ! travail local est parcourue entre deux touches du MEME bloc -- un
+  ! schema d'acces quasi-SEQUENTIEL ou AUCUNE taille de cache inferieure a
+  ! l'ensemble de travail complet n'aide, quelle que soit la politique
+  ! d'eviction (LRU ou autre). Mesure concrete : a budget=200 Mo (RSS
+  ! reelle observee ~127 Mo, donc en apparence "assez"), le temps de
+  ! factorisation etait domine a 68% par les acces cache (10.1s sur 14.9s,
+  ! CGETRF/TRSM/Schur eux-memes ne prenant que 0.97s, deja comparable au
+  ! classique) ; passer a budget=800 Mo (RSS reelle quasi inchangee, ~128
+  ! Mo -- l'ensemble de travail REEL etait deja atteint, PAS le budget)
+  ! a fait chuter ce cout cache de 10.1s a 0.75s (/13.5), et le temps de
+  ! factorisation total de 14.9s a 3.1s (/4.9), pour une RAM quasi
+  ! identique. CONCLUSION PRATIQUE : ne pas choisir MAX_MB_PER_PROCESS "le
+  ! plus petit possible" pour economiser de la RAM -- le choisir au moins
+  ! egal a l'ensemble de travail reel du processus (verifiable via
+  ! MPI_BLR_MATRIX_OOC_RESIDENT_BYTES a un budget genereux, ou en
+  ! augmentant le budget jusqu'a ce que la RSS reelle cesse de croitre) ;
+  ! l'interet de l'OOC n'est PAS de tourner avec le budget minimal, mais de
+  ! rester CORRECT et de degrader la RAM au lieu de planter quand le
+  ! probleme est trop gros pour tenir en RAM du tout -- en-dessous de ce
+  ! seuil "ensemble de travail", le compromis temps/memoire devient tres
+  ! defavorable et croit sans borne a mesure que N grandit.
+  !-----------------------------------------------------------------------
+  TYPE :: MPI_BLR_MATRIX_OOC_T
+    INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
+    INTEGER, ALLOCATABLE :: BSTART(:), BEND(:)
+    TYPE(OOC_BLOCK_DESC_T), ALLOCATABLE :: DIAGBLK(:)
+    TYPE(OOC_BLOCK_DESC_T), ALLOCATABLE :: OFFBLK(:,:)
+    INTEGER, ALLOCATABLE :: IPIV(:,:)
+    TYPE(OOC_STORE_T) :: STORE_A
+    TYPE(OOC_CACHE_T) :: CACHE_A
+    TYPE(OOC_DIAG_CACHE_T) :: CACHE_D
+    REAL(WP) :: MAX_MB_PER_PROCESS = 0.0_WP
+  END TYPE MPI_BLR_MATRIX_OOC_T
+
+  !-----------------------------------------------------------------------
+  ! Second membre OUT-OF-CORE : assemble et stocke SEPAREMENT de la
+  ! matrice (fichier scratch propre, prefixe "b" -- voir
+  ! MPI_ASSEMBLE_RHS_OOC), par PAQUETS d'au plus NRHS_BATCH colonnes
+  ! GLOBALES -- demande explicite ("limiter la memoire dans un cas
+  ! massivement second membre"). Chaque paquet est un bloc dense ordinaire
+  ! (BLR_BLOCK_T, IS_LOWRANK=.FALSE.) au sens de blr_ooc_mod.f90 -- aucun
+  ! nouveau mecanisme d'(e)serialisation necessaire, juste reutilise. Pas
+  ! de cache ici (contrairement a OFFBLK) : chaque paquet n'est relu
+  ! qu'UNE FOIS par MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D, un acces direct
+  ! disque suffit.
+  !-----------------------------------------------------------------------
+  TYPE :: OOC_RHS_T
+    TYPE(OOC_STORE_T) :: STORE_B
+    TYPE(OOC_BLOCK_DESC_T), ALLOCATABLE :: BATCH(:)
+    INTEGER :: NRHS = 0, NRHS_BATCH = 0, NBATCHES = 0, MLOC = 0
+  END TYPE OOC_RHS_T
+
+  ABSTRACT INTERFACE
+    SUBROUTINE FILL_RHS_IFACE(ISTART, IEND, RSTART, REND, BLK)
+      IMPORT :: WP
+      INTEGER, INTENT(IN)       :: ISTART, IEND, RSTART, REND
+      COMPLEX(WP), INTENT(OUT)  :: BLK(IEND-ISTART+1, REND-RSTART+1)
+    END SUBROUTINE FILL_RHS_IFACE
+
+    ! Rappelee UNE FOIS PAR PAQUET par MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D,
+    ! avec la solution LOCALE (lignes locales, colonnes GSTART:GEND
+    ! GLOBALES) de CE paquet -- a l'appelant de decider quoi en faire
+    ! (rassembler dans un tableau complet si NRHS modeste comme dans les
+    ! exemples/tests, ou ecrire directement sur disque pour un cas
+    ! massivement second membre reel). Aucune accumulation NRHS-large
+    ! n'est faite par la bibliotheque elle-meme -- c'est precisement le
+    ! but de cette interface (demande explicite : borner la memoire de la
+    ! resolution independamment de NRHS).
+    ! BATCH_RSTART/BATCH_REND : plage de colonnes GLOBALE du paquet ENTIER
+    ! (identique sur tous les processus -- necessaire si l'appelant doit
+    ! rassembler entre processus, ex. via GATHER_2D_RHS avec
+    ! NRHS:=BATCH_REND-BATCH_RSTART+1). GSTART/GEND : sous-plage GLOBALE
+    ! possedee par CE processus (coherent avec X_LOCAL/NRHS_LOC_B).
+    SUBROUTINE CONSUME_X_BATCH_IFACE(BATCH_RSTART, BATCH_REND, GSTART, GEND, X_LOCAL, LDX, NRHS_LOC_B)
+      IMPORT :: WP
+      INTEGER, INTENT(IN)      :: BATCH_RSTART, BATCH_REND, GSTART, GEND, LDX, NRHS_LOC_B
+      COMPLEX(WP), INTENT(IN)  :: X_LOCAL(LDX,MAX(NRHS_LOC_B,1))
+    END SUBROUTINE CONSUME_X_BATCH_IFACE
+  END INTERFACE
+
 CONTAINS
 
   !-----------------------------------------------------------------------
@@ -135,7 +252,8 @@ CONTAINS
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
                                       T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
-                                      SHOW_PROGRESS)
+                                      SHOW_PROGRESS, T_GET_BLOCK, T_COMPRESS, T_GET_BLOCK_MIN, T_COMPRESS_MIN, &
+                                      USE_RSVD, RSVD_OVERSAMPLE, RSVD_NPOWER)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)        :: GRID
     INTEGER, INTENT(IN)             :: N, NB
@@ -146,12 +264,60 @@ CONTAINS
     INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
     INTEGER(8), INTENT(OUT)         :: RANK_SUM
     LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
+    ! USE_RSVD (defaut .FALSE., aucun changement de comportement si absent) :
+    ! remplace la SVD complete (COMPRESS_BLOCK, CGESVD) par la SVD
+    ! randomisee ADAPTATIVE (COMPRESS_BLOCK_RSVD_ADAPTIVE, blr_compress_
+    ! mod.f90 -- rang decouvert par doublement, TOL seul, sans connaissance
+    ! prealable) pour compresser chaque bloc hors-diagonale. MESURE (voir
+    ! test/bench_rsvd_compress.f90) : x34-54 plus rapide que CGESVD sur un
+    ! bloc bien compressible, erreur de reconstruction du meme ordre
+    ! (ratio 1.00) une fois le bogue d'orthonormalisation corrige -- mais
+    ! GARANTIE HEURISTIQUE, pas une preuve formelle (voir la documentation
+    ! de COMPRESS_BLOCK_RSVD_ADAPTIVE), et une ZONE MORTE CARACTERISEE pres
+    ! du plafond COMPRESS_WORTHWHILE_RATIO ou elle replie en dense la ou
+    ! COMPRESS_BLOCK compresserait (comportement accepte, voir son
+    ! commentaire). RSVD_OVERSAMPLE/RSVD_NPOWER (optionnels, defauts 10/1
+    ! -- memes valeurs par defaut que COMPRESS_BLOCK_RSVD_ADAPTIVE) :
+    ! transmis tels quels, voir son commentaire pour leur role.
+    LOGICAL, INTENT(IN), OPTIONAL   :: USE_RSVD
+    INTEGER, INTENT(IN), OPTIONAL   :: RSVD_OVERSAMPLE, RSVD_NPOWER
+    ! DIAGNOSTIC (demande explicite -- evaluer si une SVD randomisee vaut le
+    ! coup a la place de CGESVD dans COMPRESS_BLOCK) : T_GET_BLOCK cumule le
+    ! temps dans TOUS les appels GET_BLOCK (evaluation du noyau, diagonal +
+    ! hors-diagonale) ; T_COMPRESS cumule le temps dans TOUS les appels
+    ! COMPRESS_BLOCK (SVD complete, hors-diagonale uniquement). Optionnels,
+    ! aucun surcout si absents.
+    !
+    ! BOGUE CORRIGE (2026-09-01, exploration d'une visibilite par-processus
+    ! type MPE/Jumpshot, indisponible dans cet environnement) : T_ASSEMBLE_
+    ! COMPRESS/T_GET_BLOCK/T_COMPRESS etaient TOUS affectes a la valeur
+    ! LOCALE du rang appelant, jamais reduits -- PLUS GRAVE ici que dans la
+    ! factorisation (voir MPI_BLR_MATRIX_LU_FACTOR_PIVOT[_OOC]) car cette
+    ! boucle d'assemblage est "embarrassingly parallel" (aucune
+    ! synchronisation entre processus, voir commentaire plus bas) : un
+    ! rang plus lent ici ne fait PAS attendre les autres avant que leur
+    ! propre chronometre local ne s'arrete -- le temps qu'il lui reste a
+    ! passer fuit silencieusement dans la PHASE SUIVANTE (premiere
+    ! communication collective de la factorisation, qui l'attend). Corrige :
+    ! T_ASSEMBLE_COMPRESS/T_GET_BLOCK/T_COMPRESS sont maintenant un vrai
+    ! MAX sur GRID%COMM. Nouveaux _MIN (optionnels) : ecart MAX/MIN direct
+    ! = indicateur de desequilibre de charge entre processus (une
+    ! distribution bloc-cyclique DEVRAIT rester equilibree, un ecart
+    ! important signalerait un noyau GET_BLOCK dont le cout varie fortement
+    ! selon les blocs, ou un decoupage NBLK non multiple de PR*PC).
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_GET_BLOCK, T_COMPRESS, T_GET_BLOCK_MIN, T_COMPRESS_MIN
 
     COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
     INTEGER :: li, lj, I, J, MI, NJ, NC_LOCAL, NO_LOCAL, IERR, NDONE, NTOTAL, LAST_PCT
     INTEGER(8) :: RS_LOCAL
-    DOUBLE PRECISION :: T0
-    LOGICAL :: PROGRESS
+    DOUBLE PRECISION :: T0, TT0, T_GETBLK_L, T_COMPRESS_L, T_ASM_L
+    LOGICAL :: PROGRESS, RSVD_FLAG
+    INTEGER :: RSVD_OVS, RSVD_NPOW
+
+    RSVD_FLAG = .FALSE.
+    IF (PRESENT(USE_RSVD)) RSVD_FLAG = USE_RSVD
+    RSVD_OVS = 10; IF (PRESENT(RSVD_OVERSAMPLE)) RSVD_OVS = RSVD_OVERSAMPLE
+    RSVD_NPOW = 1; IF (PRESENT(RSVD_NPOWER)) RSVD_NPOW = RSVD_NPOWER
 
     ! La barre de progression est affichee UNIQUEMENT par le processus 0,
     ! sur SA PROPRE part locale (NBLKR_LOC*NBLKC_LOC) -- pas de
@@ -166,6 +332,7 @@ CONTAINS
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
     NDONE = 0
     LAST_PCT = -5
+    T_GETBLK_L = 0.0D0; T_COMPRESS_L = 0.0D0
 
     T0 = MPI_WTIME()
     CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
@@ -187,11 +354,21 @@ CONTAINS
         NJ = A_BLR%BEND(J) - A_BLR%BSTART(J) + 1
         IF (I .EQ. J) THEN
           ALLOCATE(A_BLR%DIAGBLK(I)%D(MI,MI))
+          TT0 = MPI_WTIME()
           CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), A_BLR%DIAGBLK(I)%D)
+          T_GETBLK_L = T_GETBLK_L + (MPI_WTIME() - TT0)
         ELSE
           ALLOCATE(TMP(MI,NJ))
+          TT0 = MPI_WTIME()
           CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMP)
-          CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(li,lj))
+          T_GETBLK_L = T_GETBLK_L + (MPI_WTIME() - TT0)
+          TT0 = MPI_WTIME()
+          IF (RSVD_FLAG) THEN
+            CALL COMPRESS_BLOCK_RSVD_ADAPTIVE(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(li,lj), RSVD_OVS, RSVD_NPOW)
+          ELSE
+            CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(li,lj))
+          END IF
+          T_COMPRESS_L = T_COMPRESS_L + (MPI_WTIME() - TT0)
           NO_LOCAL = NO_LOCAL + 1
           IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
             NC_LOCAL = NC_LOCAL + 1
@@ -202,10 +379,26 @@ CONTAINS
           DEALLOCATE(TMP)
         END IF
         NDONE = NDONE + 1
-        IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('1) Assemblage+compression (rang 0)', NDONE, NTOTAL, LAST_PCT)
+        ! DEMANDE EXPLICITE (2026-09-01) : barre a rafraichissement en
+        ! place (une seule ligne, CHAR(13)) au lieu de l'affichage par
+        ! paliers -- voir progress_bar_mod.f90 : ce choix avait ete
+        ! evite sous MPI par le passe (mpirun relaie le stdout par pipe,
+        ! le retour chariot peut ne pas s'interpreter comme "ecraser la
+        ! ligne precedente" et polluer la sortie d'une ligne par mise a
+        ! jour). Seul le rang 0 ecrit ici (PROGRESS deja gate sur
+        ! GRID%MYID.EQ.0) -- a VERIFIER visuellement dans un vrai
+        ! terminal interactif (pas une sortie redirigee vers un fichier) ;
+        ! revenir a PRINT_PROGRESS_MILESTONE si la ligne se duplique au
+        ! lieu de s'ecraser sous votre mpirun.
+        IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression (rang 0)', NDONE, NTOTAL)
       END DO
     END DO
-    T_ASSEMBLE_COMPRESS = MPI_WTIME() - T0
+    T_ASM_L = MPI_WTIME() - T0
+    CALL MPI_ALLREDUCE(T_ASM_L, T_ASSEMBLE_COMPRESS, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_GET_BLOCK)) CALL MPI_ALLREDUCE(T_GETBLK_L,   T_GET_BLOCK, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_COMPRESS))  CALL MPI_ALLREDUCE(T_COMPRESS_L, T_COMPRESS,  1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_GET_BLOCK_MIN)) CALL MPI_ALLREDUCE(T_GETBLK_L,   T_GET_BLOCK_MIN, 1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+    IF (PRESENT(T_COMPRESS_MIN))  CALL MPI_ALLREDUCE(T_COMPRESS_L, T_COMPRESS_MIN,  1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
 
     CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
     CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
@@ -516,7 +709,7 @@ CONTAINS
     INTEGER :: NBLK, K, li, lj, I, J, KW, MI, NJ, IINFO, INFO_STEP
     INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, NS_LOCAL, li_K, LAST_PCT
     INTEGER(8) :: RS_LOCAL
-    DOUBLE PRECISION :: T0
+    DOUBLE PRECISION :: T0, T_FACTOR_L, RSS_MAX_MB
     LOGICAL :: PROGRESS, RSS_TRACE
 
     ! Boucle K=1..NBLK GLOBALEMENT synchronisee (MPI_BCAST a chaque etape,
@@ -529,6 +722,7 @@ CONTAINS
     LAST_PCT = -5
     RSS_TRACE = .FALSE.
     IF (PRESENT(SHOW_RSS_TRACE)) RSS_TRACE = SHOW_RSS_TRACE .AND. (GRID%MYID.EQ.0)
+    RSS_MAX_MB = 0.0D0
 
     T0 = MPI_WTIME()
     NBLK = A_BLR%NBLK
@@ -677,14 +871,35 @@ CONTAINS
         END DO
       END DO
 
-      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('3) Factorisation LU (pivot)', K, NBLK, LAST_PCT)
-      IF (RSS_TRACE) WRITE(6,'(A,I4,A,F8.1,A)') '     [RSS trace] K=', K, ' : RSS = ', &
-           REAL(GET_RSS_KB(),8)/1024.0D0, ' Mo'
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU (pivot)', K, NBLK)
+      ! DEMANDE EXPLICITE (2026-09-01) : n'afficher que le MAXIMUM observe,
+      ! pas une ligne par K -- le detail par etape servait au diagnostic
+      ! initial de l'ecart RSS-vs-theorique (voir examples/README.md), le
+      ! maximum seul suffit en usage courant. Toujours GET_RSS_KB() a
+      ! CHAQUE K (cout negligeable), juste plus de WRITE intermediaire.
+      IF (RSS_TRACE) RSS_MAX_MB = MAX(RSS_MAX_MB, REAL(GET_RSS_KB(),8)/1024.0D0)
     END DO
+    IF (RSS_TRACE) WRITE(6,'(A,F8.1,A)') '     [RSS trace] MAX observe pendant la factorisation = ', RSS_MAX_MB, ' Mo'
 
     DEALLOCATE(LRECV, URECV)
     CALL BLR_WORKSPACE_FREE(WS)
-    IF (PRESENT(T_FACTOR)) T_FACTOR = MPI_WTIME() - T0
+    ! BOGUE CORRIGE (2026-09-01, trouve en explorant une visibilite par-
+    ! processus type MPE/Jumpshot -- voir la memoire du projet) : T_FACTOR
+    ! etait affecte a la valeur LOCALE du rang appelant, jamais reduite --
+    ! contrairement a T_DIAG/T_TRSM/etc. de MPI_BLR_MATRIX_LU_FACTOR_NOPIV
+    ! (voir plus haut) qui font deja un MPI_ALLREDUCE(MAX) correct. Sans
+    ! consequence pratique ICI tant que l'appelant lit systematiquement la
+    ! copie du rang 0 (les bancs de ce projet le font tous) ET que la
+    ! synchronisation implicite des broadcasts par etape maintient les
+    ! rangs a peu pres au coude-a-coude -- mais ce n'est PAS garanti en
+    ! toute rigueur (un rang plus charge pourrait rattraper son retard
+    ! PENDANT l'attente sur un broadcast sans que cela n'allonge le T0-a-
+    ! T_WTIME() local du rang 0). Corrige par coherence avec NOPIV : MAX
+    ! reel sur GRID%COMM desormais.
+    IF (PRESENT(T_FACTOR)) THEN
+      T_FACTOR_L = MPI_WTIME() - T0
+      CALL MPI_ALLREDUCE(T_FACTOR_L, T_FACTOR, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    END IF
 
     CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
     CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
@@ -1039,7 +1254,7 @@ CONTAINS
       END IF
       DEALLOCATE(XK_FULL)
       STEP = STEP + 1
-      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('4) Resolution (pivot)', STEP, NSTEPS, LAST_PCT)
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution (pivot)', STEP, NSTEPS)
     END DO
 
     ! === 2) U*X = Y (substitution arriere) -- AUCUN pivot necessaire ===
@@ -1112,7 +1327,7 @@ CONTAINS
       END IF
       DEALLOCATE(XK_FULL)
       STEP = STEP + 1
-      IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('4) Resolution (pivot)', STEP, NSTEPS, LAST_PCT)
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution (pivot)', STEP, NSTEPS)
     END DO
 
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
@@ -2300,5 +2515,928 @@ CONTAINS
 
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
   END SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_FIXEDCAP_2D
+
+  !=========================================================================
+  ! VARIANTES OUT-OF-CORE (MPI_BLR_MATRIX_OOC_T) -- voir le type ci-dessus
+  ! et blr_ooc_mod.f90 pour le principe complet. Basees sur l'algorithme
+  ! CLASSIQUE (MPI_BLR_MATRIX_LU_FACTOR_PIVOT), jamais l'arena.
+  !=========================================================================
+
+  !-----------------------------------------------------------------------
+  ! ETAPE 1 (OOC) : assemblage + compression, IDENTIQUE algorithmiquement a
+  ! MPI_ASSEMBLE_BLR_MATRIX -- seule differences : les blocs diagonaux sont
+  ! ecrits directement sur STORE_A (jamais residents en dehors de cette
+  ! iteration), les blocs hors-diagonale passent par CACHE_A (borne a
+  ! MAX_MB_PER_PROCESS -- l'eviction naturelle du cache pendant la boucle
+  ! ecrit deja la plupart des blocs sur disque au fil de l'eau ;
+  ! OOC_CACHE_FLUSH_ALL en fin de routine garantit que TOUT est sur disque
+  ! avant que l'appelant ne passe a l'etape suivante, meme les derniers
+  ! blocs encore residents faute d'avoir ete evinces).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_OOC(GRID, N, NB, TOL, GET_BLOCK, A_BLR, SCRATCH_DIR, MAX_MB_PER_PROCESS, &
+                                          T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
+                                          SHOW_PROGRESS, T_GET_BLOCK, T_COMPRESS, T_IO, &
+                                          T_GET_BLOCK_MIN, T_COMPRESS_MIN, T_IO_MIN, &
+                                          USE_RSVD, RSVD_OVERSAMPLE, RSVD_NPOWER)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    INTEGER, INTENT(IN)             :: N, NB
+    REAL(WP), INTENT(IN)            :: TOL
+    PROCEDURE(GET_BLOCK_IFACE)      :: GET_BLOCK
+    TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(OUT) :: A_BLR
+    CHARACTER(LEN=*), INTENT(IN)    :: SCRATCH_DIR
+    REAL(WP), INTENT(IN)            :: MAX_MB_PER_PROCESS
+    DOUBLE PRECISION, INTENT(OUT)   :: T_ASSEMBLE_COMPRESS
+    INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
+    INTEGER(8), INTENT(OUT)         :: RANK_SUM
+    LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
+    ! DIAGNOSTIC (demande explicite -- evaluer si une SVD randomisee vaut le
+    ! coup a la place de CGESVD dans COMPRESS_BLOCK) : T_GET_BLOCK cumule le
+    ! temps dans TOUS les appels GET_BLOCK ; T_COMPRESS cumule le temps dans
+    ! TOUS les appels COMPRESS_BLOCK (SVD complete) ; T_IO cumule le temps
+    ! d'ecriture disque (bloc diagonal, insertion dans CACHE_A -- qui peut
+    ! evincer donc ecrire d'autres blocs -- et le flush final des deux
+    ! caches). Optionnels, aucun surcout si absents.
+    !
+    ! BOGUE CORRIGE (2026-09-01, meme correctif que MPI_ASSEMBLE_BLR_MATRIX
+    ! ci-dessus, voir son commentaire pour le detail) : T_ASSEMBLE_COMPRESS/
+    ! T_GET_BLOCK/T_COMPRESS/T_IO etaient tous des valeurs LOCALES jamais
+    ! reduites. Desormais un vrai MAX sur GRID%COMM ; _MIN optionnels en
+    ! plus pour reveler un desequilibre de charge entre processus.
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_GET_BLOCK, T_COMPRESS, T_IO
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_GET_BLOCK_MIN, T_COMPRESS_MIN, T_IO_MIN
+    ! Voir MPI_ASSEMBLE_BLR_MATRIX pour le detail (USE_RSVD/RSVD_OVERSAMPLE/
+    ! RSVD_NPOWER, meme convention).
+    LOGICAL, INTENT(IN), OPTIONAL   :: USE_RSVD
+    INTEGER, INTENT(IN), OPTIONAL   :: RSVD_OVERSAMPLE, RSVD_NPOWER
+
+    COMPLEX(WP), ALLOCATABLE :: TMP(:,:), TMPD(:,:)
+    TYPE(BLR_BLOCK_T) :: TMPBLK, DBLK
+    INTEGER :: li, lj, I, J, MI, NJ, NC_LOCAL, NO_LOCAL, IERR, NDONE, NTOTAL, LAST_PCT, IDX
+    INTEGER(8) :: RS_LOCAL
+    DOUBLE PRECISION :: T0, TT0, T_GETBLK_L, T_COMPRESS_L, T_IO_L, T_ASM_L
+    LOGICAL :: PROGRESS, RSVD_FLAG
+    INTEGER :: RSVD_OVS, RSVD_NPOW
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    NDONE = 0
+    LAST_PCT = -5
+    T_GETBLK_L = 0.0D0; T_COMPRESS_L = 0.0D0; T_IO_L = 0.0D0
+    RSVD_FLAG = .FALSE.
+    IF (PRESENT(USE_RSVD)) RSVD_FLAG = USE_RSVD
+    RSVD_OVS = 10; IF (PRESENT(RSVD_OVERSAMPLE)) RSVD_OVS = RSVD_OVERSAMPLE
+    RSVD_NPOW = 1; IF (PRESENT(RSVD_NPOWER)) RSVD_NPOW = RSVD_NPOWER
+
+    T0 = MPI_WTIME()
+    CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
+    A_BLR%N = N
+    A_BLR%NB = NB
+    A_BLR%NBLKR_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PR, GRID%MYROW)
+    A_BLR%NBLKC_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PC, GRID%MYCOL)
+    A_BLR%MAX_MB_PER_PROCESS = MAX_MB_PER_PROCESS
+    ALLOCATE(A_BLR%DIAGBLK(A_BLR%NBLK))
+    ALLOCATE(A_BLR%OFFBLK(MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1)))
+    NTOTAL = A_BLR%NBLKR_LOC * A_BLR%NBLKC_LOC
+
+    CALL OOC_STORE_INIT(A_BLR%STORE_A, SCRATCH_DIR, 'a', GRID%MYID)
+    CALL OOC_CACHE_INIT(A_BLR%CACHE_A, MAX_MB_PER_PROCESS, NTOTAL+4, &
+                         MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1))
+    CALL OOC_DIAG_CACHE_INIT(A_BLR%CACHE_D, MAX_MB_PER_PROCESS, A_BLR%NBLKR_LOC+2, A_BLR%NBLK)
+
+    NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8
+
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        NJ = A_BLR%BEND(J) - A_BLR%BSTART(J) + 1
+        IF (I .EQ. J) THEN
+          ALLOCATE(TMPD(MI,MI))
+          TT0 = MPI_WTIME()
+          CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMPD)
+          T_GETBLK_L = T_GETBLK_L + (MPI_WTIME() - TT0)
+          DBLK%IS_LOWRANK = .FALSE.
+          DBLK%M = MI; DBLK%N = MI
+          CALL MOVE_ALLOC(TMPD, DBLK%DENSE)
+          TT0 = MPI_WTIME()
+          CALL OOC_WRITE_BLOCK_FIXED(A_BLR%STORE_A, A_BLR%DIAGBLK(I), DBLK)
+          T_IO_L = T_IO_L + (MPI_WTIME() - TT0)
+          DEALLOCATE(DBLK%DENSE)
+        ELSE
+          ALLOCATE(TMP(MI,NJ))
+          TT0 = MPI_WTIME()
+          CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMP)
+          T_GETBLK_L = T_GETBLK_L + (MPI_WTIME() - TT0)
+          TT0 = MPI_WTIME()
+          IF (RSVD_FLAG) THEN
+            CALL COMPRESS_BLOCK_RSVD_ADAPTIVE(MI, NJ, TMP, MI, TOL, TMPBLK, RSVD_OVS, RSVD_NPOW)
+          ELSE
+            CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, TMPBLK)
+          END IF
+          T_COMPRESS_L = T_COMPRESS_L + (MPI_WTIME() - TT0)
+          DEALLOCATE(TMP)
+          NO_LOCAL = NO_LOCAL + 1
+          IF (TMPBLK%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + TMPBLK%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(MI,NJ)
+          END IF
+          A_BLR%OFFBLK(li,lj)%IS_LOWRANK = TMPBLK%IS_LOWRANK
+          A_BLR%OFFBLK(li,lj)%M = TMPBLK%M; A_BLR%OFFBLK(li,lj)%N = TMPBLK%N; A_BLR%OFFBLK(li,lj)%RANK = TMPBLK%RANK
+          TT0 = MPI_WTIME()
+          IDX = OOC_CACHE_PUT_NEW(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li, lj, TMPBLK)
+          T_IO_L = T_IO_L + (MPI_WTIME() - TT0)
+        END IF
+        NDONE = NDONE + 1
+        ! Voir MPI_ASSEMBLE_BLR_MATRIX pour le detail du choix barre vs paliers.
+        IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression ooc (rang 0)', NDONE, NTOTAL)
+      END DO
+    END DO
+
+    ! Garantit que TOUT est sur disque avant l'etape suivante (voir
+    ! commentaire de tete) -- les descripteurs OFFBLK/DIAGBLK restent
+    ! valides quel que soit l'etat du cache apres cet appel.
+    TT0 = MPI_WTIME()
+    CALL OOC_CACHE_FLUSH_ALL(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK)
+    CALL OOC_DIAG_CACHE_FLUSH_ALL(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK)
+    T_IO_L = T_IO_L + (MPI_WTIME() - TT0)
+    T_ASM_L = MPI_WTIME() - T0
+    CALL MPI_ALLREDUCE(T_ASM_L, T_ASSEMBLE_COMPRESS, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_GET_BLOCK)) CALL MPI_ALLREDUCE(T_GETBLK_L,   T_GET_BLOCK, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_COMPRESS))  CALL MPI_ALLREDUCE(T_COMPRESS_L, T_COMPRESS,  1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_IO))        CALL MPI_ALLREDUCE(T_IO_L,       T_IO,        1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_GET_BLOCK_MIN)) CALL MPI_ALLREDUCE(T_GETBLK_L,   T_GET_BLOCK_MIN, 1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+    IF (PRESENT(T_COMPRESS_MIN))  CALL MPI_ALLREDUCE(T_COMPRESS_L, T_COMPRESS_MIN,  1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+    IF (PRESENT(T_IO_MIN))        CALL MPI_ALLREDUCE(T_IO_L,       T_IO_MIN,        1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+
+    CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(RS_LOCAL, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+  END SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_OOC
+
+  !-----------------------------------------------------------------------
+  ! ETAPE 2 (OOC) : assemblage du second membre, SEPAREMENT de la matrice
+  ! (fichier scratch propre, prefixe "b"), par PAQUETS d'au plus
+  ! NRHS_BATCH colonnes GLOBALES -- chaque paquet assemble est ECRIT SUR
+  ! DISQUE puis LIBERE avant de passer au suivant (voir OOC_RHS_T) : la
+  ! memoire a cette etape est bornee par NRHS_BATCH, jamais par NRHS total,
+  ! meme si les etapes restent SEPAREES (demande explicite -- pas question
+  ! ici de fusionner assemblage et resolution du second membre).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_ASSEMBLE_RHS_OOC(GRID, A_BLR, NRHS, NRHS_BATCH, FILL_RHS, SCRATCH_DIR, RHS)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)                :: GRID
+    TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(IN)  :: A_BLR
+    INTEGER, INTENT(IN)                     :: NRHS, NRHS_BATCH
+    PROCEDURE(FILL_RHS_IFACE)               :: FILL_RHS
+    CHARACTER(LEN=*), INTENT(IN)            :: SCRATCH_DIR
+    TYPE(OOC_RHS_T), INTENT(OUT)            :: RHS
+
+    TYPE(BLR_BLOCK_T) :: BBLK
+    COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
+    INTEGER :: li, I, RS, WIDTH, B, RSTART, REND
+
+    RHS%NRHS = NRHS
+    RHS%NRHS_BATCH = MAX(NRHS_BATCH,1)
+    RHS%NBATCHES = (NRHS + RHS%NRHS_BATCH - 1) / RHS%NRHS_BATCH
+
+    RHS%MLOC = 0
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      RHS%MLOC = RHS%MLOC + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
+    END DO
+
+    CALL OOC_STORE_INIT(RHS%STORE_B, SCRATCH_DIR, 'b', GRID%MYID)
+    ALLOCATE(RHS%BATCH(RHS%NBATCHES))
+
+    ! Pour CHAQUE paquet, seule la PART LOCALE de CE processus (lignes ET
+    ! colonnes -- meme distribution 2D que B_LOCAL dans la resolution
+    ! classique, RHS_LOCAL_RANGE_MBM sur la LARGEUR du paquet) est
+    ! assemblee et ecrite : la resolution OOC (ci-dessous) doit retrouver
+    ! EXACTEMENT ce que B_LOCAL contiendrait pour ce paquet dans
+    ! l'algorithme non-OOC, aucune redistribution supplementaire.
+    DO B = 1, RHS%NBATCHES
+      RSTART = (B-1)*RHS%NRHS_BATCH + 1
+      REND = MIN(B*RHS%NRHS_BATCH, NRHS)
+      WIDTH = REND - RSTART + 1
+      BLOCK
+        INTEGER :: LOCAL_OFFSET, NRHS_LOC_B, GSTART, GEND
+        CALL RHS_LOCAL_RANGE_MBM(WIDTH, GRID%PC, GRID%MYCOL, LOCAL_OFFSET, NRHS_LOC_B)
+        GSTART = RSTART + LOCAL_OFFSET - 1
+        GEND = GSTART + NRHS_LOC_B - 1
+        ALLOCATE(TMP(MAX(RHS%MLOC,1),MAX(NRHS_LOC_B,1)))
+        RS = 1
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (NRHS_LOC_B .GT. 0) THEN
+            CALL FILL_RHS(A_BLR%BSTART(I), A_BLR%BEND(I), GSTART, GEND, &
+                           TMP(RS:RS+A_BLR%BEND(I)-A_BLR%BSTART(I),1:NRHS_LOC_B))
+          END IF
+          RS = RS + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
+        END DO
+        BBLK%IS_LOWRANK = .FALSE.
+        BBLK%M = MAX(RHS%MLOC,1); BBLK%N = MAX(NRHS_LOC_B,1)
+        CALL MOVE_ALLOC(TMP, BBLK%DENSE)
+        CALL OOC_WRITE_BLOCK_RAW(RHS%STORE_B, RHS%BATCH(B), BBLK)
+        DEALLOCATE(BBLK%DENSE)
+      END BLOCK
+    END DO
+  END SUBROUTINE MPI_ASSEMBLE_RHS_OOC
+
+  SUBROUTINE OOC_RHS_FREE(RHS)
+    TYPE(OOC_RHS_T), INTENT(INOUT) :: RHS
+    CALL OOC_STORE_FREE(RHS%STORE_B)
+    IF (ALLOCATED(RHS%BATCH)) DEALLOCATE(RHS%BATCH)
+  END SUBROUTINE OOC_RHS_FREE
+
+  SUBROUTINE MPI_BLR_MATRIX_OOC_FREE(A_BLR)
+    TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(INOUT) :: A_BLR
+    CALL OOC_CACHE_FREE(A_BLR%CACHE_A)
+    CALL OOC_DIAG_CACHE_FREE(A_BLR%CACHE_D)
+    CALL OOC_STORE_FREE(A_BLR%STORE_A)
+  END SUBROUTINE MPI_BLR_MATRIX_OOC_FREE
+
+  !-----------------------------------------------------------------------
+  ! DIAGNOSTIC : octets REELLEMENT residents en RAM pour CE processus a
+  ! l'instant de l'appel (CACHE_A%USED_BYTES + CACHE_D%USED_BYTES, chacun
+  ! <= son budget MAX_MB_PER_PROCESS converti en octets, a l'exception du
+  ! cas degenere ou un SEUL bloc depasse deja le budget a lui seul -- voir
+  ! OOC_CACHE_MAKE_ROOM/OOC_DIAG_CACHE_MAKE_ROOM). Sert a VERIFIER que le
+  ! budget est bien respecte, par opposition a la taille TOTALE sur disque
+  ! (non bornee par design).
+  !-----------------------------------------------------------------------
+  FUNCTION MPI_BLR_MATRIX_OOC_RESIDENT_BYTES(A_BLR) RESULT(NBYTES)
+    TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(IN) :: A_BLR
+    INTEGER(8) :: NBYTES
+    NBYTES = A_BLR%CACHE_A%USED_BYTES + A_BLR%CACHE_D%USED_BYTES
+  END FUNCTION MPI_BLR_MATRIX_OOC_RESIDENT_BYTES
+
+  !-----------------------------------------------------------------------
+  ! ETAPE 3 (OOC) : factorisation LU EN PLACE, AVEC PIVOT -- MEME
+  ! algorithme EXACT que MPI_BLR_MATRIX_LU_FACTOR_PIVOT (voir son
+  ! commentaire de tete pour le detail complet), avec des points de
+  ! CHARGEMENT/ECRITURE explicites la ou l'original lit/ecrit
+  ! A_BLR%DIAGBLK(K)%D ou A_BLR%OFFBLK(li,lj) directement :
+  !   - DIAGBLK : passe par CACHE_D (voir blr_ooc_mod.f90), meme principe
+  !     LRU que CACHE_A -- un bloc diagonal reste resident entre deux
+  !     touches successives (mises a jour de Schur, une par etape K<I) et
+  !     n'est ecrit sur disque qu'a son eviction, EN PLACE via
+  !     OOC_WRITE_BLOCK_FIXED (aucun octet orphelin, contrairement a
+  !     l'append-only : un bloc diagonal est toujours dense et de taille
+  !     fixe pour un K donne).
+  !   - OFFBLK : passe par CACHE_A (voir blr_ooc_mod.f90), ecrit EN PLACE a
+  !     l'eviction (OOC_WRITE_BLOCK_FIXED, meme routine que DIAGBLK -- le
+  !     rang peut varier d'une reecriture a l'autre, mais le premier appel
+  !     reserve toujours le pire cas dense, donc aucun octet orphelin
+  !     malgre cette variation) -- des qu'un bloc panneau (etape 6) a fini
+  !     son role (copie dans LRECV/URECV), il est explicitement EVINCE
+  !     (ecrit + libere) : il ne sera plus jamais touche avant la
+  !     resolution. Les blocs de la sous-matrice traineante (etape 7)
+  !     restent dans le cache jusqu'a ce que le budget MAX_MB_PER_PROCESS
+  !     force une eviction LRU -- la boucle naturelle sur (li,lj) suffit a
+  !     borner la RAM, aucune logique de "streaming par colonne" explicite
+  !     necessaire.
+  !
+  ! RESOLU (etait "limite connue v1") : OOC_CACHE_GET/OOC_DIAG_CACHE_GET
+  ! faisaient a l'origine une recherche LINEAIRE parmi les emplacements du
+  ! cache a CHAQUE acces (meme un acces DEJA RESIDENT) -- mesure comme un
+  ! cout significatif meme a budget genereux (peu d'evictions), voir la
+  ! memoire du projet. Remplace par un lookup DIRECT O(1) (SLOT_OF(li,lj)/
+  ! SLOT_OF(K), voir blr_ooc_mod.f90) + une pile d'emplacements libres
+  ! (FREE_STACK) pour l'insertion -- seule la recherche du bloc LRU a
+  ! evincer (OOC_CACHE_MAKE_ROOM/OOC_DIAG_CACHE_MAKE_ROOM) reste lineaire,
+  ! mais seulement lors d'un MISS necessitant une eviction, pas a chaque
+  ! acces.
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC(GRID, A_BLR, TOL, INFO, &
+                                                 N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
+                                                 SHOW_PROGRESS, SHOW_RSS_TRACE, &
+                                                 T_CACHE_GET, T_CACHE_EVICT, T_COMPUTE, T_MPICALL, &
+                                                 T_CACHE_GET_MIN, T_CACHE_EVICT_MIN, T_COMPUTE_MIN, T_MPICALL_MIN)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)              :: GRID
+    TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(INOUT) :: A_BLR
+    REAL(WP), INTENT(IN)                  :: TOL
+    INTEGER, INTENT(OUT)                  :: INFO
+    INTEGER, INTENT(OUT)                  :: N_COMPRESSED, N_OFFDIAG
+    INTEGER(8), INTENT(OUT)               :: RANK_SUM
+    INTEGER, INTENT(OUT), OPTIONAL        :: N_SWAPS
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_FACTOR
+    LOGICAL, INTENT(IN), OPTIONAL         :: SHOW_PROGRESS
+    LOGICAL, INTENT(IN), OPTIONAL         :: SHOW_RSS_TRACE
+    ! DIAGNOSTIC (demande explicite -- isoler ou part le temps de la
+    ! factorisation OOC face au classique) : T_CACHE_GET cumule le temps
+    ! passe dans TOUS les appels OOC_CACHE_GET/OOC_DIAG_CACHE_GET (lookup
+    ! O(1) + lecture disque quand le bloc n'est pas deja resident) ;
+    ! T_CACHE_EVICT cumule le temps des evictions de panneau (etape 6,
+    ! TOUJOURS reelles, ecriture disque inconditionnelle quel que soit le
+    ! budget) ; T_COMPUTE cumule le calcul pur (CGETRF, TRSM, mises a jour
+    ! de Schur, swap de ligne) ; T_MPICALL cumule les diffusions MPI
+    ! (BCAST de IPIV_K/DKK et BCAST_BLR_BLOCK des panneaux). Ces 4
+    ! categories couvrent la totalite de T_FACTOR (a la precision des
+    ! quelques operations non chronometrees pres, negligeables : ALLOCATE/
+    ! DEALLOCATE/MOVE_ALLOC). Tous optionnels, aucun surcout si absents.
+    ! Si T_CACHE_GET domine T_FACTOR alors que T_COMPUTE reste comparable
+    ! au chemin classique, ce n'est PAS un defaut du cache -- voir le
+    ! commentaire "DIMENSIONNER MAX_MB_PER_PROCESS" sur MPI_BLR_MATRIX_
+    ! OOC_T plus haut : c'est le signe que le budget est sous l'ensemble
+    ! de travail reel, augmenter MAX_MB_PER_PROCESS est le seul vrai levier.
+    !
+    ! BOGUE CORRIGE (2026-09-01, exploration d'une visibilite par-processus
+    ! type MPE/Jumpshot, indisponible dans cet environnement -- voir la
+    ! memoire du projet) : ces 4 sorties etaient jusqu'ici affectees a la
+    ! valeur LOCALE du rang appelant (pas de reduction), CONTRAIREMENT a
+    ! T_DIAG/T_TRSM/etc. de MPI_BLR_MATRIX_LU_FACTOR_NOPIV qui font deja un
+    ! MPI_ALLREDUCE(MAX) correct -- incoherence introduite lors de l'ajout
+    ! de ce diagnostic sur la variante OOC, jamais alignee sur la
+    ! convention NOPIV. Corrige : T_CACHE_GET/T_CACHE_EVICT/T_COMPUTE/
+    ! T_MPICALL sont maintenant un vrai MAX sur GRID%COMM. Nouveaux
+    ! _MIN (optionnels, meme cout : un MPI_ALLREDUCE de plus par
+    ! categorie) donnent en prime un INDICATEUR DE DESEQUILIBRE DE CHARGE
+    ! direct : un ecart MAX/MIN important sur T_CACHE_GET par exemple
+    ! signale qu'un sous-ensemble de processus subit beaucoup plus
+    ! d'evictions/lectures disque que les autres (distribution du travail
+    ! non uniforme), invisible tant qu'on ne voit que la valeur MAX seule.
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_CACHE_GET, T_CACHE_EVICT, T_COMPUTE, T_MPICALL
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_CACHE_GET_MIN, T_CACHE_EVICT_MIN, T_COMPUTE_MIN, T_MPICALL_MIN
+
+    COMPLEX(WP), ALLOCATABLE :: DKK(:,:), DIAGTMP(:,:)
+    TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
+    TYPE(BLR_WORKSPACE_T) :: WS
+    INTEGER, ALLOCATABLE :: IPIV_K(:)
+    INTEGER :: NBLK, K, li, lj, I, J, KW, MI, NJ, IINFO, INFO_STEP, IDX, IDX_D
+    INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, NS_LOCAL, li_K, LAST_PCT
+    INTEGER(8) :: RS_LOCAL
+    DOUBLE PRECISION :: T0, TT0, T_FACTOR_L, RSS_MAX_MB, CACHE_MAX_MB
+    DOUBLE PRECISION :: T_GET_L, T_EVICT_L, T_COMPUTE_L, T_MPI_L
+    LOGICAL :: PROGRESS, RSS_TRACE
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    LAST_PCT = -5
+    RSS_TRACE = .FALSE.
+    IF (PRESENT(SHOW_RSS_TRACE)) RSS_TRACE = SHOW_RSS_TRACE .AND. (GRID%MYID.EQ.0)
+    RSS_MAX_MB = 0.0D0; CACHE_MAX_MB = 0.0D0
+
+    T0 = MPI_WTIME()
+    T_GET_L = 0.0D0; T_EVICT_L = 0.0D0; T_COMPUTE_L = 0.0D0; T_MPI_L = 0.0D0
+    NBLK = A_BLR%NBLK
+    INFO = 0
+    NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8; NS_LOCAL = 0
+    ALLOCATE(LRECV(MAX(A_BLR%NBLKR_LOC,1)), URECV(MAX(A_BLR%NBLKC_LOC,1)))
+    ALLOCATE(A_BLR%IPIV(A_BLR%NB, NBLK))
+    A_BLR%IPIV = 0
+    CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB)
+
+    DO K = 1, NBLK
+      KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = MOD(K-1, GRID%PC)
+      INFO_STEP = 0
+      ALLOCATE(IPIV_K(KW))
+      IPIV_K = 0
+
+      ! 1) facteur diagonal AVEC PIVOT (CGETRF) -- CHARGE DIAGBLK(K) via
+      !    CACHE_D (proprietaire seulement, comme l'original), factorise
+      !    dans DKK directement (evite un aller-retour supplementaire :
+      !    DKK est de toute facon diffuse juste apres, voir etape 3). Le
+      !    slot de cache reste "creux" (DENSE deplace vers DKK) jusqu'a
+      !    l'etape 3, qui le repeuple -- rien d'autre ne touche CACHE_D
+      !    pour ce K entre les deux (voir etape 2, uniquement CACHE_A).
+      IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) THEN
+        TT0 = MPI_WTIME()
+        IDX_D = OOC_DIAG_CACHE_GET(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK, K)
+        T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+        TT0 = MPI_WTIME()
+        CALL MOVE_ALLOC(A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%DENSE, DKK)
+        CALL CGETRF(KW, KW, DKK, KW, IPIV_K, IINFO)
+        T_COMPUTE_L = T_COMPUTE_L + (MPI_WTIME() - TT0)
+        IF (IINFO .NE. 0) INFO_STEP = A_BLR%BSTART(K) - 1 + IINFO
+      END IF
+      TT0 = MPI_WTIME()
+      CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+      T_MPI_L = T_MPI_L + (MPI_WTIME() - TT0)
+      IF (INFO_STEP .NE. 0) THEN
+        INFO = INFO_STEP
+        DEALLOCATE(LRECV, URECV)
+        IF (ALLOCATED(IPIV_K)) DEALLOCATE(IPIV_K)
+        IF (ALLOCATED(DKK)) DEALLOCATE(DKK)
+        CALL BLR_WORKSPACE_FREE(WS)
+        RETURN
+      END IF
+
+      TT0 = MPI_WTIME()
+      CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+      T_MPI_L = T_MPI_L + (MPI_WTIME() - TT0)
+      A_BLR%IPIV(1:KW,K) = IPIV_K
+
+      ! 2) propage le pivot -- charge/modifie/marque DIRTY via le cache.
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        li_K = (K-1)/GRID%PR + 1
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .EQ. K) CYCLE
+          TT0 = MPI_WTIME()
+          IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li_K, lj)
+          T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+          TT0 = MPI_WTIME()
+          CALL BLR_BLOCK_ROW_SWAP(A_BLR%CACHE_A%SLOTS(IDX)%BLK, KW, IPIV_K)
+          T_COMPUTE_L = T_COMPUTE_L + (MPI_WTIME() - TT0)
+          CALL OOC_CACHE_MARK_DIRTY(A_BLR%CACHE_A, IDX)
+        END DO
+      END IF
+      DO I = 1, KW
+        IF (IPIV_K(I) .NE. I) NS_LOCAL = NS_LOCAL + 1
+      END DO
+      DEALLOCATE(IPIV_K)
+
+      ! 3) DKK diffuse -- deja factorise (etape 1) chez le proprietaire,
+      !    ALLOUE ICI pour les non-proprietaires (l'original le fait tout
+      !    aussi, DKK n'existe pas encore chez eux a ce point).
+      IF (.NOT. ALLOCATED(DKK)) ALLOCATE(DKK(KW,KW))
+      TT0 = MPI_WTIME()
+      IF (GRID%MYROW .EQ. PROW_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+      IF (GRID%MYCOL .EQ. PCOL_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+      T_MPI_L = T_MPI_L + (MPI_WTIME() - TT0)
+
+      ! DIAGBLK(K) a fini son role dans la factorisation elle-meme (jamais
+      ! retouche avant la resolution EN TANT QUE PIVOT -- mais peut encore
+      ! recevoir des mises a jour de Schur si K est aussi un indice I>K'
+      ! d'une etape ulterieure... non, K est fixe ici, ce cas ne se produit
+      ! pas pour SON PROPRE indice K) -- le proprietaire repeuple le slot
+      ! de cache (DIRTY), aucune ecriture disque immediate : elle n'aura
+      ! lieu qu'a l'eviction (LRU ou flush final).
+      IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) THEN
+        TT0 = MPI_WTIME()
+        ALLOCATE(DIAGTMP(KW,KW))
+        DIAGTMP = DKK
+        A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%IS_LOWRANK = .FALSE.
+        A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%M = KW; A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%N = KW
+        CALL MOVE_ALLOC(DIAGTMP, A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%DENSE)
+        CALL OOC_DIAG_CACHE_MARK_DIRTY(A_BLR%CACHE_D, IDX_D)
+        T_COMPUTE_L = T_COMPUTE_L + (MPI_WTIME() - TT0)
+      END IF
+
+      ! 4) U12 -- charge/modifie/marque DIRTY via le cache.
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        li = (K-1)/GRID%PR + 1
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          TT0 = MPI_WTIME()
+          IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li, lj)
+          T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+          TT0 = MPI_WTIME()
+          CALL BLR_TRSM_LEFT_LOWER_UNIT(DKK, KW, A_BLR%CACHE_A%SLOTS(IDX)%BLK)
+          T_COMPUTE_L = T_COMPUTE_L + (MPI_WTIME() - TT0)
+          CALL OOC_CACHE_MARK_DIRTY(A_BLR%CACHE_A, IDX)
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(li,lj)%M, A_BLR%OFFBLK(li,lj)%N)
+          END IF
+        END DO
+      END IF
+
+      ! 5) L21 -- idem.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        lj = (K-1)/GRID%PC + 1
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          TT0 = MPI_WTIME()
+          IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li, lj)
+          T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+          TT0 = MPI_WTIME()
+          CALL BLR_TRSM_RIGHT_UPPER_NONUNIT(A_BLR%CACHE_A%SLOTS(IDX)%BLK, DKK, KW)
+          T_COMPUTE_L = T_COMPUTE_L + (MPI_WTIME() - TT0)
+          CALL OOC_CACHE_MARK_DIRTY(A_BLR%CACHE_A, IDX)
+          NO_LOCAL = NO_LOCAL + 1
+          IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+            NC_LOCAL = NC_LOCAL + 1
+            RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li,lj)%RANK
+          ELSE
+            RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(li,lj)%M, A_BLR%OFFBLK(li,lj)%N)
+          END IF
+        END DO
+      END IF
+      DEALLOCATE(DKK)
+
+      ! 6) diffusion des panneaux L/U DEJA COMPRESSES, copie dans
+      !    LRECV/URECV -- le proprietaire EVINCE (ecrit+libere) le bloc
+      !    panneau juste apres la copie, il est definitivement fini.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          TT0 = MPI_WTIME()
+          IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li, (K-1)/GRID%PC+1)
+          T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+          TT0 = MPI_WTIME()
+          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, &
+                                A_BLR%CACHE_A%SLOTS(IDX)%BLK)
+          T_MPI_L = T_MPI_L + (MPI_WTIME() - TT0)
+          LRECV(li) = A_BLR%CACHE_A%SLOTS(IDX)%BLK
+          TT0 = MPI_WTIME()
+          CALL OOC_CACHE_EVICT_SLOT(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, IDX)
+          T_EVICT_L = T_EVICT_L + (MPI_WTIME() - TT0)
+        END DO
+      ELSE
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          TT0 = MPI_WTIME()
+          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, LRECV(li))
+          T_MPI_L = T_MPI_L + (MPI_WTIME() - TT0)
+        END DO
+      END IF
+
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          TT0 = MPI_WTIME()
+          IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, (K-1)/GRID%PR+1, lj)
+          T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+          TT0 = MPI_WTIME()
+          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, &
+                                A_BLR%CACHE_A%SLOTS(IDX)%BLK)
+          T_MPI_L = T_MPI_L + (MPI_WTIME() - TT0)
+          URECV(lj) = A_BLR%CACHE_A%SLOTS(IDX)%BLK
+          TT0 = MPI_WTIME()
+          CALL OOC_CACHE_EVICT_SLOT(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, IDX)
+          T_EVICT_L = T_EVICT_L + (MPI_WTIME() - TT0)
+        END DO
+      ELSE
+        DO lj = 1, A_BLR%NBLKC_LOC
+          J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+          IF (J .LE. K) CYCLE
+          TT0 = MPI_WTIME()
+          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj))
+          T_MPI_L = T_MPI_L + (MPI_WTIME() - TT0)
+        END DO
+      END IF
+
+      ! 7) mise a jour de Schur locale -- diagonale : passe par CACHE_D ;
+      !    hors-diagonale : passe par CACHE_A, DESCRIPTEUR resynchronise
+      !    apres coup (RANG/IS_LOWRANK peuvent changer).
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (J .LE. K) CYCLE
+        NJ = A_BLR%BEND(J) - A_BLR%BSTART(J) + 1
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LE. K) CYCLE
+          MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+          IF (I .EQ. J) THEN
+            TT0 = MPI_WTIME()
+            IDX_D = OOC_DIAG_CACHE_GET(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK, I)
+            T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+            TT0 = MPI_WTIME()
+            CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, LRECV(li), URECV(lj), A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%DENSE, MI)
+            T_COMPUTE_L = T_COMPUTE_L + (MPI_WTIME() - TT0)
+            CALL OOC_DIAG_CACHE_MARK_DIRTY(A_BLR%CACHE_D, IDX_D)
+          ELSE
+            TT0 = MPI_WTIME()
+            IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li, lj)
+            T_GET_L = T_GET_L + (MPI_WTIME() - TT0)
+            TT0 = MPI_WTIME()
+            CALL SCHUR_UPDATE_BLR_BLOCK(A_BLR%CACHE_A%SLOTS(IDX)%BLK, MI, NJ, KW, LRECV(li), URECV(lj), TOL, WS)
+            T_COMPUTE_L = T_COMPUTE_L + (MPI_WTIME() - TT0)
+            A_BLR%OFFBLK(li,lj)%IS_LOWRANK = A_BLR%CACHE_A%SLOTS(IDX)%BLK%IS_LOWRANK
+            A_BLR%OFFBLK(li,lj)%RANK = A_BLR%CACHE_A%SLOTS(IDX)%BLK%RANK
+            CALL OOC_CACHE_MARK_DIRTY(A_BLR%CACHE_A, IDX)
+          END IF
+        END DO
+      END DO
+
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU ooc (pivot)', K, NBLK)
+      ! DEMANDE EXPLICITE (2026-09-01) : n'afficher que le MAXIMUM observe
+      ! (RSS et cache resident), pas une ligne par K -- voir le commentaire
+      ! equivalent sur MPI_BLR_MATRIX_LU_FACTOR_PIVOT (version classique).
+      IF (RSS_TRACE) THEN
+        RSS_MAX_MB = MAX(RSS_MAX_MB, REAL(GET_RSS_KB(),8)/1024.0D0)
+        CACHE_MAX_MB = MAX(CACHE_MAX_MB, REAL(A_BLR%CACHE_A%USED_BYTES+A_BLR%CACHE_D%USED_BYTES,8)/1024.0D0/1024.0D0)
+      END IF
+    END DO
+    IF (RSS_TRACE) WRITE(6,'(A,F8.1,A,F8.1,A)') '     [RSS trace ooc] MAX observe pendant la factorisation : RSS = ', &
+         RSS_MAX_MB, ' Mo , cache resident = ', CACHE_MAX_MB, ' Mo'
+
+    ! Fin de factorisation : tout ce qui reste resident (blocs traineants
+    ! jamais evinces faute d'avoir atteint le budget) part sur disque --
+    ! la resolution doit pouvoir tout relire depuis STORE_A. Compte comme
+    ! T_CACHE_EVICT (ecriture disque, meme categorie que les evictions de
+    ! panneau de l'etape 6).
+    TT0 = MPI_WTIME()
+    CALL OOC_CACHE_FLUSH_ALL(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK)
+    CALL OOC_DIAG_CACHE_FLUSH_ALL(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK)
+    T_EVICT_L = T_EVICT_L + (MPI_WTIME() - TT0)
+
+    DEALLOCATE(LRECV, URECV)
+    CALL BLR_WORKSPACE_FREE(WS)
+    IF (PRESENT(T_FACTOR)) THEN
+      T_FACTOR_L = MPI_WTIME() - T0
+      CALL MPI_ALLREDUCE(T_FACTOR_L, T_FACTOR, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    END IF
+    IF (PRESENT(T_CACHE_GET))   CALL MPI_ALLREDUCE(T_GET_L,     T_CACHE_GET,   1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_CACHE_EVICT)) CALL MPI_ALLREDUCE(T_EVICT_L,   T_CACHE_EVICT, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_COMPUTE))     CALL MPI_ALLREDUCE(T_COMPUTE_L, T_COMPUTE,     1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_MPICALL))     CALL MPI_ALLREDUCE(T_MPI_L,     T_MPICALL,     1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_CACHE_GET_MIN))   CALL MPI_ALLREDUCE(T_GET_L,     T_CACHE_GET_MIN,   1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+    IF (PRESENT(T_CACHE_EVICT_MIN)) CALL MPI_ALLREDUCE(T_EVICT_L,   T_CACHE_EVICT_MIN, 1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+    IF (PRESENT(T_COMPUTE_MIN))     CALL MPI_ALLREDUCE(T_COMPUTE_L, T_COMPUTE_MIN,     1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+    IF (PRESENT(T_MPICALL_MIN))     CALL MPI_ALLREDUCE(T_MPI_L,     T_MPICALL_MIN,     1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
+
+    CALL MPI_ALLREDUCE(NC_LOCAL, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(NO_LOCAL, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(RS_LOCAL, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+    IF (PRESENT(N_SWAPS)) N_SWAPS = NS_LOCAL
+  END SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC
+
+  !-----------------------------------------------------------------------
+  ! Variante OOC de LOCAL_ROW_OFFSET -- corps STRICTEMENT identique.
+  !-----------------------------------------------------------------------
+  FUNCTION LOCAL_ROW_OFFSET_OOC(A_BLR, GRID, IGLOBAL) RESULT(RS)
+    TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(IN) :: A_BLR
+    TYPE(GRID_T), INTENT(IN)               :: GRID
+    INTEGER, INTENT(IN)                    :: IGLOBAL
+    INTEGER :: RS, li, I
+    RS = 1
+    DO li = 1, (IGLOBAL-1-GRID%MYROW)/GRID%PR
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      RS = RS + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
+    END DO
+  END FUNCTION LOCAL_ROW_OFFSET_OOC
+
+  !-----------------------------------------------------------------------
+  ! ETAPE 4 (OOC) : resolution, PAR PAQUETS d'au plus NRHS_BATCH colonnes
+  ! GLOBALES (RHS, deja assemble sur disque par MPI_ASSEMBLE_RHS_OOC).
+  ! Pour CHAQUE paquet : lit B depuis RHS%STORE_B (APPEND-ONLY, jamais
+  ! recycle -- chaque paquet n'est lu qu'une fois, jamais reutilise entre
+  ! paquets, un cache n'apporterait rien ici), execute EXACTEMENT
+  ! l'algorithme de MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D (substitution avant
+  ! PUIS arriere) avec WIDTH=largeur du paquet en guise de "NRHS", puis
+  ! appelle CONSUME_X_BATCH avec la solution de ce paquet avant de passer
+  ! au suivant -- la memoire de CE FLUX (B, X) est bornee par NRHS_BATCH,
+  ! jamais par NRHS total (demande explicite).
+  !
+  ! DIAGBLK/OFFBLK, EUX, sont LUS VIA CACHE_A/CACHE_D (memes caches que la
+  ! factorisation, reutilises TELS QUELS -- ils sont vides apres le flush
+  ! de fin de factorisation, mais restent structurellement valides). Point
+  ! important : contrairement a la factorisation, un bloc L/U donne est
+  ! touche EXACTEMENT UNE FOIS par phase (avant OU arriere) PAR PAQUET --
+  ! a l'interieur d'un seul paquet, un cache n'apporte donc rien (chaque
+  ! acces est un premier acces). Le gain vient d'ENTRE deux paquets : les
+  ! MEMES blocs L/U sont necessaires a CHAQUE paquet (ils ne dependent pas
+  ! des colonnes de second membre en cours), donc un cache qui SURVIT au
+  ! paquet en cours evite de relire NBATCHES fois les memes donnees --
+  ! MESURE (N=20000, NB=400, blocs quasi tous denses -- 1% compresses --
+  ! MAX_MB_PER_PROCESS=900, NRHS_BATCH=2 donc NBATCHES=3, voir test/bench_
+  ! blr_mpi_pivot_ooc_compare.f90) : temps de resolution divise par 2.76
+  ! (36.5s -> 13.2s), RSS quasi inchangee. Gain plus modeste que l'espoir
+  ! initial (facteur NBATCHES=3 aurait suggere jusqu'a /3) -- coherent avec
+  ! la mise en garde suivante : MAX_MB_PER_PROCESS=900 est proche mais pas
+  ! tres au-dessus du besoin reel observe (~915-920 Mo), une partie du
+  ! gain se perd donc encore en eviction. ATTENTION : ce gain suppose que
+  ! MAX_MB_PER_PROCESS
+  ! couvre l'ensemble complet des donnees L/U locales -- sinon, le meme
+  ! phenomene de thrashing que la factorisation (acces quasi-sequentiel,
+  ! l'integralite de l'ensemble de travail est parcourue entre deux
+  ! passages sur un meme bloc) annule le benefice (voir le commentaire
+  ! "DIMENSIONNER MAX_MB_PER_PROCESS" sur MPI_BLR_MATRIX_OOC_T).
+  !-----------------------------------------------------------------------
+  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)                  :: GRID
+    TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(INOUT) :: A_BLR
+    TYPE(OOC_RHS_T), INTENT(INOUT)            :: RHS
+    PROCEDURE(CONSUME_X_BATCH_IFACE)          :: CONSUME_X_BATCH
+    LOGICAL, INTENT(IN), OPTIONAL             :: SHOW_PROGRESS
+
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
+    COMPLEX(WP), ALLOCATABLE :: B_LOCAL(:,:)
+    TYPE(BLR_BLOCK_T) :: DTMP
+    INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
+    INTEGER :: NBLK, K, li, lj, I, J, KW, MI, RS, RE, NROWTRAIL, C, IERR, LDB
+    INTEGER :: PROW_K, PCOL_K, STEP, NSTEPS, LAST_PCT, IDX, IDX_D
+    INTEGER :: B, RSTART, REND, WIDTH, NRHS, NRHS_LOC, LOCAL_OFFSET, GSTART, GEND
+    LOGICAL :: PROGRESS
+
+    PROGRESS = .FALSE.
+    IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
+    NBLK = A_BLR%NBLK
+
+    DO B = 1, RHS%NBATCHES
+      RSTART = (B-1)*RHS%NRHS_BATCH + 1
+      REND = MIN(B*RHS%NRHS_BATCH, RHS%NRHS)
+      WIDTH = REND - RSTART + 1
+      NRHS = WIDTH
+      CALL RHS_LOCAL_RANGE_MBM(WIDTH, GRID%PC, GRID%MYCOL, LOCAL_OFFSET, NRHS_LOC)
+      GSTART = RSTART + LOCAL_OFFSET - 1
+      GEND = GSTART + NRHS_LOC - 1
+
+      CALL OOC_READ_BLOCK_RAW(RHS%STORE_B, RHS%BATCH(B), DTMP)
+      LDB = MAX(RHS%MLOC,1)
+      ALLOCATE(B_LOCAL(LDB,MAX(NRHS_LOC,1)))
+      CALL MOVE_ALLOC(DTMP%DENSE, B_LOCAL)
+
+      STEP = 0
+      LAST_PCT = -5
+      NSTEPS = 2 * NBLK
+      ALLOCATE(RSTARTS(0:GRID%PC-1), RLOCS(0:GRID%PC-1), RCOUNTS(0:GRID%PC-1), RDISPLS(0:GRID%PC-1))
+      DO C = 0, GRID%PC-1
+        CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
+      END DO
+
+      ! === 0) P*B -- inchange (IPIV deja diffuse a la factorisation) ===
+      DO K = 1, NBLK
+        KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+        PROW_K = MOD(K-1, GRID%PR)
+        IF (GRID%MYROW.NE.PROW_K .OR. NRHS_LOC.LE.0) CYCLE
+        RS = LOCAL_ROW_OFFSET_OOC(A_BLR, GRID, K)
+        DO I = 1, KW
+          IF (A_BLR%IPIV(I,K) .NE. I) THEN
+            CALL CSWAP(NRHS_LOC, B_LOCAL(RS+I-1,1), LDB, B_LOCAL(RS+A_BLR%IPIV(I,K)-1,1), LDB)
+          END IF
+        END DO
+      END DO
+
+      ! === 1) L*Y = P*B (substitution avant) -- DIAGBLK/OFFBLK LUS via
+      !     CACHE_D/CACHE_A (voir commentaire de tete : cache PERSISTANT
+      !     entre paquets, en LECTURE SEULE). ===
+      DO K = 1, NBLK
+        KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+        PROW_K = MOD(K-1, GRID%PR)
+        PCOL_K = MOD(K-1, GRID%PC)
+
+        ALLOCATE(XK_FULL(KW,NRHS))
+        IF (GRID%MYROW .EQ. PROW_K) THEN
+          ALLOCATE(DKK(KW,KW))
+          IF (GRID%MYCOL .EQ. PCOL_K) THEN
+            IDX_D = OOC_DIAG_CACHE_GET(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK, K)
+            DKK = A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%DENSE
+          END IF
+          CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+
+          RS = LOCAL_ROW_OFFSET_OOC(A_BLR, GRID, K)
+          IF (NRHS_LOC .GT. 0) THEN
+            CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, NRHS_LOC, &
+                        CONE, DKK, KW, B_LOCAL(RS,1), LDB)
+          END IF
+          DEALLOCATE(DKK)
+          ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
+          IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+          DO C = 0, GRID%PC-1
+            RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
+          END DO
+          CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                               XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+          DEALLOCATE(XK_LOC)
+        END IF
+        CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+        lj = (K-1)/GRID%PC + 1
+        NROWTRAIL = 0
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .GT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+        END DO
+        IF (NROWTRAIL .GT. 0) THEN
+          ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
+          IF (GRID%MYCOL .EQ. PCOL_K) THEN
+            CONTRIB = CZERO
+            RE = 0
+            DO li = 1, A_BLR%NBLKR_LOC
+              I = (li-1)*GRID%PR + GRID%MYROW + 1
+              IF (I .LE. K) CYCLE
+              MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+              IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li, lj)
+              CALL BLR_BLOCK_APPLY(A_BLR%CACHE_A%SLOTS(IDX)%BLK, NRHS, CONE, XK_FULL, KW, CONE, &
+                                    CONTRIB(RE+1,1), NROWTRAIL)
+              RE = RE + MI
+            END DO
+          END IF
+          ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
+          DO C = 0, GRID%PC-1
+            RCOUNTS(C) = NROWTRAIL*RLOCS(C); RDISPLS(C) = NROWTRAIL*(RSTARTS(C)-1)
+          END DO
+          CALL MPI_SCATTERV(CONTRIB, RCOUNTS, RDISPLS, MPI_COMPLEX, &
+                             CONTRIB_LOC, NROWTRAIL*NRHS_LOC, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+          IF (NRHS_LOC .GT. 0) THEN
+            RE = 0; RS = 1
+            DO li = 1, A_BLR%NBLKR_LOC
+              I = (li-1)*GRID%PR + GRID%MYROW + 1
+              MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+              IF (I .GT. K) THEN
+                B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) = B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) - CONTRIB_LOC(RE+1:RE+MI,1:NRHS_LOC)
+                RE = RE + MI
+              END IF
+              RS = RS + MI
+            END DO
+          END IF
+          DEALLOCATE(CONTRIB, CONTRIB_LOC)
+        END IF
+        DEALLOCATE(XK_FULL)
+        STEP = STEP + 1
+        IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution ooc (pivot)', STEP, NSTEPS)
+      END DO
+
+      ! === 2) U*X = Y (substitution arriere) -- AUCUN pivot necessaire ===
+      DO K = NBLK, 1, -1
+        KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
+        PROW_K = MOD(K-1, GRID%PR)
+        PCOL_K = MOD(K-1, GRID%PC)
+
+        ALLOCATE(XK_FULL(KW,NRHS))
+        IF (GRID%MYROW .EQ. PROW_K) THEN
+          ALLOCATE(DKK(KW,KW))
+          IF (GRID%MYCOL .EQ. PCOL_K) THEN
+            IDX_D = OOC_DIAG_CACHE_GET(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK, K)
+            DKK = A_BLR%CACHE_D%SLOTS(IDX_D)%BLK%DENSE
+          END IF
+          CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+
+          RS = LOCAL_ROW_OFFSET_OOC(A_BLR, GRID, K)
+          IF (NRHS_LOC .GT. 0) THEN
+            CALL CTRSM('Left', 'Upper', 'No transpose', 'Non-unit', KW, NRHS_LOC, &
+                        CONE, DKK, KW, B_LOCAL(RS,1), LDB)
+          END IF
+          DEALLOCATE(DKK)
+          ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
+          IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+          DO C = 0, GRID%PC-1
+            RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
+          END DO
+          CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                               XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+          DEALLOCATE(XK_LOC)
+        END IF
+        CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+
+        lj = (K-1)/GRID%PC + 1
+        NROWTRAIL = 0
+        DO li = 1, A_BLR%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          IF (I .LT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+        END DO
+        IF (NROWTRAIL .GT. 0) THEN
+          ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
+          IF (GRID%MYCOL .EQ. PCOL_K) THEN
+            CONTRIB = CZERO
+            RE = 0
+            DO li = 1, A_BLR%NBLKR_LOC
+              I = (li-1)*GRID%PR + GRID%MYROW + 1
+              IF (I .GE. K) CYCLE
+              MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+              IDX = OOC_CACHE_GET(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK, li, lj)
+              CALL BLR_BLOCK_APPLY(A_BLR%CACHE_A%SLOTS(IDX)%BLK, NRHS, CONE, XK_FULL, KW, CONE, &
+                                    CONTRIB(RE+1,1), NROWTRAIL)
+              RE = RE + MI
+            END DO
+          END IF
+          ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
+          DO C = 0, GRID%PC-1
+            RCOUNTS(C) = NROWTRAIL*RLOCS(C); RDISPLS(C) = NROWTRAIL*(RSTARTS(C)-1)
+          END DO
+          CALL MPI_SCATTERV(CONTRIB, RCOUNTS, RDISPLS, MPI_COMPLEX, &
+                             CONTRIB_LOC, NROWTRAIL*NRHS_LOC, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+          IF (NRHS_LOC .GT. 0) THEN
+            RE = 0; RS = 1
+            DO li = 1, A_BLR%NBLKR_LOC
+              I = (li-1)*GRID%PR + GRID%MYROW + 1
+              MI = A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+              IF (I .LT. K) THEN
+                B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) = B_LOCAL(RS:RS+MI-1,1:NRHS_LOC) - CONTRIB_LOC(RE+1:RE+MI,1:NRHS_LOC)
+                RE = RE + MI
+              END IF
+              RS = RS + MI
+            END DO
+          END IF
+          DEALLOCATE(CONTRIB, CONTRIB_LOC)
+        END IF
+        DEALLOCATE(XK_FULL)
+        STEP = STEP + 1
+        IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution ooc (pivot)', STEP, NSTEPS)
+      END DO
+
+      DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
+      CALL CONSUME_X_BATCH(RSTART, REND, GSTART, GEND, B_LOCAL, LDB, NRHS_LOC)
+      DEALLOCATE(B_LOCAL)
+    END DO
+
+    ! Libere immediatement ce que le cache de resolution a accumule (voir
+    ! commentaire de tete) -- jamais DIRTY (lecture seule), un flush ne
+    ! reecrit donc rien sur disque, il se contente de liberer la RAM sans
+    ! attendre l'eventuel MPI_BLR_MATRIX_OOC_FREE (qui peut arriver bien
+    ! plus tard, voire jamais si l'appelant reutilise A_BLR autrement).
+    CALL OOC_CACHE_FLUSH_ALL(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK)
+    CALL OOC_DIAG_CACHE_FLUSH_ALL(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK)
+  END SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D
 
 END MODULE MPI_BLR_MATRIX_MOD

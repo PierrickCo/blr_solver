@@ -1,6 +1,6 @@
 # Exemples canoniques
 
-Six programmes courts, un par paradigme du projet (voir le tableau de
+Sept programmes courts, un par paradigme du projet (voir le tableau de
 [`README.md`](../README.md)), montrant l'enchainement minimal d'appels
 pour chaque solveur -- sans l'instrumentation de mesure ni la validation
 croisee contre une reference independante des drivers de `test/`/`bench/`
@@ -15,6 +15,7 @@ croisee contre une reference independante des drivers de `test/`/`bench/`
 | `example_blr_mpi_sans_pivot.f90` | BLR+MPI | MPI, stockage BLR distribue, sans pivot (diagonale dominante) |
 | `example_blr_mpi_pivot.f90` | BLR+MPI | MPI, stockage BLR distribue, pivot confine au bloc diagonal |
 | `example_blr_mpi_pivot_arena.f90` | BLR+MPI | Identique, stockage bas-rang carve dans un allocateur arena (voir `../README.md`) |
+| `example_blr_mpi_pivot_ooc.f90` | BLR+MPI | Identique, out-of-core -- matrice/facteurs/second membre sur disque, RAM bornee par `MAX_MB_PER_PROCESS` (voir plus bas) |
 
 ## Compiler
 
@@ -38,6 +39,7 @@ le projet principal d'abord.
 mpirun -np 4 ./example_mpi_dense 2 2 [N] [NB] [NRHS]
 mpirun -np 4 ./example_blr_mpi_sans_pivot 2 2 [N] [NB] [NRHS] [TOL]
 mpirun -np 4 ./example_blr_mpi_pivot 2 2 [N] [NB] [NRHS] [TOL]
+mpirun -np 4 ./example_blr_mpi_pivot_ooc 2 2 [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR]
 ```
 
 Chaque exemple assemble une matrice de demonstration (formule analytique,
@@ -174,3 +176,110 @@ effort/gain n'etant pas demontre.
 comportement) car c'est une bonne pratique defensive independante du
 gain memoire observe ici. `SHOW_RSS_TRACE` est conserve comme outil de
 diagnostic permanent (defaut `.FALSE.`, cout nul).
+
+## Solveur out-of-core (`example_blr_mpi_pivot_ooc.f90`)
+
+Meme algorithme numerique EXACT que `example_blr_mpi_pivot.f90` (pivot
+partiel confine au bloc diagonal, meme matrice de demonstration) -- mais
+plus RIEN n'est suppose tenir en RAM en permanence : chaque processus MPI
+possede un fichier scratch local (jamais partage) et RIEN d'autre que de
+petits descripteurs (`M`/`N`/`RANG`/position sur fichier) ne reste
+resident entre deux etapes. Voir `MPI_BLR_MATRIX_OOC_T` dans
+`src/mpi_blr_matrix_mod.f90` et `src/blr_ooc_mod.f90` pour le detail
+d'implementation (format de stockage, cache LRU, politique d'ecriture).
+
+**4 etapes SEPAREES, chacune bornee en memoire par un parametre
+utilisateur :**
+
+1. **Assemblage de A** -> ecrit sur le fichier scratch, borne par
+   `MAX_MB_PER_PROCESS` (cache LRU).
+2. **Assemblage du second membre B** -> ECRIT SUR DISQUE LUI AUSSI, par
+   paquets d'au plus `NRHS_BATCH` colonnes -- jamais tout B en RAM a la
+   fois, meme dans un cas massivement multi-second-membre.
+3. **Factorisation LU** -> les blocs "finis" (panneau/diagonale de
+   l'etape K) repartent sur disque des qu'ils ne servent plus a la mise a
+   jour de Schur ; la sous-matrice traineante reste bornee par
+   `MAX_MB_PER_PROCESS` via le meme cache.
+4. **Resolution** -> relit L/U depuis le disque, par paquets d'au plus
+   `NRHS_BATCH` seconds membres.
+
+### Choisir `MAX_MB_PER_PROCESS` -- NE PAS prendre le minimum
+
+**Ne pas** choisir ce parametre "le plus petit possible" pour economiser
+de la RAM -- un budget sous l'ensemble de travail REEL du processus ne
+degrade pas gracieusement, il fait THRASHER le cache LRU, avec un cout
+disproportionne par rapport a la RAM economisee.
+
+**Cause** : un bloc hors-diagonale n'est retouche par une mise a jour de
+Schur qu'une fois tous les ~`NBLK` pas de la factorisation, et la
+TOTALITE de l'ensemble de travail local est parcourue entre deux touches
+du MEME bloc -- un schema d'acces quasi-SEQUENTIEL ou aucune taille de
+cache inferieure a l'ensemble de travail complet n'aide, quelle que soit
+la politique d'eviction.
+
+**Mesure concrete** (N=20000, NB=400, grille 2x2, voir
+`test/bench_blr_mpi_pivot_ooc_compare.f90`) :
+
+| `MAX_MB_PER_PROCESS` | RSS reelle | Temps cache (lookup+E/S disque) | Temps factorisation totale |
+|---|---|---|---|
+| 200 Mo | ~127 Mo | 10.1 s (68% du temps) | 14.9 s |
+| 800 Mo | ~128 Mo | 0.75 s (÷13.5) | 3.1 s (÷4.9) |
+
+La RSS reelle est restee QUASI IDENTIQUE entre les deux budgets -- la
+difference de temps ne vient PAS d'un budget "un peu court avec un peu
+plus de RAM utilisee en echange", elle vient du fait que 200 Mo etait
+EN-DESSOUS de l'ensemble de travail reel (~130 Mo) et 800 Mo est
+au-dessus : sous ce seuil, le cache thrashe ; au-dessus, le cout cache
+s'effondre et le temps de factorisation converge vers le chemin
+classique (calcul pur deja comparable : 0.97 s OOC contre 0.61 s
+classique a budget=200 deja).
+
+**Conclusion pratique** : choisir `MAX_MB_PER_PROCESS` au moins egal a
+l'ensemble de travail reel du processus (verifiable en augmentant le
+budget jusqu'a ce que la RSS reelle cesse de croitre, ou via
+`MPI_BLR_MATRIX_OOC_RESIDENT_BYTES` a un budget genereux). L'interet de
+l'out-of-core n'est PAS de tourner avec le budget minimal possible, mais
+de rester CORRECT et de degrader la RAM au lieu de planter quand le
+probleme est trop gros pour tenir en RAM du tout -- en-dessous du seuil
+"ensemble de travail", le compromis temps/memoire devient tres
+defavorable et s'aggrave a mesure que N grandit.
+
+### Diagnostic fin (`T_CACHE_GET`/`T_CACHE_EVICT`/`T_COMPUTE`/`T_MPICALL`)
+
+`MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC` accepte 4 arguments de sortie
+optionnels (aucun surcout si absents) qui decomposent `T_FACTOR` en 4
+categories qui se somment exactement :
+- `T_CACHE_GET` : temps dans TOUS les acces cache (lookup + lecture
+  disque si le bloc n'est pas deja resident).
+- `T_CACHE_EVICT` : temps des evictions de panneau (etape 3,
+  TOUJOURS reelles, ecriture disque inconditionnelle quel que soit le
+  budget).
+- `T_COMPUTE` : calcul pur (`CGETRF`, TRSM, mises a jour de Schur, swap
+  de ligne) -- si ce terme seul est deja comparable au chemin classique
+  mais que `T_FACTOR` reste tres superieur, c'est le signe que
+  `T_CACHE_GET` domine (voir ci-dessus).
+- `T_MPICALL` : diffusions MPI (`BCAST` de `IPIV_K`/`DKK`, diffusion des
+  panneaux compresses).
+
+### Cache de resolution (`MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D`)
+
+La resolution relit `DIAGBLK`/`OFFBLK` depuis le disque via `CACHE_A`/
+`CACHE_D` -- les MEMES caches que la factorisation, reutilises tels quels
+(vides mais structurellement valides apres le flush de fin de
+factorisation). A l'interieur d'un SEUL paquet, un bloc L/U n'est touche
+qu'une fois (pas de gain a esperer la) -- mais les MEMES blocs sont
+necessaires a CHAQUE paquet (`NBATCHES` fois au total, ils ne dependent
+pas des colonnes de second membre), donc un cache qui SURVIT au paquet en
+cours evite de les relire depuis le disque a chaque fois.
+
+**Mesure** (N=20000, NB=400, matrice quasi incompressible -- 1% compresse,
+donc blocs denses volumineux --, `MAX_MB_PER_PROCESS`=900,
+`NRHS_BATCH`=2 donc `NBATCHES`=3) : temps de resolution divise par **2.76**
+(36.5 s -> 13.2 s), RSS quasi inchangee. Gain plus modeste que le facteur
+`NBATCHES`=3 aurait pu suggerer -- coherent avec la meme regle que pour la
+factorisation : `MAX_MB_PER_PROCESS`=900 est proche mais pas tres
+au-dessus du besoin reel observe (~915-920 Mo), une partie du gain se
+perd donc encore en eviction. Sur une matrice tres compressible (blocs
+petits), l'effet est negligeable dans les deux sens -- ce cache n'apporte
+un vrai gain que lorsque NBATCHES>1 ET que les blocs sont assez gros/
+nombreux pour que relire NBATCHES fois coute reellement cher.

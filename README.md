@@ -24,12 +24,12 @@ indépendante et comparables entre eux (même recette de matrice de test) :
 | **B** | Même pipeline, sans compression (`TOL=0`) — isole le gain dû à la compression seule | `bench_blr_pipeline.f90` (`TOL=0`) |
 | **MPI** | LU dense distribué avec pivot, résolution 2D complète (aucune réplication résiduelle) | `mpi_lu_pivot_mod.f90`, `mpi_lu_solve_2d_mod.f90`, `bench_mpi.f90` |
 | **C** | LU dense monolithique, sans découpage en blocs (référence MKL pure) | `block_lu_mod.f90`, `bench_seq.f90` |
-| **BLR+MPI** | Solveur MPI dont le stockage local par processus reste compressé de bout en bout (jamais dense hors blocs diagonaux), panneaux diffusés déjà compressés | `mpi_blr_matrix_mod.f90`, `test_mpi_blr_matrix.f90` (sans pivot), `test_mpi_blr_matrix_pivot.f90` (avec pivot confiné au bloc diagonal), `test_mpi_blr_matrix_pivot_arena.f90` (même algorithme, allocateur arena pour le stockage bas-rang) |
+| **BLR+MPI** | Solveur MPI dont le stockage local par processus reste compressé de bout en bout (jamais dense hors blocs diagonaux), panneaux diffusés déjà compressés | `mpi_blr_matrix_mod.f90`, `test_mpi_blr_matrix.f90` (sans pivot), `test_mpi_blr_matrix_pivot.f90` (avec pivot confiné au bloc diagonal), `test_mpi_blr_matrix_pivot_arena.f90` (même algorithme, allocateur arena pour le stockage bas-rang), `test_mpi_blr_matrix_pivot_ooc.f90` (même algorithme, out-of-core) |
 
 **BLR+MPI** est la pièce la plus aboutie du projet : c'est le seul module où
 le stockage *distribué* lui-même reste compressé (tous les modules MPI plus
 anciens gardent une matrice locale dense, la compression n'y accélère que le
-calcul). Il existe en trois variantes, toutes validées :
+calcul). Il existe en quatre variantes, toutes validées :
 - **sans pivot** (`MPI_BLR_MATRIX_LU_FACTOR_NOPIV`) — matrices à diagonale
   dominante uniquement.
 - **avec pivot partiel confiné au bloc diagonal**
@@ -50,6 +50,18 @@ calcul). Il existe en trois variantes, toutes validées :
   l'arena, jamais récupérée pour les anciennes versions de blocs) — l'écart
   se creuse avec N, l'arena n'a pas encore d'avantage net en RSS absolue à
   plus petite échelle (N=20000).
+- **avec pivot, out-of-core** (`MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC`, type
+  `MPI_BLR_MATRIX_OOC_T`) — même algorithme numérique, mais la matrice, les
+  facteurs LU et le second membre vivent sur un fichier scratch par
+  processus (jamais en RAM en permanence), la mémoire résidente étant
+  bornée par un paramètre utilisateur (`MAX_MB_PER_PROCESS`) via deux
+  caches LRU (voir `examples/README.md` pour le détail). Compromis MESURÉ :
+  le budget mémoire doit rester au-dessus de l'ensemble de travail réel du
+  processus, sous peine de faire thrasher le cache — à N=20000, un budget
+  de 200 Mo perdait 68 % du temps de factorisation en accès disque, contre
+  seulement quelques % à 800 Mo (RSS réelle quasi identique dans les deux
+  cas, ~130 Mo) ; le compromis n'est donc pas « moins de RAM contre plus de
+  temps » de façon linéaire, mais un vrai seuil à ne pas franchir.
 
 ## Limites connues, assumées
 
