@@ -238,7 +238,7 @@ test_blr_workspace.o: $(TEST)/test_blr_workspace.f90 blr_compress_mod.o blr_aren
 # construits ci-dessus, comme legacy/Makefile.
 EX = examples
 
-examples: example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot example_blr_mpi_pivot_arena example_blr_mpi_pivot_fixedcap example_blr_mpi_pivot_ooc
+examples: example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot example_blr_mpi_pivot_arena example_blr_mpi_pivot_fixedcap example_blr_mpi_pivot_ooc example_user_matrix example_user_matrix_ooc
 
 example_blr_sequentiel: blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o $(EX)/example_blr_sequentiel.o
 	$(FC) -o $@ $(OPTF) blr_kinds_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o $(EX)/example_blr_sequentiel.o $(LIBS)
@@ -270,6 +270,12 @@ example_blr_mpi_pivot: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_are
 $(EX)/example_blr_mpi_pivot.o: $(EX)/example_blr_mpi_pivot.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_pivot.f90 -o $(EX)/example_blr_mpi_pivot.o
 
+example_user_matrix: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_user_matrix.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_user_matrix.o $(MPILIBS)
+
+$(EX)/example_user_matrix.o: $(EX)/example_user_matrix.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_user_matrix.f90 -o $(EX)/example_user_matrix.o
+
 example_blr_mpi_pivot_arena: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot_arena.o
 	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_blr_mpi_pivot_arena.o $(MPILIBS)
 
@@ -288,6 +294,12 @@ example_blr_mpi_pivot_ooc: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr
 $(EX)/example_blr_mpi_pivot_ooc.o: $(EX)/example_blr_mpi_pivot_ooc.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_blr_mpi_pivot_ooc.f90 -o $(EX)/example_blr_mpi_pivot_ooc.o
 
+example_user_matrix_ooc: blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_user_matrix_ooc.o
+	$(MPIFC) -o $@ $(OPTF) blr_kinds_mod.o mpi_grid_mod.o blr_compress_mod.o blr_arena_mod.o blr_ooc_mod.o progress_bar_mod.o thread_control_mod.o blr_matrix_mod.o mpi_blr_lu_pivot_bcast_mod.o mpi_lu_pivot_mod.o mpi_lu_solve_2d_mod.o mpi_blr_matrix_mod.o bench_utils_mod.o $(EX)/example_user_matrix_ooc.o $(MPILIBS)
+
+$(EX)/example_user_matrix_ooc.o: $(EX)/example_user_matrix_ooc.f90 mpi_blr_matrix_mod.o mpi_lu_solve_2d_mod.o bench_utils_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_user_matrix_ooc.f90 -o $(EX)/example_user_matrix_ooc.o
+
 clean:
 	$(RM) *.o *.mod test_block_lu test_blr_compress test_mpi_grid test_mpi_lu_pivot test_openmp_dense test_mpi_lu_solve_2d bench_seq bench_mpi bench_blr_pipeline test_blr_matrix_progress test_blr_workspace test_mpi_blr_matrix test_mpi_blr_matrix_pivot test_mpi_blr_matrix_pivot_arena test_mpi_blr_matrix_pivot_ooc bench_blr_mpi_pivot_compressibility bench_blr_mpi_pivot_ratio bench_blr_mpi_pivot_arena
-	$(RM) $(EX)/*.o example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot example_blr_mpi_pivot_arena example_blr_mpi_pivot_fixedcap example_blr_mpi_pivot_ooc
+	$(RM) $(EX)/*.o example_blr_sequentiel example_dense_sequentiel example_mpi_dense example_blr_mpi_sans_pivot example_blr_mpi_pivot example_blr_mpi_pivot_arena example_blr_mpi_pivot_fixedcap example_blr_mpi_pivot_ooc example_user_matrix example_user_matrix_ooc

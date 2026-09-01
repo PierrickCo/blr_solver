@@ -37,6 +37,8 @@ example_blr_mpi_pivot
 example_blr_mpi_pivot_arena
 example_blr_mpi_pivot_fixedcap
 example_blr_mpi_pivot_ooc
+example_user_matrix
+example_user_matrix_ooc
 examples/*.o
 
 # Binaire du micro-benchmark de diagnostic (pas dans le Makefile,
