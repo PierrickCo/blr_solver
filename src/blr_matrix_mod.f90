@@ -102,7 +102,7 @@ CONTAINS
 
     DOUBLE PRECISION :: T0
     COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
-    INTEGER :: I, J, MI, NJ, NDONE, NTOTAL, NTHREADS, TID
+    INTEGER :: I, J, MI, NJ, NDONE, NTOTAL, NTHREADS, TID, PBAR_STATE
     LOGICAL :: PROGRESS
     TYPE(BLR_WORKSPACE_T), ALLOCATABLE :: WSARR(:)
 
@@ -132,6 +132,7 @@ CONTAINS
     N_OFFDIAG = 0
     RANK_SUM = 0_8
     NDONE = 0
+    PBAR_STATE = -1
     NTOTAL = A_BLR%NBLK * A_BLR%NBLK
 
     ! NDONE reste PARTAGE (pas en REDUCTION) : un compteur de progression en
@@ -163,7 +164,7 @@ CONTAINS
         END IF
         !$OMP CRITICAL
         NDONE = NDONE + 1
-        IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression', NDONE, NTOTAL)
+        IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression', NDONE, NTOTAL, PBAR_STATE)
         !$OMP END CRITICAL
       END DO
     END DO
@@ -213,13 +214,14 @@ CONTAINS
     LOGICAL, INTENT(IN), OPTIONAL     :: SHOW_PROGRESS
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
-    INTEGER :: NBLK, K, I, J, KW, MI, NJ, IINFO, NTHREADS, TID
+    INTEGER :: NBLK, K, I, J, KW, MI, NJ, IINFO, NTHREADS, TID, PBAR_STATE
     DOUBLE PRECISION :: T0
     LOGICAL :: PROGRESS
     TYPE(BLR_WORKSPACE_T), ALLOCATABLE :: WSARR(:)
 
     PROGRESS = .FALSE.
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS
+    PBAR_STATE = -1
 
     ! UN workspace QR+SVD PAR THREAD (mise a jour de Schur parallelisee
     ! ci-dessous, point 4 demande) -- NB suffit comme taille : MI,NJ<=NB et
@@ -310,7 +312,7 @@ CONTAINS
       END DO
       !$OMP END PARALLEL DO
 
-      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU', K, NBLK)
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU', K, NBLK, PBAR_STATE)
     END DO
 
     CALL SET_NUM_THREADS(NTHREADS)
@@ -335,7 +337,7 @@ CONTAINS
     LOGICAL, INTENT(IN), OPTIONAL  :: SHOW_PROGRESS
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
-    INTEGER :: NBLK, K, I, J, KW, NDONE, NTOTAL, NTHREADS
+    INTEGER :: NBLK, K, I, J, KW, NDONE, NTOTAL, NTHREADS, PBAR_STATE
     LOGICAL :: PROGRESS
     COMPLEX(WP), ALLOCATABLE :: YACC(:,:)
 
@@ -344,6 +346,7 @@ CONTAINS
 
     NBLK = A_BLR%NBLK
     NDONE = 0
+    PBAR_STATE = -1
     NTOTAL = 2*NBLK
     NTHREADS = OMP_GET_MAX_THREADS()
 
@@ -382,7 +385,7 @@ CONTAINS
       CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, NRHS, &
                   CONE, A_BLR%DIAGBLK(K)%D, KW, B(A_BLR%BSTART(K),1), LDB)
       NDONE = NDONE + 1
-      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution', NDONE, NTOTAL)
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution', NDONE, NTOTAL, PBAR_STATE)
     END DO
 
     ! U*X = Y (substitution arriere) -- meme principe, boucle interne sur J.
@@ -405,7 +408,7 @@ CONTAINS
       CALL CTRSM('Left', 'Upper', 'No transpose', 'Non-unit', KW, NRHS, &
                   CONE, A_BLR%DIAGBLK(K)%D, KW, B(A_BLR%BSTART(K),1), LDB)
       NDONE = NDONE + 1
-      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution', NDONE, NTOTAL)
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution', NDONE, NTOTAL, PBAR_STATE)
     END DO
   END SUBROUTINE BLR_MATRIX_LU_SOLVE
 

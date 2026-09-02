@@ -4,15 +4,25 @@
 ! manuelle sur de petits cas test, pas pour tourner en continu sur les gros
 ! benchmarks :
 !
-! PRINT_PROGRESS_BAR : barre texte a rafraichissement en place (carriage
-! return, CHAR(13), sans saut de ligne) -- FONCTIONNE seulement attachee a
-! un vrai terminal interactif (utilisee par blr_matrix_mod.f90, processus
-! sequentiel unique). NE PAS utiliser sous MPI/mpirun : le lanceur relaie
-! le stdout de chaque processus via un pipe, pas un pseudo-terminal -- le
-! retour chariot n'est alors PAS interprete comme "ecraser la ligne
-! precedente" et chaque appel finit sur SA PROPRE ligne (bug constate et
-! corrige : `mpirun ./example_blr_mpi_pivot` polluait la sortie d'une
-! ligne par mise a jour au lieu d'une barre unique).
+! PRINT_PROGRESS_BAR : barre texte sur UNE SEULE LIGNE qui se REMPLIT au
+! fur et a mesure (demande explicite : plus de reecriture complete de la
+! ligne a chaque appel). AUCUN caractere de controle (ni CHAR(13), ni
+! saut de ligne avant la fin) : chaque appel se contente d'AJOUTER les
+! nouveaux caracteres '=' devenus dus depuis le dernier appel, avec
+! ADVANCE='NO' -- la ligne grandit normalement, comme n'importe quelle
+! sortie texte. Robuste PARTOUT (terminal interactif, sortie redirigee
+! vers un fichier, mpirun/srun relayant le stdout par pipe) puisqu'aucun
+! rendu special n'est requis : c'est ce qui a motive l'abandon du
+! rafraichissement par CHAR(13) (qui ne s'affichait correctement que sur
+! un vrai terminal, cf. l'historique dans la memoire du projet).
+!
+! ETAT PORTE PAR L'APPELANT (NFILL_STATE, INTENT(INOUT)) : un entier
+! local, initialise a une valeur < 0 AVANT la boucle -- meme convention
+! que LAST_PCT dans PRINT_PROGRESS_MILESTONE ci-dessous (aucun etat cache
+! dans le module, donc aucun risque d'interference entre plusieurs barres
+! actives en meme temps dans le meme programme). Le premier appel (etat
+! < 0) ouvre la ligne (etiquette + crochet) ; le dernier appel
+! (CURRENT>=TOTAL) referme le crochet et saute une ligne.
 !
 ! PRINT_PROGRESS_MILESTONE : affichage par PALIERS (tous les 5% par
 ! defaut), une ligne complete normale (avec saut de ligne) par palier --
@@ -28,30 +38,33 @@ MODULE PROGRESS_BAR_MOD
   IMPLICIT NONE
 CONTAINS
 
-  SUBROUTINE PRINT_PROGRESS_BAR(LABEL, CURRENT, TOTAL)
+  SUBROUTINE PRINT_PROGRESS_BAR(LABEL, CURRENT, TOTAL, NFILL_STATE)
     CHARACTER(LEN=*), INTENT(IN) :: LABEL
     INTEGER, INTENT(IN)          :: CURRENT, TOTAL
+    INTEGER, INTENT(INOUT)       :: NFILL_STATE
 
     INTEGER, PARAMETER :: BARWIDTH = 30
     INTEGER :: NFILL, PCT, I
-    CHARACTER(LEN=BARWIDTH) :: BAR
-    CHARACTER(LEN=256) :: LINE
 
     IF (TOTAL .LE. 0) RETURN
-    PCT   = MIN(100, MAX(0, NINT(100.0*REAL(CURRENT)/REAL(TOTAL))))
     NFILL = MIN(BARWIDTH, MAX(0, (BARWIDTH*CURRENT)/TOTAL))
-    DO I = 1, BARWIDTH
-      IF (I .LE. NFILL) THEN
-        BAR(I:I) = '='
-      ELSE
-        BAR(I:I) = ' '
-      END IF
-    END DO
 
-    WRITE(LINE,'(A,A,A,A,A,I4,A)') '  ', TRIM(LABEL), ' [', BAR, '] ', PCT, ' %'
-    WRITE(6,'(A,A)',ADVANCE='NO') CHAR(13), TRIM(LINE)
+    IF (NFILL_STATE .LT. 0) THEN
+      WRITE(6,'(A,A,A)',ADVANCE='NO') '  ', TRIM(LABEL), ' ['
+      NFILL_STATE = 0
+    END IF
+
+    DO I = NFILL_STATE+1, NFILL
+      WRITE(6,'(A)',ADVANCE='NO') '='
+    END DO
+    NFILL_STATE = NFILL
     FLUSH(6)
-    IF (CURRENT .GE. TOTAL) WRITE(6,*)
+
+    IF (CURRENT .GE. TOTAL) THEN
+      PCT = MIN(100, MAX(0, NINT(100.0*REAL(CURRENT)/REAL(TOTAL))))
+      WRITE(6,'(A,I4,A)') '] ', PCT, ' %'
+      FLUSH(6)
+    END IF
   END SUBROUTINE PRINT_PROGRESS_BAR
 
   SUBROUTINE PRINT_PROGRESS_MILESTONE(LABEL, CURRENT, TOTAL, LAST_PCT, STEP_PCT)
