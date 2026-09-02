@@ -68,13 +68,27 @@
 ! pendant le calcul de B (etape potentiellement longue a grand N, cout
 ! CALCUL O(N^2*NRHS) mais ZERO cout memoire supplementaire).
 !
-! CHECK_RESIDUAL (verification SANS solution exacte connue -- IDENTIQUE a
-! example_blr_mpi_pivot.f90, INDEPENDANT de CHECK_ERROR, voir son
-! commentaire de tete pour le detail complet) : calcule ||A*X-B||/||B||
-! APRES resolution avec le B REELLEMENT utilise -- le cas d'usage GENERAL
-! (A et B fournis par l'utilisateur, solution inconnue). Meme principe
-! memoire que CHECK_ERROR : produit brut, ZERO cout memoire au-dela de
-! X_GLOBAL deja gathere sur le rang 0, l'avantage OOC reste entier.
+! CHECK_RESIDUAL (verification SANS solution exacte connue -- INDEPENDANT
+! de CHECK_ERROR) : calcule ||A*X-B||/||B|| APRES resolution avec le B
+! REELLEMENT utilise -- le cas d'usage GENERAL (A et B fournis par
+! l'utilisateur, solution inconnue).
+!
+! Pour eviter de rappeler GET_BLOCK/FILL_RHS une deuxieme fois (couteux si
+! ces callbacks le sont vraiment, cas d'usage reel), A (dense, telle que
+! renvoyee par GET_BLOCK) et B (telle qu'ecrite par FILL_RHS, donc deja
+! coherente avec CHECK_ERROR) sont mises en cache sur disque UNE SEULE
+! FOIS, DES QUE POSSIBLE (juste apres assemblage / apres assemblage du
+! RHS, donc AVANT que la factorisation n'ecrase A par L/U en place) --
+! acheck_rank_NNNNNN.dat et bcheck_rank_NNNNNN.dat, meme convention
+! 1-fichier-par-processus, meme decoupage par blocs de lignes que la
+! verification elle-meme (borne par MAX_MB_PER_PROCESS) -- voir
+! example_user_matrix_ooc.f90 pour le detail complet de la technique
+! (identique ici). Des qu'un bloc de B a servi au calcul du residu, il
+! n'est plus utile : X (deja disponible dans X_GLOBAL) est ECRIT A SA
+! PLACE, DANS LE MEME FICHIER (reecriture en place par POS=, comme
+! OOC_WRITE_BLOCK_FIXED dans blr_ooc_mod.f90) -- a la fin,
+! acheck_rank_*.dat est supprime, bcheck_rank_*.dat survit et contient
+! desormais X (copie disque de la solution, en plus de X_GLOBAL en RAM).
 !===============================================================================
 PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   USE MPI_BLR_MATRIX_MOD
@@ -203,12 +217,21 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   CALL REPORT_MEMORY_MB(GRID, 'RAM residente (cache, apres assemblage)', MPI_BLR_MATRIX_OOC_RESIDENT_BYTES(A_BLR))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage)', GET_RSS_KB()*1024_8)
 
+  ! Cache de A pour CHECK_RESIDUAL : AVANT la factorisation, qui ecrase A
+  ! par L/U en place -- GET_BLOCK n'est plus jamais rappelee ensuite.
+  IF (CHECK_RESIDUAL_FLAG) CALL CACHE_A_FOR_CHECK(GRID, N, NB)
+
   ! --- 2) assemblage du second membre, SEPAREMENT, aussi sur disque ------
   RSS_MAX_RHS_MB = 0.0D0
   CALL MPI_ASSEMBLE_RHS_OOC(GRID, A_BLR, NRHS, NRHS_BATCH, FILL_RHS, SCRATCH_DIR, RHS)
   IF (CHECK_ERROR_FLAG .AND. MYID0.EQ.0) &
        WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant B=A*Xexact = ', RSS_MAX_RHS_MB, ' Mo'
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage B)', GET_RSS_KB()*1024_8)
+
+  ! Cache de B pour CHECK_RESIDUAL -- deja coherente avec CHECK_ERROR
+  ! puisque FILL_RHS (rappelee ici) applique la meme logique qu'a
+  ! l'assemblage reel du second membre.
+  IF (CHECK_RESIDUAL_FLAG) CALL CACHE_B_FOR_CHECK(GRID, N, NB, NRHS)
 
   ! --- 3) factorisation LU, AVEC pivot, out-of-core -----------------------
   CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC(GRID, A_BLR, TOL, INFO, &
@@ -258,13 +281,17 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   END IF
 
   ! APPEL COLLECTIF (MPI_BCAST/MPI_ALLREDUCE a l'interieur) -- TOUS les
-  ! rangs doivent l'appeler, pas seulement le rang 0.
+  ! rangs doivent l'appeler, pas seulement le rang 0. Consomme et supprime
+  ! acheck_rank_*.dat au passage ; bcheck_rank_*.dat survit seul,
+  ! contenant desormais X (voir COMPUTE_RESIDUAL).
   IF (CHECK_RESIDUAL_FLAG) THEN
     RSS_MAX_RESID_MB = 0.0D0
     RESID = COMPUTE_RESIDUAL(X_GLOBAL)
     IF (MYID0.EQ.0) THEN
       WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant le residu = ', RSS_MAX_RESID_MB, ' Mo'
       WRITE(6,'(A,ES12.4)') ' Residu relatif ||A*X-B|| / ||B|| = ', RESID
+      WRITE(6,'(A)') ' acheck_rank_*.dat supprime ; bcheck_rank_*.dat contient desormais X '// &
+           '(economie d''espace disque).'
     END IF
   END IF
 
@@ -371,28 +398,97 @@ CONTAINS
     END IF
   END FUNCTION B_ENTRY
 
+  ! Ecrit UNE FOIS le cache dense de A (acheck_rank_NNNNNN.dat), par blocs
+  ! de lignes bornes par MAX_MB_PER_PROCESS -- meme decoupage que
+  ! COMPUTE_RESIDUAL, pour que la relecture s'y cale exactement. Appelee
+  ! AVANT la factorisation (qui ecrase A par L/U en place). Voir
+  ! example_user_matrix_ooc.f90/CACHE_A_FOR_CHECK pour le detail complet
+  ! (technique identique).
+  SUBROUTINE CACHE_A_FOR_CHECK(GD, NN, NNB)
+    TYPE(GRID_T), INTENT(IN) :: GD
+    INTEGER, INTENT(IN)      :: NN, NNB
+    COMPLEX(WP), ALLOCATABLE :: ABLOCK(:,:)
+    INTEGER :: ROWS_PER_PROC, RSTART_MINE, REND_MINE, RSTART_CHUNK, REND_CHUNK, NCHUNK, CR
+    INTEGER :: UNIT_A
+    CHARACTER(LEN=16) :: RSTR
+
+    ROWS_PER_PROC = (NN + GD%NPROCS - 1) / GD%NPROCS
+    RSTART_MINE = GD%MYID*ROWS_PER_PROC + 1
+    REND_MINE = MIN((GD%MYID+1)*ROWS_PER_PROC, NN)
+    CR = MAX(1, MIN(NNB, INT(MAX_MB_PER_PROCESS*1024.0_WP*1024.0_WP / (8.0_WP*REAL(NN,WP)))))
+
+    WRITE(RSTR,'(I6.6)') GD%MYID
+    OPEN(NEWUNIT=UNIT_A, FILE=TRIM(SCRATCH_DIR)//'/acheck_rank_'//TRIM(RSTR)//'.dat', &
+         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+
+    DO RSTART_CHUNK = RSTART_MINE, REND_MINE, CR
+      REND_CHUNK = MIN(RSTART_CHUNK+CR-1, REND_MINE)
+      NCHUNK = REND_CHUNK - RSTART_CHUNK + 1
+      ALLOCATE(ABLOCK(NCHUNK,NN))
+      CALL GET_BLOCK(RSTART_CHUNK, REND_CHUNK, 1, NN, ABLOCK)
+      WRITE(UNIT_A) RSTART_CHUNK, REND_CHUNK, NCHUNK
+      WRITE(UNIT_A) ABLOCK(1:NCHUNK,1:NN)
+      DEALLOCATE(ABLOCK)
+    END DO
+    CLOSE(UNIT_A)
+  END SUBROUTINE CACHE_A_FOR_CHECK
+
+  ! Ecrit UNE FOIS le cache de B (bcheck_rank_NNNNNN.dat), par bloc de
+  ! lignes -- meme decoupage que COMPUTE_RESIDUAL. B est ici deja LARGE
+  ! de NRHS colonnes en une seule passe (pas de sous-paquets : X_GLOBAL
+  ! lui-meme n'est jamais borne dans ce fichier de demonstration, voir le
+  ! commentaire de COMPUTE_RESIDUAL). Rappelle FILL_RHS -- deja coherente
+  ! avec CHECK_ERROR puisque c'est la MEME fonction qui a servi a
+  ! l'assemblage reel du second membre.
+  SUBROUTINE CACHE_B_FOR_CHECK(GD, NN, NNB, NR)
+    TYPE(GRID_T), INTENT(IN) :: GD
+    INTEGER, INTENT(IN)      :: NN, NNB, NR
+    COMPLEX(WP), ALLOCATABLE :: BBLOCK(:,:)
+    INTEGER :: ROWS_PER_PROC, RSTART_MINE, REND_MINE, RSTART_CHUNK, REND_CHUNK, NCHUNK, CR
+    INTEGER :: UNIT_B
+    CHARACTER(LEN=16) :: RSTR
+
+    ROWS_PER_PROC = (NN + GD%NPROCS - 1) / GD%NPROCS
+    RSTART_MINE = GD%MYID*ROWS_PER_PROC + 1
+    REND_MINE = MIN((GD%MYID+1)*ROWS_PER_PROC, NN)
+    CR = MAX(1, MIN(NNB, INT(MAX_MB_PER_PROCESS*1024.0_WP*1024.0_WP / (8.0_WP*REAL(NN,WP)))))
+
+    WRITE(RSTR,'(I6.6)') GD%MYID
+    OPEN(NEWUNIT=UNIT_B, FILE=TRIM(SCRATCH_DIR)//'/bcheck_rank_'//TRIM(RSTR)//'.dat', &
+         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+
+    DO RSTART_CHUNK = RSTART_MINE, REND_MINE, CR
+      REND_CHUNK = MIN(RSTART_CHUNK+CR-1, REND_MINE)
+      NCHUNK = REND_CHUNK - RSTART_CHUNK + 1
+      ALLOCATE(BBLOCK(NCHUNK,NR))
+      CALL FILL_RHS(RSTART_CHUNK, REND_CHUNK, 1, NR, BBLOCK)
+      WRITE(UNIT_B) RSTART_CHUNK, REND_CHUNK, NCHUNK
+      WRITE(UNIT_B) BBLOCK(1:NCHUNK,1:NR)
+      DEALLOCATE(BBLOCK)
+    END DO
+    CLOSE(UNIT_B)
+  END SUBROUTINE CACHE_B_FOR_CHECK
+
   ! Residu ||A*X-B||/||B|| -- CAS GENERAL, voir example_blr_mpi_pivot.f90/
-  ! COMPUTE_RESIDUAL pour le detail COMPLET du correctif (identique ici) :
-  ! BLAS (CGEMM par blocs de lignes via GET_BLOCK) + DISTRIBUTION MPI sur
-  ! TOUS les rangs (X diffuse via MPI_BCAST, normes partielles reduites
-  ! via MPI_ALLREDUCE) -- APPEL COLLECTIF desormais (voir le site d'appel).
+  ! COMPUTE_RESIDUAL pour le detail COMPLET du correctif de plafonnage
+  ! memoire (identique ici) : BLAS (CGEMM par blocs de lignes) +
+  ! DISTRIBUTION MPI sur TOUS les rangs (X diffuse via MPI_BCAST, normes
+  ! partielles reduites via MPI_ALLREDUCE) -- APPEL COLLECTIF (voir le
+  ! site d'appel).
   !
-  ! CORRIGE (2026-09-01, question explicite : "la memoire est-elle bien
-  ! limitee par MAX_MB_PER_PROCESS ici, comme le reste de l'algorithme ?")
-  ! -- REPONSE : NON, PAS avant ce correctif. Le tampon BLAS BLKROWS(NCHUNK,N)
-  ! utilisait NCHUNK=NB (taille de bloc BLR, sans rapport avec le budget
-  ! memoire utilisateur) -- a N=8000/NB=400 cela ne fait que ~25 Mo
-  ! (invisible sous le defaut de 64 Mo), mais a un N beaucoup plus grand
-  ! (le cas meme ou l'OOC est cense servir), NB*N*8 octets peut largement
-  ! DEPASSER MAX_MB_PER_PROCESS sans qu'aucun controle utilisateur n'existe
-  ! -- contradiction directe avec la promesse OOC. CORRIGE : NCHUNK est
-  ! desormais calcule pour que BLKROWS respecte MAX_MB_PER_PROCESS (borne
-  ! aussi par NB par le haut -- inutile de prendre des blocs plus larges
-  ! que la taille BLR native, sans benefice de performance).
+  ! A et B sont RELUES depuis le cache disque (acheck_rank_*.dat,
+  ! bcheck_rank_*.dat -- ecrit par CACHE_A_FOR_CHECK/CACHE_B_FOR_CHECK,
+  ! AVANT la factorisation) au lieu de rappeler GET_BLOCK/FILL_RHS/
+  ! B_ENTRY -- B etant deja coherente avec CHECK_ERROR (meme FILL_RHS),
+  ! XCOMBINED/NCOLS_MULT ne sont plus necessaires : la comparaison se fait
+  ! directement contre le B cache, que CHECK_ERROR soit actif ou non.
+  ! Des qu'un bloc de B a servi, X (deja disponible dans XG) l'ecrase EN
+  ! PLACE dans bcheck_rank_*.dat (POS=, meme forme) -- economie d'espace
+  ! disque, voir le commentaire de tete. acheck_rank_*.dat est supprime en
+  ! fin de fonction.
   !
-  ! LIMITE RESTANTE, HONNETE (non corrigee, prexistante, DOCUMENTEE) :
-  ! X_GLOBAL(N,NRHS) (et XCOMBINED si CHECK_ERROR=1, le double) restent
-  ! des tableaux COMPLETS non bornes par MAX_MB_PER_PROCESS -- MEME
+  ! LIMITE RESTANTE, HONNETE (prexistante, DOCUMENTEE) : X_GLOBAL(N,NRHS)
+  ! reste un tableau COMPLET non borne par MAX_MB_PER_PROCESS -- MEME
   ! limite deja assumee par le commentaire de tete de ce fichier pour
   ! l'affichage des 5 premieres valeurs de X ("un vrai cas massivement
   ! second membre ecrirait plutot chaque paquet directement sur disque").
@@ -402,13 +498,15 @@ CONTAINS
   ! distinction plutot que de le cacher.
   REAL(WP) FUNCTION COMPUTE_RESIDUAL(XG)
     COMPLEX(WP), INTENT(INOUT) :: XG(N,NRHS)
-    COMPLEX(WP), ALLOCATABLE :: BLKROWS(:,:), RESBLK(:,:), XCOMBINED(:,:)
+    COMPLEX(WP), ALLOCATABLE :: ABLOCK(:,:), AXBLOCK(:,:), BBLOCK(:,:)
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     INTEGER :: ROWS_PER_PROC, RSTART_MINE, REND_MINE, NROWS_MINE, NTOTAL_LOCAL
-    INTEGER :: RSTART_CHUNK, REND_CHUNK, NCHUNK, GI, R, NCOLS_MULT, IERR2, NDONE
-    INTEGER :: CHUNK_ROWS
+    INTEGER :: RSTART_CHUNK, REND_CHUNK, NCHUNK, GI, R, IERR2, NDONE
+    INTEGER :: CHUNK_ROWS, UNIT_A, UNIT_B
+    INTEGER :: HA_RSTART, HA_REND, HA_NCHUNK, HB_RSTART, HB_REND, HB_NCHUNK
+    INTEGER(8) :: PAYLOAD_POS
     REAL(WP) :: NUM2_LOCAL, DEN2_LOCAL, NUM2, DEN2
-    COMPLEX(WP) :: BVAL
+    CHARACTER(LEN=16) :: RSTR
 
     CALL MPI_BCAST(XG, N*NRHS, MPI_COMPLEX, 0, GRID%COMM, IERR2)
 
@@ -418,23 +516,16 @@ CONTAINS
     NROWS_MINE = MAX(REND_MINE - RSTART_MINE + 1, 0)
     NTOTAL_LOCAL = MAX(NROWS_MINE, 1)
 
-    ! Taille de bloc de lignes bornee par MAX_MB_PER_PROCESS : BLKROWS
-    ! (le tampon dominant, N colonnes) ne doit jamais depasser le budget
-    ! utilisateur. Bornee AUSSI par NB par le haut (pas de gain a prendre
-    ! des blocs plus larges que la taille BLR native).
+    ! Taille de bloc de lignes bornee par MAX_MB_PER_PROCESS -- MEME
+    ! decoupage que CACHE_A_FOR_CHECK/CACHE_B_FOR_CHECK (relecture calee
+    ! exactement dessus).
     CHUNK_ROWS = MAX(1, MIN(NB, INT(MAX_MB_PER_PROCESS*1024.0_WP*1024.0_WP / (8.0_WP*REAL(N,WP)))))
 
-    NCOLS_MULT = NRHS
-    IF (CHECK_ERROR_FLAG) THEN
-      NCOLS_MULT = 2*NRHS
-      ALLOCATE(XCOMBINED(N,NCOLS_MULT))
-      XCOMBINED(:,1:NRHS) = XG
-      DO R = 1, NRHS
-        DO GI = 1, N
-          XCOMBINED(GI,NRHS+R) = XEX_FORMULA(GI,R)
-        END DO
-      END DO
-    END IF
+    WRITE(RSTR,'(I6.6)') GRID%MYID
+    OPEN(NEWUNIT=UNIT_A, FILE=TRIM(SCRATCH_DIR)//'/acheck_rank_'//TRIM(RSTR)//'.dat', &
+         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='OLD', ACTION='READ')
+    OPEN(NEWUNIT=UNIT_B, FILE=TRIM(SCRATCH_DIR)//'/bcheck_rank_'//TRIM(RSTR)//'.dat', &
+         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='OLD', ACTION='READWRITE')
 
     NUM2_LOCAL = 0.0_WP; DEN2_LOCAL = 0.0_WP
     RSS_MAX_RESID_MB = REAL(GET_RSS_KB(),8)/1024.0D0
@@ -442,30 +533,35 @@ CONTAINS
     DO RSTART_CHUNK = RSTART_MINE, REND_MINE, CHUNK_ROWS
       REND_CHUNK = MIN(RSTART_CHUNK+CHUNK_ROWS-1, REND_MINE)
       NCHUNK = REND_CHUNK - RSTART_CHUNK + 1
-      ALLOCATE(BLKROWS(NCHUNK,N), RESBLK(NCHUNK,NCOLS_MULT))
-      CALL GET_BLOCK(RSTART_CHUNK, REND_CHUNK, 1, N, BLKROWS)
-      IF (CHECK_ERROR_FLAG) THEN
-        CALL CGEMM('N','N', NCHUNK, NCOLS_MULT, N, CONE, BLKROWS, NCHUNK, XCOMBINED, N, CZERO, RESBLK, NCHUNK)
-      ELSE
-        CALL CGEMM('N','N', NCHUNK, NCOLS_MULT, N, CONE, BLKROWS, NCHUNK, XG, N, CZERO, RESBLK, NCHUNK)
-      END IF
+
+      READ(UNIT_A) HA_RSTART, HA_REND, HA_NCHUNK
+      ALLOCATE(ABLOCK(NCHUNK,N))
+      READ(UNIT_A) ABLOCK(1:NCHUNK,1:N)
+
+      READ(UNIT_B) HB_RSTART, HB_REND, HB_NCHUNK
+      INQUIRE(UNIT=UNIT_B, POS=PAYLOAD_POS)
+      ALLOCATE(BBLOCK(NCHUNK,NRHS))
+      READ(UNIT_B) BBLOCK(1:NCHUNK,1:NRHS)
+
+      ALLOCATE(AXBLOCK(NCHUNK,NRHS))
+      CALL CGEMM('N','N', NCHUNK, NRHS, N, CONE, ABLOCK, NCHUNK, XG, N, CZERO, AXBLOCK, NCHUNK)
       DO R = 1, NRHS
         DO GI = 1, NCHUNK
-          IF (CHECK_ERROR_FLAG) THEN
-            BVAL = RESBLK(GI,NRHS+R)
-          ELSE
-            BVAL = B_ENTRY(RSTART_CHUNK+GI-1, R)
-          END IF
-          NUM2_LOCAL = NUM2_LOCAL + REAL(ABS(RESBLK(GI,R)-BVAL)**2,WP)
-          DEN2_LOCAL = DEN2_LOCAL + REAL(ABS(BVAL)**2,WP)
+          NUM2_LOCAL = NUM2_LOCAL + REAL(ABS(AXBLOCK(GI,R)-BBLOCK(GI,R))**2,WP)
+          DEN2_LOCAL = DEN2_LOCAL + REAL(ABS(BBLOCK(GI,R))**2,WP)
         END DO
       END DO
-      DEALLOCATE(BLKROWS, RESBLK)
+
+      ! B vient de servir : plus utile -- X ecrase sa place sur disque.
+      WRITE(UNIT_B, POS=PAYLOAD_POS) XG(RSTART_CHUNK:REND_CHUNK, 1:NRHS)
+
+      DEALLOCATE(ABLOCK, AXBLOCK, BBLOCK)
       NDONE = NDONE + NCHUNK
       RSS_MAX_RESID_MB = MAX(RSS_MAX_RESID_MB, REAL(GET_RSS_KB(),8)/1024.0D0)
       IF (GRID%MYID.EQ.0) CALL PRINT_PROGRESS_BAR('Calcul du residu ||A*X-B|| (verification)', NDONE, NTOTAL_LOCAL)
     END DO
-    IF (ALLOCATED(XCOMBINED)) DEALLOCATE(XCOMBINED)
+    CLOSE(UNIT_B)
+    CLOSE(UNIT_A, STATUS='DELETE')
 
     CALL MPI_ALLREDUCE(NUM2_LOCAL, NUM2, 1, MPI_REAL, MPI_SUM, GRID%COMM, IERR2)
     CALL MPI_ALLREDUCE(DEN2_LOCAL, DEN2, 1, MPI_REAL, MPI_SUM, GRID%COMM, IERR2)
