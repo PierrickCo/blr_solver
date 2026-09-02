@@ -2,11 +2,12 @@
 #
 # PREREQUIS : compiler d'abord le projet PRINCIPAL (`make` depuis
 # blr_solver/) -- ce Makefile reutilise directement les .o/.mod DEJA
-# construits la-bas (../blr_kinds_mod.o, ../mpi_grid_mod.o, etc.) plutot
-# que de les recompiler, pour ne jamais dupliquer le code source des
-# modules encore vivants. Meme compilateur/options que le projet
-# principal (doivent rester synchronises -- copies volontairement, pas
-# generees, pour que ce fichier reste lisible seul).
+# construits la-bas, DESORMAIS DANS lib/ (../lib/blr_kinds_mod.o,
+# ../lib/mpi_grid_mod.o, etc. -- voir le rangement bin/lib dans le
+# Makefile principal) plutot que de les recompiler, pour ne jamais
+# dupliquer le code source des modules encore vivants. Meme compilateur/
+# options que le projet principal (doivent rester synchronises -- copies
+# volontairement, pas generees, pour que ce fichier reste lisible seul).
 
 MKLROOT = /opt/intel/oneapi/mkl/2026.1
 IMPI_LIBDIR = /opt/intel/oneapi/mpi/2021.18/lib
@@ -15,7 +16,7 @@ FC    = ifx
 MPIFC = mpiifx
 OPTF  = -O2 -qopenmp -warn all -check bounds
 
-MAIN  = ..
+MAIN  = ../lib
 SRC   = src
 TEST  = test
 

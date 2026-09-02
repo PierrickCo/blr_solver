@@ -51,21 +51,21 @@ for th in "${THREADS_LIST[@]}"; do
   export OMP_NUM_THREADS=$th
   echo "=== OMP_NUM_THREADS=$th ==="
 
-  log=$(run_and_log "scaling_A_T${th}" ./bench_blr_pipeline "$N" "$NRHS" "$NB" "$TOL")
+  log=$(run_and_log "scaling_A_T${th}" ./bin/bench_blr_pipeline "$N" "$NRHS" "$NB" "$TOL")
   t_fac=$(grep_num "Temps factorisation =" "$log"); t_sol=$(grep_num "Temps resolution =" "$log")
   mem=$(grep_num "Memoire des facteurs L/U" "$log"); err=$(grep_num "Erreur relative ||Xcalc-Xexact" "$log")
   [ "$th" -eq 1 ] && BASE_A=$t_fac
   sp=$(awk -v b="${BASE_A:-$t_fac}" -v x="$t_fac" 'BEGIN{if(x>0) printf "%.2f", b/x; else print ""}')
   echo "A,$th,$N,$NRHS,$NB,$TOL,$t_fac,$t_sol,$mem,$err,$sp" >> "$CSV_OMP"
 
-  log=$(run_and_log "scaling_B_T${th}" ./bench_blr_pipeline "$N" "$NRHS" "$NB" 0)
+  log=$(run_and_log "scaling_B_T${th}" ./bin/bench_blr_pipeline "$N" "$NRHS" "$NB" 0)
   t_fac=$(grep_num "Temps factorisation =" "$log"); t_sol=$(grep_num "Temps resolution =" "$log")
   mem=$(grep_num "Memoire des facteurs L/U" "$log"); err=$(grep_num "Erreur relative ||Xcalc-Xexact" "$log")
   [ "$th" -eq 1 ] && BASE_B=$t_fac
   sp=$(awk -v b="${BASE_B:-$t_fac}" -v x="$t_fac" 'BEGIN{if(x>0) printf "%.2f", b/x; else print ""}')
   echo "B,$th,$N,$NRHS,$NB,0,$t_fac,$t_sol,$mem,$err,$sp" >> "$CSV_OMP"
 
-  log=$(run_and_log "scaling_C_T${th}" ./bench_seq "$N" "$NRHS" "$N" "$TOL")
+  log=$(run_and_log "scaling_C_T${th}" ./bin/bench_seq "$N" "$NRHS" "$N" "$TOL")
   t_fac=$(grep_num_after "Direct dense, sans decoupage" "Temps factorisation (hors compression)" "$log")
   t_sol=$(grep_num_after "Direct dense, sans decoupage" "Temps resolution" "$log")
   mem=$(grep_num_after "Direct dense, sans decoupage" "Memoire analytique" "$log")
@@ -93,7 +93,7 @@ for grid in $GRID_LIST; do
   OMP_NUM_THREADS=$(omp_for_nprocs "$NPROCS")
   echo "=== grille ${PR}x${PC} ($NPROCS proc, OMP_NUM_THREADS=$OMP_NUM_THREADS) ==="
 
-  log=$(run_and_log "scaling_MPI_${PR}x${PC}" mpirun -np "$NPROCS" ./bench_mpi "$PR" "$PC" "$N" "$NRHS" "$NB" "$TOL")
+  log=$(run_and_log "scaling_MPI_${PR}x${PC}" mpirun -np "$NPROCS" ./bin/bench_mpi "$PR" "$PC" "$N" "$NRHS" "$NB" "$TOL")
   t_fac=$(grep_num "Temps factorisation (hors compression, distribuee)" "$log")
   t_sol=$(grep_num "Temps resolution (2D)" "$log")
   mem=$(grep_num "Memoire PAR PROCESSUS pendant factor." "$log")
@@ -102,7 +102,7 @@ for grid in $GRID_LIST; do
   sp=$(awk -v b="${BASEMPI_A:-$t_fac}" -v x="$t_fac" 'BEGIN{if(x>0) printf "%.2f", b/x; else print ""}')
   echo "MPI,${PR}x${PC},$NPROCS,$N,$NRHS,$NB,$TOL,$t_fac,$t_sol,$mem,$err,$sp" >> "$CSV_MPI"
 
-  log=$(run_and_log "scaling_BLRMPI_${PR}x${PC}" mpirun -np "$NPROCS" ./test_mpi_blr_matrix "$PR" "$PC" "$N" "$NB" "$NRHS" "$TOL")
+  log=$(run_and_log "scaling_BLRMPI_${PR}x${PC}" mpirun -np "$NPROCS" ./bin/test_mpi_blr_matrix "$PR" "$PC" "$N" "$NB" "$NRHS" "$TOL")
   read -r _ t_fac t_sol <<< "$(floats_on_line "Temps assemblage" "$log" | tr '\n' ' ')"
   mem=$(floats_on_line "Memoire ANALYTIQUE" "$log" | head -1)
   err=$(grep_num "Erreur relative ||X_distribue" "$log")

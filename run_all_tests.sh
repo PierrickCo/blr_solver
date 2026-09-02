@@ -11,7 +11,7 @@
 #
 # Usage : ./run_all_tests.sh [intel|gcc]   (depuis blr_solver/, apres avoir
 #         source l'environnement -- voir INSTALL.md)
-#   intel (defaut) : Makefile (ifx+MKL+Intel MPI), binaires a la racine.
+#   intel (defaut) : Makefile (ifx+MKL+Intel MPI), binaires dans bin/.
 #   gcc            : Makefile.gcc (gfortran+BLAS/LAPACK+OpenMPI), binaires
 #                     dans build-gcc/ -- chemin utilise par la CI (voir
 #                     .github/workflows/ci.yml), aucune licence Intel requise.
@@ -25,7 +25,7 @@ if [ "$TOOLCHAIN" = "gcc" ]; then
   BINDIR="build-gcc"
 else
   MAKEFILE="Makefile"
-  BINDIR="."
+  BINDIR="bin"
 fi
 
 echo "=== Compilation (chaine: $TOOLCHAIN) ==="

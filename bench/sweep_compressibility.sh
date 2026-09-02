@@ -36,10 +36,10 @@ NPROCS=$((PR*PC))
 export OMP_NUM_THREADS
 OMP_NUM_THREADS=$(omp_for_nprocs "$NPROCS")
 
-BIN="./bench_blr_mpi_pivot_compressibility"
+BIN="./bin/bench_blr_mpi_pivot_compressibility"
 if [ ! -x "$BIN" ]; then
-  echo "$BIN absent -- compilation (make bench_blr_mpi_pivot_compressibility)..."
-  make -f Makefile bench_blr_mpi_pivot_compressibility
+  echo "$BIN absent -- compilation (make bin/bench_blr_mpi_pivot_compressibility)..."
+  make -f Makefile bin/bench_blr_mpi_pivot_compressibility
 fi
 
 CSV="bench/results_compressibility.csv"

@@ -1,49 +1,21 @@
-# Artefacts de compilation (Intel oneAPI, gcc, ifort 2019)
-*.o
-*.mod
+# Artefacts de compilation (Intel oneAPI, gcc, ifort 2019) -- rangement
+# bin/ (executables, tests/benchmarks a la racine ET exemples) + lib/
+# (.o/.mod partages), voir le Makefile principal. Les .o propres a chaque
+# exemple restent dans examples/ (ligne dediee plus bas).
+bin/
+lib/
 build-gcc/
 build-ifort2019/
-
-# Binaires de la ligne vivante
-test_block_lu
-test_blr_compress
-test_mpi_grid
-test_mpi_lu_pivot
-test_openmp_dense
-bench_seq
-bench_mpi
-test_mpi_lu_solve_2d
-test_mpi_blr_matrix
-test_mpi_blr_matrix_pivot
-test_mpi_blr_matrix_pivot_arena
-test_mpi_blr_matrix_pivot_ooc
-bench_blr_pipeline
-bench_blr_mpi_pivot_compressibility
-bench_blr_mpi_pivot_ratio
-bench_blr_mpi_pivot_arena
-bench_blr_mpi_pivot_ooc_compare
-bench_blr_mpi_pivot_ooc_geometric
-bench_blr_mpi_pivot_ooc_massive_rhs
-bench_rsvd_compress
-test_blr_matrix_progress
-test_blr_workspace
-
-# Binaires des exemples canoniques
-example_blr_sequentiel
-example_dense_sequentiel
-example_mpi_dense
-example_blr_mpi_sans_pivot
-example_blr_mpi_pivot
-example_blr_mpi_pivot_arena
-example_blr_mpi_pivot_fixedcap
-example_blr_mpi_pivot_ooc
-example_user_matrix
-example_user_matrix_ooc
 examples/*.o
 
 # Binaire du micro-benchmark de diagnostic (pas dans le Makefile,
 # compile manuellement -- voir test/bench_arena_hypothesis.f90)
 bench_arena_hypothesis
+
+# legacy/ n'a pas son propre repertoire bin/lib (mis de cote, jamais
+# reorganise) -- ses .o/.mod restent a plat dans legacy/.
+legacy/*.o
+legacy/*.mod
 
 # Binaires legacy/
 legacy/test_ldlt

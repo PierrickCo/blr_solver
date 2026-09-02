@@ -26,20 +26,20 @@ make examples             # chaine Intel (ifx+MKL+Intel MPI)
 make -f Makefile.gcc examples   # chaine gcc+BLAS/LAPACK+OpenMPI
 ```
 
-Chaque exemple se construit comme binaire a la racine de `blr_solver/`
+Chaque exemple se construit comme binaire dans `blr_solver/bin/`
 (ou `build-gcc/` pour la chaine gcc), en reutilisant directement les
-`.o`/`.mod` deja compiles par `make`/`make -f Makefile.gcc` -- compiler
-le projet principal d'abord.
+`.o`/`.mod` deja compiles par `make`/`make -f Makefile.gcc` dans
+`blr_solver/lib/` -- compiler le projet principal d'abord.
 
 ## Lancer
 
 ```bash
-./example_blr_sequentiel [N] [NB] [NRHS] [TOL]
-./example_dense_sequentiel [N] [NB]
-mpirun -np 4 ./example_mpi_dense 2 2 [N] [NB] [NRHS]
-mpirun -np 4 ./example_blr_mpi_sans_pivot 2 2 [N] [NB] [NRHS] [TOL]
-mpirun -np 4 ./example_blr_mpi_pivot 2 2 [N] [NB] [NRHS] [TOL]
-mpirun -np 4 ./example_blr_mpi_pivot_ooc 2 2 [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR]
+./bin/example_blr_sequentiel [N] [NB] [NRHS] [TOL]
+./bin/example_dense_sequentiel [N] [NB]
+mpirun -np 4 ./bin/example_mpi_dense 2 2 [N] [NB] [NRHS]
+mpirun -np 4 ./bin/example_blr_mpi_sans_pivot 2 2 [N] [NB] [NRHS] [TOL]
+mpirun -np 4 ./bin/example_blr_mpi_pivot 2 2 [N] [NB] [NRHS] [TOL]
+mpirun -np 4 ./bin/example_blr_mpi_pivot_ooc 2 2 [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR]
 ```
 
 Chaque exemple assemble une matrice de demonstration (formule analytique,

@@ -101,9 +101,10 @@ make
 ```
 
 Ceci construit les binaires de la ligne vivante (5 solveurs de référence +
-BLR+MPI). Le code mis de côté (`legacy/`) se construit séparément, **après**
-le projet principal (il réutilise directement les `.o`/`.mod` déjà
-construits ici plutôt que de les dupliquer) :
+BLR+MPI) dans `bin/`, à partir des `.o`/`.mod` compilés dans `lib/` (voir
+le Makefile). Le code mis de côté (`legacy/`) se construit séparément,
+**après** le projet principal (il réutilise directement les `.o`/`.mod`
+déjà construits dans `lib/` plutôt que de les dupliquer) :
 
 ```bash
 cd legacy
@@ -131,7 +132,7 @@ binaire/syntaxe individuellement). Logs détaillés dans
 Pour un test unitaire manuel, un cas minuscule, séquentiel, sans MPI :
 
 ```bash
-./test_block_lu 200 32
+./bin/test_block_lu 200 32
 ```
 
 Doit se terminer par `=== TEST OK ===` (ou équivalent) avec une erreur
@@ -140,7 +141,7 @@ relative de l'ordre de `1e-7`.
 Un cas MPI minimal (nécessite `mpirun` fonctionnel) :
 
 ```bash
-mpirun -np 4 ./test_mpi_blr_matrix 2 2 500 50 20 1e-4
+mpirun -np 4 ./bin/test_mpi_blr_matrix 2 2 500 50 20 1e-4
 ```
 
 Doit afficher un diagnostic d'affinité CPU (voir [`CLUSTER.md`](CLUSTER.md))
@@ -148,19 +149,22 @@ puis `=== TEST MPI_BLR_MATRIX : OK ===`.
 
 ## Référence des binaires et de leur syntaxe
 
+Les binaires vivent dans `bin/` (`build-gcc/` pour la chaîne gcc, qui ne
+sépare pas bin/lib) -- préfixer chaque commande ci-dessous par `bin/`.
+
 | Binaire | Usage | Référence |
 |---|---|---|
-| `test_block_lu` | `./test_block_lu N NB` | A (unitaire) |
-| `bench_blr_pipeline` | `./bench_blr_pipeline [N] [NRHS] [NB] [TOL]` (défauts 10000 100 100 1e-4 ; `TOL=0` pour B) | A / B |
-| `bench_seq` | `./bench_seq [N] [NRHS] [NB] [TOL]` (`NB=N` pour la référence C standard) | C |
-| `test_mpi_lu_pivot` | `mpirun -np <PR*PC> ./test_mpi_lu_pivot PR PC N NB` | MPI (unitaire) |
-| `bench_mpi` | `mpirun -np <PR*PC> ./bench_mpi PR PC [N] [NRHS] [NB] [TOL]` | MPI |
-| `test_mpi_blr_matrix` | `mpirun -np <PR*PC> ./test_mpi_blr_matrix PR PC N NB NRHS TOL` | BLR+MPI, sans pivot |
-| `test_mpi_blr_matrix_pivot` | `mpirun -np <PR*PC> ./test_mpi_blr_matrix_pivot PR PC N NB NRHS TOL` | BLR+MPI, avec pivot confiné |
-| `test_mpi_grid` | `mpirun -np <PR*PC> ./test_mpi_grid PR PC N NB` | infrastructure de grille |
-| `test_mpi_lu_solve_2d` | `mpirun -np <PR*PC> ./test_mpi_lu_solve_2d PR PC N NB NRHS` | résolution 2D distribuée |
-| `test_openmp_dense` | `./test_openmp_dense N NB` | mesure le threading MKL interne (référence C) |
-| `test_blr_compress` | `./test_blr_compress` (sans argument) | bibliothèque d'algèbre par blocs |
+| `test_block_lu` | `bin/test_block_lu N NB` | A (unitaire) |
+| `bench_blr_pipeline` | `bin/bench_blr_pipeline [N] [NRHS] [NB] [TOL]` (défauts 10000 100 100 1e-4 ; `TOL=0` pour B) | A / B |
+| `bench_seq` | `bin/bench_seq [N] [NRHS] [NB] [TOL]` (`NB=N` pour la référence C standard) | C |
+| `test_mpi_lu_pivot` | `mpirun -np <PR*PC> bin/test_mpi_lu_pivot PR PC N NB` | MPI (unitaire) |
+| `bench_mpi` | `mpirun -np <PR*PC> bin/bench_mpi PR PC [N] [NRHS] [NB] [TOL]` | MPI |
+| `test_mpi_blr_matrix` | `mpirun -np <PR*PC> bin/test_mpi_blr_matrix PR PC N NB NRHS TOL` | BLR+MPI, sans pivot |
+| `test_mpi_blr_matrix_pivot` | `mpirun -np <PR*PC> bin/test_mpi_blr_matrix_pivot PR PC N NB NRHS TOL` | BLR+MPI, avec pivot confiné |
+| `test_mpi_grid` | `mpirun -np <PR*PC> bin/test_mpi_grid PR PC N NB` | infrastructure de grille |
+| `test_mpi_lu_solve_2d` | `mpirun -np <PR*PC> bin/test_mpi_lu_solve_2d PR PC N NB NRHS` | résolution 2D distribuée |
+| `test_openmp_dense` | `bin/test_openmp_dense N NB` | mesure le threading MKL interne (référence C) |
+| `test_blr_compress` | `bin/test_blr_compress` (sans argument) | bibliothèque d'algèbre par blocs |
 
 `PR`/`PC` : dimensions de la grille de processus MPI (`PR*PC` doit égaler le
 nombre de processus lancés par `mpirun -np`). `N` : taille de la matrice.

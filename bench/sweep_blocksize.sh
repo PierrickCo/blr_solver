@@ -52,7 +52,7 @@ for NB in "${NB_LIST[@]}"; do
   echo "=== NB=$NB ==="
 
   # --- A : OpenMP, compresse (TOL>0) ---
-  log=$(run_and_log "blocksize_A_NB${NB}" ./bench_blr_pipeline "$N" "$NRHS" "$NB" "$TOL")
+  log=$(run_and_log "blocksize_A_NB${NB}" ./bin/bench_blr_pipeline "$N" "$NRHS" "$NB" "$TOL")
   t_asm=$(grep_num "Temps assemblage+compression" "$log")
   t_fac=$(grep_num "Temps factorisation =" "$log")
   t_sol=$(grep_num "Temps resolution =" "$log")
@@ -61,7 +61,7 @@ for NB in "${NB_LIST[@]}"; do
   echo "A,$N,$NB,$NRHS,$TOL,$t_asm,$t_fac,$t_sol,$mem,$err" >> "$CSV"
 
   # --- B : OpenMP, plein bloc (TOL=0) ---
-  log=$(run_and_log "blocksize_B_NB${NB}" ./bench_blr_pipeline "$N" "$NRHS" "$NB" 0)
+  log=$(run_and_log "blocksize_B_NB${NB}" ./bin/bench_blr_pipeline "$N" "$NRHS" "$NB" 0)
   t_asm=$(grep_num "Temps assemblage+compression" "$log")
   t_fac=$(grep_num "Temps factorisation =" "$log")
   t_sol=$(grep_num "Temps resolution =" "$log")
@@ -70,7 +70,7 @@ for NB in "${NB_LIST[@]}"; do
   echo "B,$N,$NB,$NRHS,0,$t_asm,$t_fac,$t_sol,$mem,$err" >> "$CSV"
 
   # --- MPI dense+2D (cas 1 de bench_mpi) ---
-  log=$(run_and_log "blocksize_MPI_NB${NB}" mpirun -np "$NPROCS" ./bench_mpi "$PR" "$PC" "$N" "$NRHS" "$NB" "$TOL")
+  log=$(run_and_log "blocksize_MPI_NB${NB}" mpirun -np "$NPROCS" ./bin/bench_mpi "$PR" "$PC" "$N" "$NRHS" "$NB" "$TOL")
   t_asm=$(grep_num "Temps assemblage (max/processus)" "$log")
   t_fac=$(grep_num "Temps factorisation (hors compression, distribuee)" "$log")
   t_sol=$(grep_num "Temps resolution (2D)" "$log")
@@ -79,7 +79,7 @@ for NB in "${NB_LIST[@]}"; do
   echo "MPI,$N,$NB,$NRHS,$TOL,$t_asm,$t_fac,$t_sol,$mem,$err" >> "$CSV"
 
   # --- BLR+MPI sans pivot (test_mpi_blr_matrix) ---
-  log=$(run_and_log "blocksize_BLRMPI_NB${NB}" mpirun -np "$NPROCS" ./test_mpi_blr_matrix "$PR" "$PC" "$N" "$NB" "$NRHS" "$TOL")
+  log=$(run_and_log "blocksize_BLRMPI_NB${NB}" mpirun -np "$NPROCS" ./bin/test_mpi_blr_matrix "$PR" "$PC" "$N" "$NB" "$NRHS" "$TOL")
   read -r t_asm t_fac t_sol <<< "$(floats_on_line "Temps assemblage" "$log" | tr '\n' ' ')"
   mem=$(floats_on_line "Memoire ANALYTIQUE" "$log" | head -1)
   err=$(grep_num "Erreur relative ||X_distribue" "$log")

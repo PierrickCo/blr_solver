@@ -56,7 +56,7 @@ de processus MPI colocalisés sur le nœud.
 source /opt/intel/oneapi/setvars.sh
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-srun --cpu-bind=cores ./test_mpi_blr_matrix 2 2 20000 500 100 1e-4
+srun --cpu-bind=cores ./bin/test_mpi_blr_matrix 2 2 20000 500 100 1e-4
 ```
 
 `--cpu-bind=cores` (ou l'option équivalente du lanceur utilisé) est un

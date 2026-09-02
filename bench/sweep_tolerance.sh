@@ -40,7 +40,7 @@ for TOL in "${TOL_LIST[@]}"; do
   echo "=== TOL=$TOL ==="
 
   # --- A : OpenMP compresse ---
-  log=$(run_and_log "tolerance_A_TOL${TOL}" ./bench_blr_pipeline "$N" "$NRHS" "$NB" "$TOL")
+  log=$(run_and_log "tolerance_A_TOL${TOL}" ./bin/bench_blr_pipeline "$N" "$NRHS" "$NB" "$TOL")
   comp_pct=$(floats_on_line "Blocs compresses" "$log" | tail -1)
   avg_rank=$(grep_num "Rang moyen =" "$log")
   t_asm=$(grep_num "Temps assemblage+compression" "$log")
@@ -51,7 +51,7 @@ for TOL in "${TOL_LIST[@]}"; do
   echo "A,$N,$NB,$NRHS,$TOL,$comp_pct,$avg_rank,$t_asm,$t_fac,$t_sol,$mem,$err" >> "$CSV"
 
   # --- BLR+MPI sans pivot ---
-  log=$(run_and_log "tolerance_BLRMPI_TOL${TOL}" mpirun -np "$NPROCS" ./test_mpi_blr_matrix "$PR" "$PC" "$N" "$NB" "$NRHS" "$TOL")
+  log=$(run_and_log "tolerance_BLRMPI_TOL${TOL}" mpirun -np "$NPROCS" ./bin/test_mpi_blr_matrix "$PR" "$PC" "$N" "$NB" "$NRHS" "$TOL")
   comp_pct=$(floats_on_line "Compression :" "$log" | tail -1)
   avg_rank=$(grep_num "Rang moyen =" "$log")
   read -r t_asm t_fac t_sol <<< "$(floats_on_line "Temps assemblage" "$log" | tr '\n' ' ')"
