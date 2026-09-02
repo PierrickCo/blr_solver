@@ -24,13 +24,40 @@
 ! plantage), sans gain -- ajustez RATIO/TOL en consequence si besoin, voir
 ! example_blr_mpi_pivot.f90 pour ces parametres avances.
 !
-! VERIFICATION SANS SOLUTION CONNUE : le residu ||A*X-B||/||B|| ci-dessous
-! ne suppose RIEN sur B -- fonctionne avec votre b reel, contrairement a
-! une comparaison a une solution exacte (qui n'existe pas pour un vrai
-! probleme).
+! VERIFICATION SANS SOLUTION CONNUE (CHECK_RESIDUAL) : le residu
+! ||A*X-B||/||B|| ne suppose RIEN sur B -- fonctionne avec votre b reel,
+! contrairement a une comparaison a une solution exacte (qui n'existe pas
+! pour un vrai probleme). Desactive par defaut (cout CALCUL O(N^2*NRHS)
+! reel, meme optimise BLAS+MPI -- voir COMPUTE_RESIDUAL) : activez-le pour
+! verifier, desactivez-le une fois confiant pour ne pas payer ce cout a
+! chaque run.
 !
-! Usage : mpirun -np <PR*PC> ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL]
-!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4)
+! RATIO (COMPRESS_WORTHWHILE_RATIO) et USE_RSVD (SVD complete vs
+! randomisee adaptative) : memes parametres, memes valeurs par defaut, que
+! example_blr_mpi_pivot.f90 -- voir son commentaire de tete pour le detail.
+!
+! VERIFIER QUE VOS BLOCS SE COMPRESSENT VRAIMENT : GET_BLOCK renvoie
+! toujours un bloc DENSE (c'est la seule chose qu'elle sait faire) -- c'est
+! COMPRESS_BLOCK, appelee automatiquement par l'assemblage, qui decide
+! ENSUITE de le stocker compresse (SVD tronquee) ou de le garder dense
+! (bloc juge "pas assez compressible", voir RATIO ci-dessus). Deux
+! indicateurs affiches ci-dessous permettent de VERIFIER ce qui s'est
+! reellement passe sur VOS blocs :
+!   - "Blocs compresses" : COMBIEN de blocs ont ete stockes compresses
+!     (IS_LOWRANK=.TRUE.) sur le total hors-diagonale -- une simple
+!     proportion, qui peut rester a 100% meme si chaque bloc n'economise
+!     presque rien (un rang proche du plafond RATIO*NB compresse encore
+!     "techniquement" mais n'apporte quasi aucun gain memoire).
+!   - "Taux de compression REEL" : la taille de stockage EFFECTIVE
+!     (bas-rang + dense restant) rapportee a la taille dense equivalente,
+!     basee sur le RANG MOYEN reellement trouve -- LA mesure qui repond
+!     vraiment a "mes blocs entres en dense sont-ils bien compresses
+!     ensuite, et de combien ?". Proche de 100% = quasi aucun gain reel
+!     (meme si "Blocs compresses" affiche 100%) ; proche de 0% = tres
+!     bonne compression.
+!
+! Usage : mpirun -np <PR*PC> ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] [RATIO] [USE_RSVD] [CHECK_RESIDUAL]
+!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0)
 !===============================================================================
 PROGRAM EXAMPLE_USER_MATRIX
   USE MPI_BLR_MATRIX_MOD
@@ -40,7 +67,7 @@ PROGRAM EXAMPLE_USER_MATRIX
 
   TYPE(GRID_T) :: GRID
   INTEGER :: PR, PC, N, NB, NRHS, IERR, MYID0
-  REAL(WP) :: TOL
+  REAL(WP) :: TOL, RATIO
   CHARACTER(LEN=32) :: ARG
   TYPE(MPI_BLR_MATRIX_T) :: A_BLR
   COMPLEX(WP), ALLOCATABLE :: B_LOCAL(:,:), B_ORIG_LOCAL(:,:), X_GLOBAL(:,:)
@@ -49,8 +76,11 @@ PROGRAM EXAMPLE_USER_MATRIX
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR, T_SOLVE, T0, T1
   REAL(WP) :: RESID
+  INTEGER :: USE_RSVD_INT, CHECK_RESIDUAL_INT
+  LOGICAL :: USE_RSVD_FLAG, CHECK_RESIDUAL_FLAG
 
   N = 4000; NB = 200; NRHS = 1; TOL = 1.0E-4_WP
+  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_RESIDUAL_INT = 0
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
@@ -74,6 +104,21 @@ PROGRAM EXAMPLE_USER_MATRIX
   IF (COMMAND_ARGUMENT_COUNT() .GE. 6) THEN
     CALL GET_COMMAND_ARGUMENT(6, ARG); READ(ARG,*) TOL
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 7) THEN
+    CALL GET_COMMAND_ARGUMENT(7, ARG); READ(ARG,*) RATIO
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 8) THEN
+    CALL GET_COMMAND_ARGUMENT(8, ARG); READ(ARG,*) USE_RSVD_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 9) THEN
+    CALL GET_COMMAND_ARGUMENT(9, ARG); READ(ARG,*) CHECK_RESIDUAL_INT
+  END IF
+  USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
+  CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
+
+  ! Voir example_blr_mpi_pivot.f90/SET_COMPRESS_WORTHWHILE_RATIO pour le
+  ! detail -- AVANT tout assemblage/factorisation.
+  CALL SET_COMPRESS_WORTHWHILE_RATIO(RATIO)
 
   CALL GRID_INIT(GRID, MPI_COMM_WORLD, PR, PC, IERR)
   IF (IERR .NE. 0) THEN
@@ -81,16 +126,25 @@ PROGRAM EXAMPLE_USER_MATRIX
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
-  IF (MYID0.EQ.0) WRITE(6,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2)') &
-       ' Grille ', PR, 'x', PC, ' , N=', N, ' , NB=', NB, ' , NRHS=', NRHS, ' , TOL=', TOL
+  IF (MYID0.EQ.0) THEN
+    WRITE(6,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2,A,F6.3)') &
+         ' Grille ', PR, 'x', PC, ' , N=', N, ' , NB=', NB, ' , NRHS=', NRHS, ' , TOL=', TOL, ' , RATIO=', RATIO
+    IF (USE_RSVD_FLAG) THEN
+      WRITE(6,'(A)') ' Compression : SVD randomisee adaptative (COMPRESS_BLOCK_RSVD_ADAPTIVE)'
+    ELSE
+      WRITE(6,'(A)') ' Compression : SVD complete (COMPRESS_BLOCK, CGESVD)'
+    END IF
+  END IF
 
   ! --- 1) assemblage BLR distribue -----------------------------------------
   CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, T_ASM, &
-                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE.)
+                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., USE_RSVD=USE_RSVD_FLAG)
   IF (MYID0.EQ.0) THEN
     WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
          ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+    WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (bas-rang / dense equivalent) : ', &
+         REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
   END IF
 
   ! --- 2) factorisation LU, pivot confine au bloc diagonal -----------------
@@ -102,7 +156,13 @@ PROGRAM EXAMPLE_USER_MATRIX
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
-  IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Factorisation LU : ', T_FACTOR, ' s'
+  IF (MYID0.EQ.0) THEN
+    WRITE(6,'(A,F8.3,A)') ' Factorisation LU : ', T_FACTOR, ' s'
+    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (fin factorisation) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+         ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+    WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (fin factorisation) : ', &
+         REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
+  END IF
 
   ! --- 3) second membre local, distribue comme A ---------------------------
   MLOC = 0
@@ -135,13 +195,32 @@ PROGRAM EXAMPLE_USER_MATRIX
   END IF
 
   ! --- 5) verification ||A*X-B||/||B|| -- APPEL COLLECTIF (tous les rangs) -
-  RESID = COMPUTE_RESIDUAL(X_GLOBAL, B_ORIG_LOCAL, GRID, N, NB, NRHS, NRHS_LOC, MLOC)
-  IF (MYID0.EQ.0) WRITE(6,'(A,ES12.4)') ' Residu relatif ||A*X-B|| / ||B|| = ', RESID
+  ! Optionnelle (CHECK_RESIDUAL=0 par defaut) : cout CALCUL reel meme
+  ! optimise, voir le commentaire de tete.
+  IF (CHECK_RESIDUAL_FLAG) THEN
+    RESID = COMPUTE_RESIDUAL(X_GLOBAL, B_ORIG_LOCAL, GRID, N, NB, NRHS, NRHS_LOC, MLOC)
+    IF (MYID0.EQ.0) WRITE(6,'(A,ES12.4)') ' Residu relatif ||A*X-B|| / ||B|| = ', RESID
+  END IF
 
   DEALLOCATE(B_LOCAL, B_ORIG_LOCAL, X_GLOBAL)
   CALL MPI_FINALIZE(IERR)
 
 CONTAINS
+
+  ! Taux de compression REEL (stockage bas-rang effectif / stockage dense
+  ! equivalent) -- PAS un simple pourcentage de blocs "compresses" (voir
+  ! le commentaire de tete) : RANK_SUM mele le rang REEL des blocs
+  ! compresses et un "rang virtuel"=NB pour chaque bloc en repli DENSE,
+  ! d'ou le retrait de la contribution des blocs denses avant de calculer
+  ! le ratio (meme correctif que example_blr_mpi_pivot.f90).
+  REAL(WP) FUNCTION REAL_COMPRESSION_PCT(NCOMP, NOFF, RSUM)
+    INTEGER, INTENT(IN)     :: NCOMP, NOFF
+    INTEGER(8), INTENT(IN)  :: RSUM
+    INTEGER :: NDENSE
+    NDENSE = NOFF - NCOMP
+    REAL_COMPRESSION_PCT = 100.0_WP * (2.0_WP*REAL(NB,WP)*REAL(RSUM,WP) - REAL(NB,WP)**2*REAL(NDENSE,WP)) &
+         / (REAL(NB,WP)**2 * REAL(MAX(NOFF,1),WP))
+  END FUNCTION REAL_COMPRESSION_PCT
 
   !===========================================================================
   ! REMPLACEZ CETTE FONCTION par votre propre matrice A.
