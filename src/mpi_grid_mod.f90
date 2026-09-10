@@ -1,28 +1,23 @@
 !===============================================================================
-! ETAPE 6a : infrastructure de distribution BLOC-CYCLIQUE 2D (a la
-! ScaLAPACK/BLACS), premiere brique du chemin MPI -- AUCUNE factorisation
-! ici, uniquement : grille de processus, formules de correspondance
-! d'indices local<->global, et une routine de rassemblement (GATHER) pour
-! VALIDER que la distribution est correcte avant de construire quoi que ce
-! soit dessus.
+! Infrastructure de distribution bloc-cyclique 2D (a la ScaLAPACK/BLACS),
+! base commune du chemin MPI du solveur -- aucune factorisation ici,
+! uniquement : grille de processus, formules de correspondance d'indices
+! local<->global, et une routine de rassemblement (GATHER) pour valider la
+! distribution avant de construire quoi que ce soit dessus.
 !
-! POURQUOI 2D BLOC-CYCLIQUE (rappel du choix fait avec l'utilisateur avant
-! de commencer) : c'est ce que fait ScaLAPACK (PxGETRF) et ce qu'on a vu
-! fonctionner chez STRUMPACK (BLACSGrid/DistributedMatrix) lors de
-! l'exploration precedente -- meilleur equilibrage de charge et volume de
-! communication qu'une distribution 1D par blocs de lignes, au prix d'une
-! complexite bien plus grande (voir la suite des etapes 6b-6e).
+! POURQUOI 2D BLOC-CYCLIQUE : c'est le schema utilise par ScaLAPACK
+! (PxGETRF), avec un meilleur equilibrage de charge et un volume de
+! communication moindre qu'une distribution 1D par blocs de lignes, au
+! prix d'une complexite plus grande dans les modules qui s'appuient dessus.
 !
 ! GRILLE DE PROCESSUS : PR x PC processus (PR lignes, PC colonnes de la
-! grille -- PR*PC = nombre total de processus MPI). Convention CHOISIE ICI
-! (pas de norme absolue, mais doit rester coherente partout dans ce
-! projet) : numerotation "ligne-major" -- rang MPI = MYROW*PC + MYCOL,
-! MYROW = rang/PC, MYCOL = MOD(rang,PC).
+! grille -- PR*PC = nombre total de processus MPI). Convention retenue
+! partout dans ce solveur : numerotation "ligne-major" -- rang MPI =
+! MYROW*PC + MYCOL, MYROW = rang/PC, MYCOL = MOD(rang,PC).
 !
-! DEUX SOUS-COMMUNICATEURS PAR PROCESSUS (essentiels pour la suite -- la
-! diffusion du panneau L se fait "le long d'une ligne de la grille", celle
-! du panneau U "le long d'une colonne de la grille", cf. commentaire dans
-! le futur module de factorisation) :
+! DEUX SOUS-COMMUNICATEURS PAR PROCESSUS (utilises par les modules de
+! factorisation : la diffusion du panneau L se fait le long d'une ligne de
+! la grille, celle du panneau U le long d'une colonne) :
 !   ROW_COMM : tous les processus qui partagent le MEME MYROW (varie MYCOL)
 !   COL_COMM : tous les processus qui partagent le MEME MYCOL (varie MYROW)
 !
@@ -30,10 +25,9 @@
 ! colonnes) : le bloc global d'indice IBLK (0-based) est possede par le
 ! processus IBLK mod NPROCS (NPROCS = PR pour les lignes, PC pour les
 ! colonnes) -- "cyclique" car apres avoir distribue une premiere serie de
-! blocs a tous les processus, on recommence au premier. Les fonctions
-! NUMROC/INDXL2G/INDXG2L/INDXG2P ci-dessous sont les formules STANDARD de
-! ScaLAPACK pour ce decoupage (verifiees a la main sur un exemple avant
-! implementation -- voir la memoire du projet pour le detail).
+! blocs a tous les processus, la distribution recommence au premier. Les
+! fonctions NUMROC/INDXL2G/INDXG2L/INDXG2P ci-dessous sont les formules
+! standard de ScaLAPACK pour ce decoupage.
 !===============================================================================
 MODULE MPI_GRID_MOD
   USE BLR_KINDS_MOD, ONLY: WP
@@ -81,46 +75,44 @@ CONTAINS
   END SUBROUTINE GRID_INIT
 
   !-----------------------------------------------------------------------
-  ! Diagnostic OMP_NUM_THREADS / affinite CPU -- A APPELER UNE FOIS, juste
-  ! apres MPI_INIT, par tout programme MPI+OpenMP de ce projet destine a
-  ! tourner sur un cluster reel (pas necessaire pour les petits tests de
-  ! correction). But : rendre visible IMMEDIATEMENT, au lancement, la
-  ! configuration reelle (processus MPI par noeud x threads OpenMP par
-  ! processus vs coeurs vus), plutot que de la decouvrir indirectement via
-  ! une perf degradee des heures plus tard.
+  ! Diagnostic OMP_NUM_THREADS / affinite CPU -- a appeler une fois, juste
+  ! apres MPI_INIT, par tout programme MPI+OpenMP destine a tourner sur un
+  ! cluster (pas necessaire pour les petits tests de correction). Rend
+  ! visible, des le lancement, la configuration reelle (processus MPI par
+  ! noeud x threads OpenMP par processus, comparee aux coeurs disponibles)
+  ! plutot que de la laisser se manifester indirectement par une
+  ! performance degradee.
   !
   ! COMM : communicateur global (typiquement MPI_COMM_WORLD), utilise pour
-  ! detecter quels rangs partagent la MEME memoire physique (MEME noeud)
+  ! detecter quels rangs partagent la meme memoire physique (meme noeud)
   ! via MPI_COMM_SPLIT_TYPE(MPI_COMM_TYPE_SHARED) -- une seule ligne de
-  ! diagnostic est imprimee PAR NOEUD (par le rang 0 de chaque groupe
+  ! diagnostic est imprimee par noeud (par le rang 0 de chaque groupe
   ! partage), pas par processus, pour rester lisible avec beaucoup de
   ! rangs.
   !
-  ! DETECTION ROBUSTE DE LA SUR-SOUSCRIPTION (corrige une premiere version
-  ! naive) : un simple "processus_sur_noeud x OMP_NUM_THREADS vs coeurs vus
-  ! par CE processus" donne un FAUX POSITIF des qu'un pinning CPU est deja
-  ! actif (ex: Intel MPI pin PAR DEFAUT chaque rang sur un sous-ensemble
-  ! DISJOINT de coeurs -- observe concretement sur ce projet : 4 rangs sur
-  ! une machine a 8 coeurs, chacun pinne sur 2 coeurs disjoints -> "coeurs
-  ! vus par ce processus" = 2, et 4x2=8 declenchait a tort une alerte alors
-  ! que les 8 coeurs physiques sont exactement et exclusivement couverts).
+  ! DETECTION DE LA SUR-SOUSCRIPTION : un simple "processus_sur_noeud x
+  ! OMP_NUM_THREADS vs coeurs vus par CE processus" donne un faux positif
+  ! des qu'un pinning CPU est actif (ex : Intel MPI epingle par defaut
+  ! chaque rang sur un sous-ensemble disjoint de coeurs -- avec 4 rangs sur
+  ! une machine a 8 coeurs, chacun epingle sur 2 coeurs disjoints, "coeurs
+  ! vus par ce processus" vaut 2, et 4x2=8 declencherait a tort une alerte
+  ! alors que les 8 coeurs physiques sont exactement et exclusivement
+  ! couverts).
   !
-  ! Fix : au lieu de MULTIPLIER un nombre de coeurs "par processus" (qui ne
-  ! dit pas si les processus se PARTAGENT les memes coeurs ou en occupent
-  ! des DISJOINTS), on lit le masque d'affinite CPU reel de chaque
-  ! processus (/proc/self/status, "Cpus_allowed"), on en calcule l'UNION
-  ! sur tous les rangs du noeud (MPI_ALLREDUCE MAX bit-a-bit) -- le nombre
-  ! de coeurs DISTINCTS reellement occupe sur le noeud, pinning ou pas --
-  ! et on le compare a la somme des threads demandes par tous les rangs du
-  ! noeud. Ce test est correct dans les DEUX regimes :
+  ! Au lieu de multiplier un nombre de coeurs "par processus" (qui ne dit
+  ! pas si les processus se partagent les memes coeurs ou en occupent des
+  ! disjoints), le masque d'affinite CPU reel de chaque processus
+  ! (/proc/self/status, "Cpus_allowed") est lu, puis son UNION sur tous les
+  ! rangs du noeud calculee (MPI_ALLREDUCE MAX bit-a-bit) -- le nombre de
+  ! coeurs distincts reellement occupes sur le noeud, pinning ou pas -- et
+  ! comparee a la somme des threads demandes par tous les rangs du noeud.
+  ! Ce test est correct dans les deux regimes :
   !   - pinning actif (masques disjoints) : UNION = somme des tailles de
   !     masques -> reflete le vrai total de coeurs occupes.
   !   - pas de pinning (tous les rangs voient le noeud entier, masques
   !     identiques) : UNION = taille d'UN masque (le noeud entier) -> la
-  !     somme des threads demandes (elle, PAS dedupliquee) depasse vite ce
-  !     total des que plusieurs processus tournent sans restriction --
-  !     c'est exactement le cas reellement observe et documente dans la
-  !     memoire du projet.
+  !     somme des threads demandes (elle, pas dedupliquee) depasse vite ce
+  !     total des que plusieurs processus tournent sans restriction.
   !-----------------------------------------------------------------------
   SUBROUTINE REPORT_THREAD_AFFINITY(COMM)
     INCLUDE 'mpif.h'
@@ -204,11 +196,9 @@ CONTAINS
   ! champ "Cpus_allowed", format hexadecimal eventuellement groupe par
   ! virgules pour les masques > 32 bits) et le decode en tableau 0/1
   ! MASK(0:MAXBITS-1) (bit i = 1 si le coeur logique i est autorise pour ce
-  ! processus). Specifique Linux (format /proc) -- coherent avec le choix
-  ! du projet de tourner exclusivement sous WSL2/Linux (cf. memoire
-  ! toolchain). Si le fichier ou le champ est introuvable, renvoie un
-  ! masque nul (le diagnostic degrade proprement, il n'affichera aucune
-  ! alerte plutot que de planter).
+  ! processus). Specifique Linux (format /proc). Si le fichier ou le champ
+  ! est introuvable, renvoie un masque nul (le diagnostic degrade
+  ! proprement, il n'affichera aucune alerte plutot que de planter).
   !-----------------------------------------------------------------------
   SUBROUTINE GET_CPU_AFFINITY_MASK(MASK, MAXBITS)
     INTEGER, INTENT(IN)  :: MAXBITS
@@ -326,9 +316,9 @@ CONTAINS
   ! Rassemble sur ROOT (rang dans GRID%COMM) une matrice locale
   ! bloc-cyclique 2D (A_LOCAL, LLDxLLDC utiles, MLOC x NLOC elements) en la
   ! matrice GLOBALE A_GLOBAL (N x N, seule valide sur ROOT en sortie).
-  ! Usage : VALIDATION de la distribution (etape 6a) et diagnostics dans
-  ! les etapes suivantes -- PAS destine a etre utilise a chaque iteration
-  ! d'un vrai calcul (couteux, communication en etoile vers ROOT).
+  ! Usage : validation de la distribution et diagnostics -- pas destine a
+  ! etre utilise a chaque iteration d'un vrai calcul (couteux, communication
+  ! en etoile vers ROOT).
   !-----------------------------------------------------------------------
   SUBROUTINE GATHER_2D(GRID, N, NB, A_LOCAL, MLOC, NLOC, ROOT, A_GLOBAL)
     INCLUDE 'mpif.h'
@@ -379,11 +369,11 @@ CONTAINS
 
   !-----------------------------------------------------------------------
   ! Rassemble sur ROOT un vecteur distribue PAR LIGNES uniquement (NUMROC
-  ! sur PR, un element par MYROW) et REPLIQUE sur tous les MYCOL -- exactement
-  ! la forme de sortie de MPI_MATVEC_2D (etape 6b). Seuls les processus
-  ! MYCOL==0 participent a l'envoi (evite d'envoyer PC fois la meme
-  ! donnee) ; ROOT doit lui-meme etre un processus MYCOL==0 (toujours vrai
-  ! pour ROOT=0 avec notre convention de numerotation ligne-major).
+  ! sur PR, un element par MYROW) et REPLIQUE sur tous les MYCOL. Utilisee
+  ! par legacy/src/mpi_lu_solve_mod.f90. Seuls les processus MYCOL==0
+  ! participent a l'envoi (evite d'envoyer PC fois la meme donnee) ; ROOT
+  ! doit lui-meme etre un processus MYCOL==0 (toujours vrai pour ROOT=0
+  ! avec la convention de numerotation ligne-major).
   !-----------------------------------------------------------------------
   SUBROUTINE GATHER_ROW_VECTOR(GRID, N, NB, Y_LOCAL, MLOC, ROOT, Y_GLOBAL)
     INCLUDE 'mpif.h'

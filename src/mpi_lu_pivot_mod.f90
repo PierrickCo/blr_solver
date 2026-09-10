@@ -1,70 +1,61 @@
 !===============================================================================
-! ETAPE 6d : factorisation LU par blocs DISTRIBUEE (bloc-cyclique 2D), AVEC
-! PIVOT PARTIEL -- la partie la plus delicate du chantier MPI (voir
-! discussion avec l'utilisateur avant cette etape). Construite sur le
-! squelette de 6c (mpi_lu_nopiv_mod.f90), avec le PANNEAU DIAGONAL
-! remplace par une vraie factorisation pivotee.
+! Factorisation LU par blocs distribuee (bloc-cyclique 2D), avec pivot
+! partiel. Meme structure generale que la variante sans pivot de ce chemin
+! MPI, avec le panneau diagonal remplace par une vraie factorisation
+! pivotee.
 !
-! CHOIX D'IMPLEMENTATION CENTRAL (documente car c'est une simplification
-! deliberee, dans le meme esprit que "SVD plutot que QR-pivote" a l'etape
-! 2) : plutot que de reimplementer a la main la recherche de pivot ET
-! l'elimination scalaire colonne-par-colonne de facon distribuee (tres
-! haut risque de bug, cf. la discussion sur la complexite de PxGETF2),
-! on RASSEMBLE le panneau-colonne complet [KSTART:N,KSTART:KEND] (toutes
-! les lignes restantes, largeur KW<=NB) sur SON processus proprietaire
-! (le meme "owner" que dans 6c), on le factorise LOCALEMENT avec CGETRF
-! -- EXACTEMENT le meme appel, deja valide, que dans block_lu_mod.f90
-! (etape 1) -- puis on RENVOIE le panneau factorise a ses proprietaires
-! d'origine. La recherche de pivot et l'elimination scalaire restent donc
-! un algorithme sequentiel bien rode (LAPACK), pas quelque chose que l'on
-! reecrit soi-meme de facon distribuee. Le cout reel de la distribution
-! (et la vraie complexite de cette etape) se trouve ENTIEREMENT dans :
+! CHOIX D'IMPLEMENTATION CENTRAL : plutot que de reimplementer a la main la
+! recherche de pivot et l'elimination scalaire colonne-par-colonne de facon
+! distribuee (algorithme delicat, cf. la complexite de PxGETF2 dans
+! ScaLAPACK), le panneau-colonne complet [KSTART:N,KSTART:KEND] (toutes les
+! lignes restantes, largeur KW<=NB) est rassemble sur son processus
+! proprietaire, factorise localement avec CGETRF -- le meme appel que dans
+! block_lu_mod.f90 -- puis renvoye a ses proprietaires d'origine. La
+! recherche de pivot et l'elimination scalaire restent donc un algorithme
+! sequentiel LAPACK, jamais reecrit de facon distribuee. Le cout de la
+! distribution se trouve entierement dans :
 !   (a) le rassemblement/renvoi du panneau (communication, pas de calcul),
-!   (b) la PROPAGATION des echanges de lignes trouves vers le reste de la
-!       grille -- colonnes DEJA factorisees a gauche ET colonnes pas
-!       encore touchees a droite, sur TOUS les processus, quelle que soit
+!   (b) la propagation des echanges de lignes trouves vers le reste de la
+!       grille -- colonnes deja factorisees a gauche et colonnes pas
+!       encore touchees a droite, sur tous les processus, quelle que soit
 !       leur colonne de grille (contrairement au panneau lui-meme qui
-!       n'existe que sur UNE colonne de processus).
+!       n'existe que sur une colonne de processus).
 !
 ! ALGORITHME, pour chaque bloc-colonne/ligne global K :
-!   A) RASSEMBLER le panneau [KSTART:N,KSTART:KEND] sur son proprietaire
+!   A) Rassembler le panneau [KSTART:N,KSTART:KEND] sur son proprietaire
 !      (processus (PROW_K,PCOL_K)) -- seuls les processus de la colonne de
 !      grille PCOL_K participent (envoi de leur part locale, via
 !      COL_COMM).
-!   B) Le proprietaire factorise LOCALEMENT ce panneau via CGETRF (pivot
-!      partiel standard, sur TOUTES les lignes du panneau -- exactement le
-!      pivot "confine au panneau" de l'etape 1/3, transpose ici a un
-!      panneau qui, cette fois, est physiquement reparti avant/apres le
-!      rassemblement). IPIV_PANEL_GLOBAL(i) reste au format LOCAL-AU-
-!      PANNEAU exact que renvoie CGETRF (PAS converti en indice global) --
-!      c'est le format que BLOCK_LU_SOLVE (etape 1) attend directement
-!      dans IPIV_GLOBAL(KSTART:KEND), meme convention que block_lu_mod.f90.
-!      La conversion en indice GLOBAL (KSTART-1+valeur) n'est faite que
-!      LOCALEMENT, au moment de calculer R2 dans la boucle de propagation
-!      (etape E) -- necessaire LA pour determiner quel processus possede
-!      la ligne gagnante, mais ne doit surtout pas contaminer la valeur
-!      stockee/diffusee, sous peine de casser BLOCK_LU_SOLVE en aval (bug
-!      reellement rencontre et corrige : residu ~0.5-1e7 avant correction,
-!      y compris en grille 1x1 -- preuve que ce n'etait pas un bug de
-!      communication distribuee mais une confusion de convention).
-!   C) RENVOYER le panneau factorise a ses proprietaires d'origine (meme
+!   B) Le proprietaire factorise localement ce panneau via CGETRF (pivot
+!      partiel standard, sur toutes les lignes du panneau -- le pivot
+!      "confine au panneau" habituel, applique ici a un panneau qui, cette
+!      fois, est physiquement reparti avant/apres le rassemblement).
+!      IPIV_PANEL_GLOBAL(i) reste au format local-au-panneau exact que
+!      renvoie CGETRF (pas converti en indice global) : c'est le format
+!      que BLOCK_LU_SOLVE attend directement dans IPIV_GLOBAL(KSTART:KEND),
+!      meme convention que block_lu_mod.f90. La conversion en indice
+!      global (KSTART-1+valeur) n'est faite que localement, au moment de
+!      calculer R2 dans la boucle de propagation (etape E) -- necessaire
+!      la pour determiner quel processus possede la ligne gagnante, mais
+!      ne doit jamais contaminer la valeur stockee/diffusee, sous peine de
+!      casser BLOCK_LU_SOLVE en aval.
+!   C) Renvoyer le panneau factorise a ses proprietaires d'origine (meme
 !      schema de communication que A, en sens inverse).
-!   D) DIFFUSER IPIV_PANEL_GLOBAL(1:KW) a TOUTE LA GRILLE (MPI_BCAST sur
-!      GRID%COMM, pas seulement COL_COMM -- indispensable puisque l'etape
-!      suivante doit s'appliquer a des processus de N'IMPORTE QUELLE
-!      colonne de grille).
-!   E) PROPAGER les KW echanges de lignes trouves, DANS L'ORDRE (comme le
-!      ferait un CLASWP unique avec ce IPIV), aux colonnes locales A
-!      GAUCHE (indice global < KSTART) et A DROITE (indice global > KEND)
-!      -- sur TOUS les processus (SWAP_ROWS_RANGE, ci-dessous : swap local
+!   D) Diffuser IPIV_PANEL_GLOBAL(1:KW) a toute la grille (MPI_BCAST sur
+!      GRID%COMM, pas seulement COL_COMM -- l'etape suivante doit
+!      s'appliquer a des processus de n'importe quelle colonne de grille).
+!   E) Propager les KW echanges de lignes trouves, dans l'ordre (comme le
+!      ferait un CLASWP unique avec ce IPIV), aux colonnes locales a
+!      gauche (indice global < KSTART) et a droite (indice global > KEND)
+!      -- sur tous les processus (SWAP_ROWS_RANGE, ci-dessous : swap local
 !      si les deux lignes globales impliquees vivent sur le meme MYROW,
 !      MPI_SENDRECV entre les deux processus-lignes concernes sinon).
-!   F) Le reste est IDENTIQUE a 6c (le panneau, une fois factorise et
-!      propage, contient DEJA tout L21 -- CGETRF l'a calcule sur toute la
-!      hauteur du panneau, pas seulement le bloc diagonal) : diffuser le
-!      bloc diagonal le long de ROW_COMM pour calculer le panneau U par
-!      CTRSM, diffuser L (deja pret) le long de ROW_COMM et U le long de
-!      COL_COMM, mise a jour du complement de Schur par CGEMM.
+!   F) Le panneau, une fois factorise et propage, contient deja tout L21
+!      (CGETRF l'a calcule sur toute la hauteur du panneau, pas seulement
+!      le bloc diagonal) : diffuser le bloc diagonal le long de ROW_COMM
+!      pour calculer le panneau U par CTRSM, diffuser L (deja pret) le
+!      long de ROW_COMM et U le long de COL_COMM, mettre a jour le
+!      complement de Schur par CGEMM.
 !===============================================================================
 MODULE MPI_LU_PIVOT_MOD
   USE BLR_KINDS_MOD, ONLY: WP
@@ -74,14 +65,11 @@ MODULE MPI_LU_PIVOT_MOD
 
 CONTAINS
 
-  ! SHOW_PROGRESS (optionnel) : affichage par PALIERS (PRINT_PROGRESS_
-  ! MILESTONE, pas la barre a rafraichissement en place) -- ce module
-  ! tourne sous MPI/mpirun, qui relaie le stdout de chaque processus via
-  ! un pipe et casse le retour chariot (voir progress_bar_mod.f90 et
-  ! mpi_blr_matrix_mod.f90 pour le detail du bug rencontre/corrige).
-  ! K/NBLK est un pourcentage EXACT (boucle globalement synchronisee par
-  ! les diffusions a chaque etape K) -- affiche uniquement par le
-  ! processus 0.
+  ! SHOW_PROGRESS (optionnel) : affichage par paliers (PRINT_PROGRESS_
+  ! MILESTONE -- voir progress_bar_mod.f90), robuste sous MPI/mpirun quel
+  ! que soit le lanceur. K/NBLK est un pourcentage exact (boucle
+  ! globalement synchronisee par les diffusions a chaque etape K) -- affiche
+  ! uniquement par le processus 0.
   SUBROUTINE MPI_LU_PIVOT_FACTOR(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, &
                                   INFO, N_SWAPS, MIN_PIVOT, SHOW_PROGRESS)
     INCLUDE 'mpif.h'
@@ -160,19 +148,18 @@ CONTAINS
             DEALLOCATE(RBUF)
           END DO
 
-          ! --- factorisation locale, pivot partiel standard (deja valide,
-          !     etape 1) ---
+          ! --- factorisation locale, pivot partiel standard ---
           CALL CGETRF(MPANEL, KW, PANEL, MPANEL, IPIV_LOCAL, IINFO)
           IF (IINFO .NE. 0) INFO_STEP = KSTART - 1 + IINFO
-          ! IPIV_PANEL_GLOBAL reste au format LOCAL AU PANNEAU (comme le
-          ! renvoie directement CGETRF -- valeur v = ligne v DU SOUS-TABLEAU
-          ! debutant a KSTART, PAS un indice de ligne global). C'est
-          ! EXACTEMENT le format que BLOCK_LU_SOLVE (etape 1) attend dans
-          ! IPIV_GLOBAL(KSTART:KEND) puisqu'il rejoue les echanges via
-          ! CLASWP(...,B(KSTART,1),...,IPIV(KSTART),1) -- un CLASWP relatif
-          ! au meme sous-tableau. La conversion en indice GLOBAL (KSTART-1+v,
-          ! necessaire pour NOTRE propagation a nous, cf. R2 plus bas) se
-          ! fait SEULEMENT localement dans la boucle de propagation, jamais
+          ! IPIV_PANEL_GLOBAL reste au format local au panneau (comme le
+          ! renvoie directement CGETRF -- valeur v = ligne v du sous-tableau
+          ! debutant a KSTART, pas un indice de ligne global). C'est le
+          ! format que BLOCK_LU_SOLVE attend dans IPIV_GLOBAL(KSTART:KEND)
+          ! puisqu'il rejoue les echanges via
+          ! CLASWP(...,B(KSTART,1),...,IPIV(KSTART),1), un CLASWP relatif au
+          ! meme sous-tableau. La conversion en indice global (KSTART-1+v,
+          ! necessaire pour la propagation ci-dessous, cf. R2 plus bas) se
+          ! fait seulement localement dans la boucle de propagation, jamais
           ! dans la valeur stockee/diffusee ici.
           DO J = 1, KW
             IPIV_PANEL_GLOBAL(J) = IPIV_LOCAL(J)
@@ -251,7 +238,7 @@ CONTAINS
         END IF
       END DO
 
-      ! === F : identique a 6c (le panneau contient deja tout L21) ===
+      ! === F : le panneau contient deja tout L21 ===
       RTRAIL0   = NUMROC(KEND, NB, GRID%MYROW, GRID%PR)
       CTRAIL0   = NUMROC(KEND, NB, GRID%MYCOL, GRID%PC)
       NROWTRAIL = MLOC - RTRAIL0
@@ -315,8 +302,7 @@ CONTAINS
   ! purement local si PROW1==PROW2 (les deux lignes vivent sur le meme
   ! MYROW), sinon MPI_SENDRECV entre les deux processus-lignes concernes
   ! (chaque processus determine independamment son role via son propre
-  ! MYROW -- aucune coordination supplementaire necessaire, cf. discussion
-  ! avec l'utilisateur sur pourquoi c'est la partie delicate de 6d).
+  ! MYROW, sans coordination supplementaire).
   !-----------------------------------------------------------------------
   SUBROUTINE SWAP_ROWS_RANGE(GRID, NB, A_LOCAL, MLOC, NLOC, R1, R2, PROW1, PROW2, &
                               COL_LO, COL_HI)

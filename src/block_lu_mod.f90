@@ -1,44 +1,45 @@
 !===============================================================================
-! ETAPE 1 du solveur BLR "from scratch" : factorisation LU PAR BLOCS, SANS
-! compression (elle arrive a l'etape 2), complexe SIMPLE PRECISION.
+! Factorisation LU dense PAR BLOCS, SANS compression, complexe simple
+! precision -- reference de base pour les variantes BLR du solveur
+! (blr_lu_mod.f90, blr_matrix_mod.f90), qui injectent la compression dans
+! la mise a jour de Schur au meme endroit que l'etape 4 de l'algorithme
+! ci-dessous.
 !
-! PRINCIPE : c'est exactement l'algorithme "right-looking blocked LU" que
-! LAPACK utilise en interne dans sa version bloquee de CGETRF -- on le
-! reecrit nous-memes ici (au lieu d'appeler CGETRF directement sur la
-! matrice entiere) car c'est le squelette sur lequel on va greffer, a
-! l'etape suivante, la compression BLR des blocs hors-diagonale dans la
-! mise a jour de Schur (etape 5 ci-dessous) : on ne peut pas intercepter ce
-! qui se passe DANS un CGETRF, donc on reimplemente l'orchestration par
-! blocs nous-memes, en s'appuyant sur les noyaux denses de LAPACK/MKL
-! (CGETRF, CLASWP, CTRSM, CGEMM) pour ce qui se passe A L'INTERIEUR de
-! chaque bloc/panneau -- comme le font MUMPS et STRUMPACK (ils n'ecrivent
-! pas leur propre BLAS non plus).
+! PRINCIPE : algorithme "right-looking blocked LU", le meme que celui que
+! LAPACK utilise en interne dans sa version bloquee de CGETRF. Reimplemente
+! ici (plutot qu'un simple appel a CGETRF sur la matrice entiere) car les
+! variantes BLR doivent intercepter la mise a jour de Schur pour y
+! substituer une forme basse-rang -- ce qui n'est pas possible depuis
+! l'exterieur d'un CGETRF. L'orchestration par blocs est donc reimplementee
+! ici, en s'appuyant sur les noyaux denses de LAPACK/MKL (CGETRF, CLASWP,
+! CTRSM, CGEMM) pour le travail interne a chaque bloc/panneau -- meme
+! principe que MUMPS et STRUMPACK, qui n'ecrivent pas non plus leur propre
+! BLAS.
 !
-! DECOUPAGE EN BLOCS : taille FIXE NB (derniere colonne de blocs
+! DECOUPAGE EN BLOCS : taille fixe NB (derniere colonne de blocs
 ! eventuellement plus petite si N n'est pas multiple de NB).
 !
-! PIVOT : partiel, CONFINE AU PANNEAU COURANT (colonnes du bloc K, TOUTES
-! les lignes restantes K..N) -- c'est le pivot standard d'une LU bloquee,
-! PAS un pivot global sur toute la matrice a chaque etape scalaire (ce qui
-! serait couteux et inutile), mais PAS NON PLUS confine a un tout petit
-! bloc NBxNB isole (ce qui degraderait la stabilite numerique sans raison,
-! puisqu'on a acces a toutes les lignes du panneau). C'est le meme choix
-! que fait MUMPS/STRUMPACK au niveau d'un front. Les echanges de lignes
-! sont ensuite propages a TOUTE la matrice (blocs deja factorises a
-! gauche ET blocs pas encore touches a droite), exactement comme le fait
-! CGETRF en interne.
+! PIVOT : partiel, confine au panneau courant (colonnes du bloc K, toutes
+! les lignes restantes K..N) -- le pivot standard d'une LU bloquee, ni un
+! pivot global sur toute la matrice a chaque etape scalaire (couteux et
+! superflu), ni confine a un seul bloc NBxNB isole (degraderait la
+! stabilite numerique sans necessite, l'acces a toutes les lignes du
+! panneau etant deja disponible). Meme choix que MUMPS/STRUMPACK au niveau
+! d'un front. Les echanges de lignes sont ensuite propages a toute la
+! matrice (blocs deja factorises a gauche et blocs pas encore touches a
+! droite), exactement comme le fait CGETRF en interne.
 !
 ! ALGORITHME (bloc K = colonnes [kstart:kend], kw = kend-kstart+1) :
 !   1) Factoriser le panneau [kstart:N, kstart:kend] avec CGETRF (pivot
 !      partiel sur ce panneau).
-!   2) Appliquer les echanges de lignes obtenus aux colonnes A GAUCHE
-!      (1:kstart-1, deja factorisees) ET A DROITE (kend+1:N, pas encore
+!   2) Appliquer les echanges de lignes obtenus aux colonnes a gauche
+!      (1:kstart-1, deja factorisees) et a droite (kend+1:N, pas encore
 !      touchees) du panneau, via CLASWP.
 !   3) Resoudre L11*U12 = A12 (CTRSM) pour obtenir le bloc-ligne U de la
 !      partie a droite du panneau.
 !   4) Mettre a jour la sous-matrice restante : A22 <- A22 - L21*U12
-!      (CGEMM) -- C'EST CETTE ETAPE que l'etape 2 remplacera par une
-!      version basse-rang quand les blocs L21/U12 seront compresses.
+!      (CGEMM) -- c'est cette etape que les variantes BLR remplacent par
+!      une version basse-rang une fois les blocs L21/U12 compresses.
 !
 ! A la sortie, A contient L (strictement inferieure, diagonale unite
 ! implicite) et U (triangulaire superieure, diagonale incluse) -- comme
@@ -46,12 +47,12 @@
 ! la ligne i a ete echangee avec la ligne IPIV(i)) -- directement
 ! compatible avec CLASWP/CGETRS.
 !
-! PAS DE DIRECTIVE OPENMP ICI (etape 5) : contrairement a blr_lu_mod.f90
-! (etape 2), la mise a jour de Schur de CE module est UN SEUL GROS CGEMM
-! par panneau (pas de compression -> pas de multiples petits blocs
-! independants a repartir nous-memes) -- ce gros appel est DEJA parallelise
-! EN INTERNE par MKL (threading BLAS standard). Rien a paralleliser a notre
-! niveau ; le parallelisme vient entierement de la MKL threadee.
+! PAS DE DIRECTIVE OPENMP ICI : la mise a jour de Schur de ce module est un
+! seul gros CGEMM par panneau (pas de compression, donc pas de multiples
+! petits blocs independants a repartir explicitement) -- cet appel est deja
+! parallelise en interne par MKL (threading BLAS standard). Le parallelisme
+! provient entierement de la MKL threadee, rien a paralleliser au niveau de
+! l'orchestration.
 !===============================================================================
 MODULE BLOCK_LU_MOD
   USE BLR_KINDS_MOD, ONLY: WP
@@ -71,11 +72,9 @@ CONTAINS
   ! partiel (matrice a diagonale dominante = souvent N_SWAPS~0, peu
   ! probant) plutot que de le supposer -- cf. test/test_pivoting.f90.
   !
-  ! SHOW_PROGRESS (optionnel) : barre a rafraichissement en place (voir
-  ! progress_bar_mod.f90) -- OK ici, contrairement aux routines MPI de ce
-  ! projet, puisque ce module est sequentiel/OpenMP, attache a un vrai
-  ! terminal (pas de relai stdout par un lanceur MPI qui casserait le
-  ! retour chariot).
+  ! SHOW_PROGRESS (optionnel) : barre de progression (voir
+  ! progress_bar_mod.f90) -- module sequentiel/OpenMP, attache directement
+  ! au terminal de l'utilisateur, sans relai par un lanceur MPI.
   !-----------------------------------------------------------------------
   SUBROUTINE BLOCK_LU_FACTOR(N, NB, A, LDA, IPIV, INFO, N_SWAPS, MIN_PIVOT, SHOW_PROGRESS)
     INTEGER, INTENT(IN)             :: N, NB, LDA
@@ -151,18 +150,16 @@ CONTAINS
   ! Resolution A*X = B a partir des facteurs L/U et IPIV calcules par
   ! BLOCK_LU_FACTOR. B est ecrase par X.
   !
-  ! IMPORTANT (bug corrige ici) : les indices de pivot stockes dans
-  ! IPIV(KSTART:KEND) par BLOCK_LU_FACTOR sont LOCAUX A CHAQUE PANNEAU
-  ! (CGETRF, appele sur le sous-tableau A(KSTART:N,...), n'a aucune notion
-  ! de KSTART et renvoie des indices relatifs a SA PROPRE ligne 1 = notre
-  ! ligne globale KSTART). Ca fonctionne directement pour le premier
-  ! panneau (KSTART=1, donc local=global) mais PAS pour les suivants -- un
-  ! unique CLASWP(NRHS,B,LDB,1,N,IPIV,1) sur tout B interpreterait a tort
-  ! les valeurs locales des panneaux K>1 comme des indices globaux. On
-  ! applique donc les pivots PANNEAU PAR PANNEAU, dans le meme ordre et
-  ! avec la meme convention (sous-tableau demarrant a KSTART) que
-  ! BLOCK_LU_FACTOR -- exactement les memes appels CLASWP que ceux deja
-  ! valides lors de la factorisation.
+  ! Important : les indices de pivot stockes dans IPIV(KSTART:KEND) par
+  ! BLOCK_LU_FACTOR sont locaux a chaque panneau (CGETRF, appele sur le
+  ! sous-tableau A(KSTART:N,...), n'a aucune notion de KSTART et renvoie
+  ! des indices relatifs a sa propre ligne 1, c'est-a-dire la ligne globale
+  ! KSTART). C'est transparent pour le premier panneau (KSTART=1, donc
+  ! local=global) mais pas pour les suivants -- un unique
+  ! CLASWP(NRHS,B,LDB,1,N,IPIV,1) sur tout B interpreterait a tort les
+  ! valeurs locales des panneaux K>1 comme des indices globaux. Les pivots
+  ! sont donc appliques panneau par panneau, dans le meme ordre et avec la
+  ! meme convention (sous-tableau demarrant a KSTART) que BLOCK_LU_FACTOR.
   !-----------------------------------------------------------------------
   SUBROUTINE BLOCK_LU_SOLVE(N, NB, NRHS, A, LDA, IPIV, B, LDB)
     INTEGER, INTENT(IN)        :: N, NB, NRHS, LDA, LDB

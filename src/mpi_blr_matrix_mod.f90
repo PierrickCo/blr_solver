@@ -1,48 +1,48 @@
 !===============================================================================
-! SOLVEUR LU MPI, BLR, SANS PIVOT (etape 1 d'un plan en 2 etapes explicitement
-! valide avec l'utilisateur -- le pivot viendra ensuite, sur cette base).
+! Solveur LU MPI+BLR : le stockage local de chaque processus est lui-meme
+! compresse, pas seulement la mise a jour de Schur ou la diffusion des
+! panneaux.
 !
-! DIFFERENCE avec TOUT ce qui existait jusqu'ici cote MPI (6c/6d/6e/P3) :
-! ces modules stockent TOUJOURS A_LOCAL(MLOC,NLOC) comme un tableau DENSE
-! (la compression n'accelere que la mise a jour de Schur, ou la diffusion
-! des panneaux -- jamais le STOCKAGE local lui-meme). ICI, le stockage local
-! de CHAQUE processus est un tableau de BLR_BLOCK_T (compresse des
-! l'assemblage, EXACTEMENT comme blr_matrix_mod.f90/"A" en sequentiel) --
-! "evite au maximum le passage au bloc plein", demande explicite.
+! DIFFERENCE avec les autres solveurs MPI de ce projet : ces modules
+! stockent toujours A_LOCAL(MLOC,NLOC) comme un tableau dense (la
+! compression n'accelere que la mise a jour de Schur, ou la diffusion des
+! panneaux -- jamais le stockage local lui-meme). Ici, le stockage local
+! de chaque processus est un tableau de BLR_BLOCK_T (compresse des
+! l'assemblage, comme blr_matrix_mod.f90 en sequentiel) -- le passage au
+! bloc plein est evite au maximum.
 !
-! STRUCTURE DE DONNEES : au lieu de l'indexation ELEMENT-level habituelle
-! (NUMROC/INDXL2G sur des LIGNES/COLONNES individuelles), on indexe ici au
-! niveau BLOC : chaque processus possede NBLKR_LOC blocs-lignes locaux et
-! NBLKC_LOC blocs-colonnes locaux (BLOCK_NUMROC, meme principe que NUMROC
-! mais un "element" = un bloc NB x NB entier, cycle=1 bloc par processus).
-! Bloc-ligne LOCAL li <-> bloc-ligne GLOBAL I = (li-1)*PR + MYROW + 1 (et
-! symetriquement pour les colonnes) -- CHAQUE processus d'une meme ligne de
-! grille (meme MYROW) partage EXACTEMENT le meme ensemble de lignes-bloc
-! locales (la formule ne depend que de MYROW/PR), ce qui est la cle de
-! l'algorithme de diffusion ci-dessous.
+! STRUCTURE DE DONNEES : au lieu de l'indexation element-level habituelle
+! (NUMROC/INDXL2G sur des lignes/colonnes individuelles), l'indexation se
+! fait ici au niveau bloc : chaque processus possede NBLKR_LOC blocs-lignes
+! locaux et NBLKC_LOC blocs-colonnes locaux (BLOCK_NUMROC, meme principe
+! que NUMROC mais un "element" = un bloc NB x NB entier, cycle = 1 bloc
+! par processus). Bloc-ligne local li <-> bloc-ligne global I =
+! (li-1)*PR + MYROW + 1 (et symetriquement pour les colonnes) -- chaque
+! processus d'une meme ligne de grille (meme MYROW) partage exactement le
+! meme ensemble de lignes-bloc locales (la formule ne depend que de
+! MYROW/PR), ce qui est la cle de l'algorithme de diffusion ci-dessous.
 !
-! MESSAGES MPI MINIMISES (demande explicite) : les panneaux L21/U12 sont
-! diffuses DEJA COMPRESSES (technique de la proposition 3, BCAST_BLR_BLOCK)
-! -- jamais dense-puis-compression (6e) ni meme dense du tout ici. Comme
-! CHAQUE bloc du panneau garde sa propre representation (dense ou UFAC/VFAC
-! de rang tres inferieur a NB), le volume envoye est proportionnel au rang
-! reel de la matrice, pas a NB.
+! MESSAGES MPI MINIMISES : les panneaux L21/U12 sont diffuses deja
+! compresses (BCAST_BLR_BLOCK, mpi_blr_lu_pivot_bcast_mod.f90) -- jamais
+! dense-puis-compression, ni meme dense du tout ici. Comme chaque bloc du
+! panneau garde sa propre representation (dense ou UFAC/VFAC de rang tres
+! inferieur a NB), le volume envoye est proportionnel au rang reel de la
+! matrice, pas a NB.
 !
 ! MISE A JOUR DE SCHUR : reste compressee aussi souvent que possible via
-! SCHUR_UPDATE_BLR_BLOCK (deja construit pour blr_matrix_mod.f90/"A") --
-! meme mecanisme, applique ici bloc local par bloc local.
+! SCHUR_UPDATE_BLR_BLOCK (blr_compress_mod.f90) -- meme mecanisme,
+! applique ici bloc local par bloc local.
 !
 ! RESOLUTION : reprend l'algorithme 2D complet de mpi_lu_solve_2d_mod.f90
-! (ALLGATHERV+diffusion+SCATTERV sur B, AUCUNE replication residuelle) mais
+! (ALLGATHERV+diffusion+SCATTERV sur B, aucune replication residuelle) mais
 ! remplace le CGEMM dense par BLR_BLOCK_APPLY, bloc local par bloc local --
 ! exploite directement la compression des facteurs stockes.
 !
-! HORS SCOPE ICI (valide avec l'utilisateur, etape suivante) : PAS de pivot
-! (matrices a diagonale dominante uniquement, comme TOUS les modules "sans
-! pivot" du projet) ; PAS de memoire partagee MPI (MPI_Win/RMA) -- cette
-! architecture ne l'empeche pas d'etre ajoutee plus tard (chaque processus
-! garde une frontiere claire entre ses donnees locales et les messages
-! recus), mais ce n'est pas construit maintenant.
+! LES VARIANTES NOPIV DE CE MODULE RESTENT SANS PIVOT (matrices a diagonale
+! dominante uniquement) ; aucune ne s'appuie sur la memoire partagee MPI
+! (MPI_Win/RMA) -- l'architecture ne l'empeche pas d'etre ajoutee plus
+! tard (chaque processus garde une frontiere claire entre ses donnees
+! locales et les messages recus), mais ce n'est pas necessaire ici.
 !===============================================================================
 MODULE MPI_BLR_MATRIX_MOD
   USE BLR_KINDS_MOD, ONLY: WP
@@ -94,10 +94,10 @@ MODULE MPI_BLR_MATRIX_MOD
   END TYPE MPI_BLR_MATRIX_ARENA_T
 
   !-----------------------------------------------------------------------
-  ! Variante "CAPACITE FIXE" (demande explicite : "les blocs LR stoquent
-  ! le maximum de rang que COMPRESS_WORTHWHILE_RATIO le permet ; les
-  ! echanges MPI et les operations associees ne se font que sur le rang
-  ! REEL") -- voir BLR_BLOCK_FIXEDCAP_T (blr_compress_mod.f90) pour le
+  ! Variante "CAPACITE FIXE" : les blocs bas-rang stockent en permanence
+  ! le rang maximal que COMPRESS_WORTHWHILE_RATIO autorise ; les echanges
+  ! MPI et les operations associees ne portent, eux, que sur le rang reel.
+  ! Voir BLR_BLOCK_FIXEDCAP_T (blr_compress_mod.f90) pour le
   ! principe complet. Contrairement a MPI_BLR_MATRIX_ARENA_T, AUCUN champ
   ! ARENA ici -- chaque bloc gere sa propre capacite RMAX via de simples
   ! composantes ALLOCATABLE, aucun allocateur/pool partage, aucun attribut
@@ -112,13 +112,12 @@ MODULE MPI_BLR_MATRIX_MOD
   END TYPE MPI_BLR_MATRIX_FIXEDCAP_T
 
   !-----------------------------------------------------------------------
-  ! Variante OUT-OF-CORE (demande explicite : ne plus etre limite par la
-  ! RAM disponible, ni pour la matrice assemblee, ni pour les facteurs LU
-  ! apres remplissage de Schur, ni pour un second membre massif) -- basee
-  ! sur l'algorithme CLASSIQUE (pas l'arena : le cycle allocate/deallocate
-  ! individuel de BLR_BLOCK_T se prete naturellement a l'eviction disque,
-  ! contrairement a l'arena qui ne libere jamais un bloc individuellement
-  ! -- voir la memoire du projet).
+  ! Variante OUT-OF-CORE : ne plus etre limite par la RAM disponible, ni
+  ! pour la matrice assemblee, ni pour les facteurs LU apres remplissage
+  ! de Schur, ni pour un second membre massif -- basee sur l'algorithme
+  ! classique (pas l'arena : le cycle allocate/deallocate individuel de
+  ! BLR_BLOCK_T se prete naturellement a l'eviction disque, contrairement
+  ! a l'arena qui ne libere jamais un bloc individuellement).
   !
   ! DIAGBLK/OFFBLK ne contiennent plus les donnees directement (UFAC/VFAC/
   ! DENSE) mais un DESCRIPTEUR LEGER (OOC_BLOCK_DESC_T, blr_ooc_mod.f90 --
@@ -185,8 +184,8 @@ MODULE MPI_BLR_MATRIX_MOD
   ! Second membre OUT-OF-CORE : assemble et stocke SEPAREMENT de la
   ! matrice (fichier scratch propre, prefixe "b" -- voir
   ! MPI_ASSEMBLE_RHS_OOC), par PAQUETS d'au plus NRHS_BATCH colonnes
-  ! GLOBALES -- demande explicite ("limiter la memoire dans un cas
-  ! massivement second membre"). Chaque paquet est un bloc dense ordinaire
+  ! GLOBALES -- pour borner la memoire meme dans un cas massivement
+  ! second membre. Chaque paquet est un bloc dense ordinaire
   ! (BLR_BLOCK_T, IS_LOWRANK=.FALSE.) au sens de blr_ooc_mod.f90 -- aucun
   ! nouveau mecanisme d'(e)serialisation necessaire, juste reutilise. Pas
   ! de cache ici (contrairement a OFFBLK) : chaque paquet n'est relu
@@ -213,8 +212,8 @@ MODULE MPI_BLR_MATRIX_MOD
     ! exemples/tests, ou ecrire directement sur disque pour un cas
     ! massivement second membre reel). Aucune accumulation NRHS-large
     ! n'est faite par la bibliotheque elle-meme -- c'est precisement le
-    ! but de cette interface (demande explicite : borner la memoire de la
-    ! resolution independamment de NRHS).
+    ! but de cette interface : borner la memoire de la resolution
+    ! independamment de NRHS.
     ! BATCH_RSTART/BATCH_REND : plage de colonnes GLOBALE du paquet ENTIER
     ! (identique sur tous les processus -- necessaire si l'appelant doit
     ! rassembler entre processus, ex. via GATHER_2D_RHS avec
@@ -245,10 +244,10 @@ CONTAINS
   END FUNCTION BLOCK_NUMROC
 
   !-----------------------------------------------------------------------
-  ! ETAPE 1 : assemblage bloc par bloc + compression IMMEDIATE des blocs
-  ! hors-diagonale locaux (meme esprit que ASSEMBLE_BLR_MATRIX/"A", mais
-  ! chaque processus n'assemble que SA part -- GET_BLOCK recoit des
-  ! indices GLOBAUX, comme en sequentiel).
+  ! Assemblage bloc par bloc, avec compression immediate des blocs hors-
+  ! diagonale locaux (meme principe que ASSEMBLE_BLR_MATRIX/blr_matrix_
+  ! mod.f90, mais chaque processus n'assemble que sa part -- GET_BLOCK
+  ! recoit des indices globaux, comme en sequentiel).
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
                                       T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
@@ -281,28 +280,24 @@ CONTAINS
     ! transmis tels quels, voir son commentaire pour leur role.
     LOGICAL, INTENT(IN), OPTIONAL   :: USE_RSVD
     INTEGER, INTENT(IN), OPTIONAL   :: RSVD_OVERSAMPLE, RSVD_NPOWER
-    ! DIAGNOSTIC (demande explicite -- evaluer si une SVD randomisee vaut le
-    ! coup a la place de CGESVD dans COMPRESS_BLOCK) : T_GET_BLOCK cumule le
-    ! temps dans TOUS les appels GET_BLOCK (evaluation du noyau, diagonal +
-    ! hors-diagonale) ; T_COMPRESS cumule le temps dans TOUS les appels
+    ! DIAGNOSTIC (utile pour evaluer si une SVD randomisee vaut le coup a
+    ! la place de CGESVD dans COMPRESS_BLOCK) : T_GET_BLOCK cumule le
+    ! temps dans tous les appels GET_BLOCK (evaluation du noyau, diagonal +
+    ! hors-diagonale) ; T_COMPRESS cumule le temps dans tous les appels
     ! COMPRESS_BLOCK (SVD complete, hors-diagonale uniquement). Optionnels,
     ! aucun surcout si absents.
     !
-    ! BOGUE CORRIGE (2026-09-01, exploration d'une visibilite par-processus
-    ! type MPE/Jumpshot, indisponible dans cet environnement) : T_ASSEMBLE_
-    ! COMPRESS/T_GET_BLOCK/T_COMPRESS etaient TOUS affectes a la valeur
-    ! LOCALE du rang appelant, jamais reduits -- PLUS GRAVE ici que dans la
-    ! factorisation (voir MPI_BLR_MATRIX_LU_FACTOR_PIVOT[_OOC]) car cette
-    ! boucle d'assemblage est "embarrassingly parallel" (aucune
-    ! synchronisation entre processus, voir commentaire plus bas) : un
-    ! rang plus lent ici ne fait PAS attendre les autres avant que leur
-    ! propre chronometre local ne s'arrete -- le temps qu'il lui reste a
-    ! passer fuit silencieusement dans la PHASE SUIVANTE (premiere
-    ! communication collective de la factorisation, qui l'attend). Corrige :
-    ! T_ASSEMBLE_COMPRESS/T_GET_BLOCK/T_COMPRESS sont maintenant un vrai
-    ! MAX sur GRID%COMM. Nouveaux _MIN (optionnels) : ecart MAX/MIN direct
-    ! = indicateur de desequilibre de charge entre processus (une
-    ! distribution bloc-cyclique DEVRAIT rester equilibree, un ecart
+    ! T_ASSEMBLE_COMPRESS/T_GET_BLOCK/T_COMPRESS sont un vrai MAX sur
+    ! GRID%COMM, jamais la valeur locale du rang appelant -- important ici
+    ! car cette boucle d'assemblage est "embarrassingly parallel" (aucune
+    ! synchronisation entre processus, voir commentaire plus bas) : sans
+    ! cette reduction, un rang plus lent ne ferait pas attendre les autres
+    ! avant que leur propre chronometre local ne s'arrete, et le temps
+    ! qu'il lui reste a passer fuirait silencieusement dans la phase
+    ! suivante (premiere communication collective de la factorisation, qui
+    ! l'attend). Nouveaux _MIN (optionnels) : ecart MAX/MIN direct =
+    ! indicateur de desequilibre de charge entre processus (une
+    ! distribution bloc-cyclique devrait rester equilibree, un ecart
     ! important signalerait un noyau GET_BLOCK dont le cout varie fortement
     ! selon les blocs, ou un decoupage NBLK non multiple de PR*PC).
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_GET_BLOCK, T_COMPRESS, T_GET_BLOCK_MIN, T_COMPRESS_MIN
@@ -379,17 +374,10 @@ CONTAINS
           DEALLOCATE(TMP)
         END IF
         NDONE = NDONE + 1
-        ! DEMANDE EXPLICITE (2026-09-01) : barre a rafraichissement en
-        ! place (une seule ligne, CHAR(13)) au lieu de l'affichage par
-        ! paliers -- voir progress_bar_mod.f90 : ce choix avait ete
-        ! evite sous MPI par le passe (mpirun relaie le stdout par pipe,
-        ! le retour chariot peut ne pas s'interpreter comme "ecraser la
-        ! ligne precedente" et polluer la sortie d'une ligne par mise a
-        ! jour). Seul le rang 0 ecrit ici (PROGRESS deja gate sur
-        ! GRID%MYID.EQ.0) -- a VERIFIER visuellement dans un vrai
-        ! terminal interactif (pas une sortie redirigee vers un fichier) ;
-        ! revenir a PRINT_PROGRESS_MILESTONE si la ligne se duplique au
-        ! lieu de s'ecraser sous votre mpirun.
+        ! Barre qui se remplit progressivement (voir progress_bar_mod.f90)
+        ! -- robuste sous MPI puisqu'elle n'emet aucun caractere de
+        ! controle. Seul le rang 0 ecrit ici (PROGRESS deja gate sur
+        ! GRID%MYID.EQ.0).
         IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression (rang 0)', NDONE, NTOTAL, PBAR_STATE)
       END DO
     END DO
@@ -426,15 +414,15 @@ CONTAINS
   END FUNCTION MPI_BLR_MATRIX_MEMORY_BYTES
 
   !-----------------------------------------------------------------------
-  ! ETAPE 3 : factorisation LU EN PLACE, SANS PIVOT, sur A_BLR -- reste
-  ! compressee tout du long (voir commentaire de tete de fichier pour
-  ! l'algorithme complet). N_COMPRESSED/N_OFFDIAG/RANK_SUM caracterisent
-  ! les facteurs L/U FINAUX (sommes sur tous les processus).
+  ! Factorisation LU en place, sans pivot, sur A_BLR -- reste compressee
+  ! tout du long (voir commentaire de tete de fichier pour l'algorithme
+  ! complet). N_COMPRESSED/N_OFFDIAG/RANK_SUM caracterisent les facteurs
+  ! L/U finaux (sommes sur tous les processus).
   !-----------------------------------------------------------------------
   ! T_DIAG/T_BCAST_DKK/T_TRSM/T_BCAST_PANEL/T_ALLOC/T_MPICALL/T_SCHUR_PRODUCT/
   ! T_RECOMPRESS/T_SCHUR_DIAG (tous optionnels, INTENT(OUT), max/processus) :
-  ! decoupage fin du temps de factorisation demande par l'utilisateur --
-  ! T_BCAST_PANEL est le temps TOTAL de l'etape 5 (diffusion des panneaux
+  ! decoupage fin du temps de factorisation, categorie par categorie --
+  ! T_BCAST_PANEL est le temps total de l'etape 5 (diffusion des panneaux
   ! L/U compresses) et INCLUT T_ALLOC/T_MPICALL comme sous-parties (le
   ! reste, non isole separement, est le pack/unpack RESHAPE dans
   ! BCAST_BLR_BLOCK) ; T_SCHUR_PRODUCT = temps de calcul du produit L*U
@@ -554,8 +542,8 @@ CONTAINS
       END IF
       DEALLOCATE(DKK)
 
-      ! 5) diffusion des panneaux L/U DEJA COMPRESSES (reduit au maximum
-      !    le volume envoye -- technique de la proposition 3) : le
+      ! 5) diffusion des panneaux L/U deja compresses (reduit au maximum
+      !    le volume envoye, voir BCAST_BLR_BLOCK) : le
       !    panneau L(:,K) local a la colonne PCOL_K est diffuse le long de
       !    ROW_COMM (touche toute la ligne MYROW -- MEME ensemble de
       !    lignes-bloc locales pour tous les processus de cette ligne).
@@ -640,14 +628,13 @@ CONTAINS
   END SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_NOPIV
 
   !-----------------------------------------------------------------------
-  ! ETAPE 3bis : factorisation LU EN PLACE, AVEC PIVOT PARTIEL CONFINE AU
-  ! BLOC DIAGONAL (meme philosophie que block_lu_mod.f90/etape 1 et
-  ! mpi_lu_pivot_mod.f90/6d -- pivot recherche UNIQUEMENT dans les KW
-  ! lignes du bloc diagonal courant, jamais globalement). Choisi plutot
-  ! qu'une methode "ne decompresse jamais" (option initialement envisagee,
-  ! haut risque, cf. discussion avec l'utilisateur) car permuter des LIGNES
-  ! d'un bloc bas-rang ne touche QUE UFAC (cout O(rang), jamais de
-  ! decompression) -- voir BLR_BLOCK_ROW_SWAP.
+  ! Factorisation LU en place, avec pivot partiel confine au bloc diagonal
+  ! (meme philosophie que block_lu_mod.f90 et mpi_lu_pivot_mod.f90 -- pivot
+  ! recherche uniquement dans les KW lignes du bloc diagonal courant,
+  ! jamais globalement). Choisi plutot qu'une methode "ne decompresse
+  ! jamais" (plus risquee) car permuter des lignes d'un bloc bas-rang ne
+  ! touche que UFAC (cout O(rang), jamais de decompression) -- voir
+  ! BLR_BLOCK_ROW_SWAP.
   !
   ! DIAGONALE : CGETRF directement (plus de conflit avec un invariant
   ! "sans pivot" puisqu'on l'assouplit ICI expres) -- recupere gratuitement
@@ -688,13 +675,9 @@ CONTAINS
     INTEGER, INTENT(OUT), OPTIONAL    :: N_SWAPS
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_FACTOR
     LOGICAL, INTENT(IN), OPTIONAL     :: SHOW_PROGRESS
-    ! DIAGNOSTIC TEMPORAIRE (a retirer une fois l'investigation terminee,
-    ! voir la memoire du projet -- ecart RSS-vs-theorique apres factori-
-    ! sation, causes MKL/malloc_trim ecartees) : affiche la RSS du
-    ! processus 0 A CHAQUE etape K, pour voir la FORME de la croissance
-    ! (reguliere = fragmentation continue plausible ; par sauts ponctuels
-    ! = plutot un redimensionnement de workspace qui grossit sans jamais
-    ! retrecir). N'affecte AUCUN resultat -- uniquement des WRITE.
+    ! Diagnostic memoire : affiche la RSS maximale du processus 0 observee
+    ! pendant la factorisation (voir plus bas). N'affecte aucun resultat --
+    ! uniquement un WRITE en fin de boucle.
     LOGICAL, INTENT(IN), OPTIONAL     :: SHOW_RSS_TRACE
     ! USE_MOVE_ALLOC (optionnel, defaut .FALSE.) : transmis tel quel a
     ! SCHUR_UPDATE_BLR_BLOCK (voir blr_compress_mod.f90) -- evite la
@@ -872,30 +855,25 @@ CONTAINS
       END DO
 
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU (pivot)', K, NBLK, PBAR_STATE)
-      ! DEMANDE EXPLICITE (2026-09-01) : n'afficher que le MAXIMUM observe,
-      ! pas une ligne par K -- le detail par etape servait au diagnostic
-      ! initial de l'ecart RSS-vs-theorique (voir examples/README.md), le
-      ! maximum seul suffit en usage courant. Toujours GET_RSS_KB() a
-      ! CHAQUE K (cout negligeable), juste plus de WRITE intermediaire.
+      ! N'affiche que le maximum observe, pas une ligne par K -- le detail
+      ! par etape sert au diagnostic fin de l'ecart RSS-vs-theorique (voir
+      ! examples/README.md), le maximum seul suffit en usage courant.
+      ! Toujours GET_RSS_KB() a chaque K (cout negligeable), juste pas de
+      ! WRITE intermediaire.
       IF (RSS_TRACE) RSS_MAX_MB = MAX(RSS_MAX_MB, REAL(GET_RSS_KB(),8)/1024.0D0)
     END DO
     IF (RSS_TRACE) WRITE(6,'(A,F8.1,A)') '     [RSS trace] MAX observe pendant la factorisation = ', RSS_MAX_MB, ' Mo'
 
     DEALLOCATE(LRECV, URECV)
     CALL BLR_WORKSPACE_FREE(WS)
-    ! BOGUE CORRIGE (2026-09-01, trouve en explorant une visibilite par-
-    ! processus type MPE/Jumpshot -- voir la memoire du projet) : T_FACTOR
-    ! etait affecte a la valeur LOCALE du rang appelant, jamais reduite --
-    ! contrairement a T_DIAG/T_TRSM/etc. de MPI_BLR_MATRIX_LU_FACTOR_NOPIV
-    ! (voir plus haut) qui font deja un MPI_ALLREDUCE(MAX) correct. Sans
-    ! consequence pratique ICI tant que l'appelant lit systematiquement la
-    ! copie du rang 0 (les bancs de ce projet le font tous) ET que la
-    ! synchronisation implicite des broadcasts par etape maintient les
-    ! rangs a peu pres au coude-a-coude -- mais ce n'est PAS garanti en
-    ! toute rigueur (un rang plus charge pourrait rattraper son retard
-    ! PENDANT l'attente sur un broadcast sans que cela n'allonge le T0-a-
-    ! T_WTIME() local du rang 0). Corrige par coherence avec NOPIV : MAX
-    ! reel sur GRID%COMM desormais.
+    ! T_FACTOR est un vrai MAX sur GRID%COMM, jamais la valeur locale du
+    ! rang appelant -- coherent avec T_DIAG/T_TRSM/etc. de MPI_BLR_MATRIX_
+    ! LU_FACTOR_NOPIV (voir plus haut). Necessaire en toute rigueur meme si
+    ! la synchronisation implicite des broadcasts par etape maintient
+    ! generalement les rangs au coude-a-coude : un rang plus charge
+    ! pourrait rattraper son retard pendant l'attente sur un broadcast
+    ! sans que cela n'allonge le T0-a-T_WTIME() local du rang 0, faussant
+    ! une simple lecture de la copie du rang 0.
     IF (PRESENT(T_FACTOR)) THEN
       T_FACTOR_L = MPI_WTIME() - T0
       CALL MPI_ALLREDUCE(T_FACTOR_L, T_FACTOR, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
@@ -911,12 +889,12 @@ CONTAINS
   END SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT
 
   !-----------------------------------------------------------------------
-  ! ETAPE 4 : resolution A*X=B, DISTRIBUTION 2D COMPLETE de B (comme
-  ! mpi_lu_solve_2d_mod.f90 -- ALLGATHERV+diffusion+SCATTERV, RSTARTS/RLOCS
-  ! calcules localement sans communication), mais la contribution
-  ! MI x NRHS de chaque bloc trainant local est calculee via
-  ! BLR_BLOCK_APPLY (exploite directement la compression), PAS un CGEMM
-  ! dense sur tout le panneau -- boucle bloc local par bloc local.
+  ! Resolution A*X=B, distribution 2D complete de B (comme mpi_lu_solve_
+  ! 2d_mod.f90 -- ALLGATHERV+diffusion+SCATTERV, RSTARTS/RLOCS calcules
+  ! localement sans communication), mais la contribution MI x NRHS de
+  ! chaque bloc trainant local est calculee via BLR_BLOCK_APPLY (exploite
+  ! directement la compression), pas un CGEMM dense sur tout le panneau --
+  ! boucle bloc local par bloc local.
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS)
     INCLUDE 'mpif.h'
@@ -1161,17 +1139,16 @@ CONTAINS
       CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
     END DO
 
-    ! === 0) P*B : applique le swap de CHAQUE bloc a B_LOCAL EN UNE FOIS,
-    !     AVANT toute substitution -- IMPORTANT : ceci doit precede TOUTE
-    !     soustraction croisee entre blocs (etape 1 ci-dessous), sinon le
-    !     swap de l'etape K permute aussi les contributions DEJA soustraites
-    !     par les etapes m<K, ce qui est faux (P_K ne doit s'appliquer qu'au
-    !     B ORIGINAL, jamais a une valeur partiellement mise a jour -- bug
-    !     reel trouve et corrige : la version precedente appliquait le swap
-    !     "en ligne" au debut de l'iteration K, trop tard). Chaque processus
-    !     traite uniquement les blocs dont il possede des lignes
-    !     (MYROW==PROW_K) ; IPIV deja diffuse a toute la grille, aucune
-    !     communication necessaire ici. ===
+    ! === 0) P*B : applique le swap de CHAQUE bloc a B_LOCAL en une fois,
+    !     avant toute substitution -- important : ceci doit preceder toute
+    !     soustraction croisee entre blocs (etape 1 ci-dessous), car P_K ne
+    !     doit s'appliquer qu'au B original, jamais a une valeur
+    !     partiellement mise a jour (appliquer le swap de l'etape K "en
+    !     ligne" au debut de l'iteration K permuterait aussi les
+    !     contributions deja soustraites par les etapes m<K, ce qui serait
+    !     faux). Chaque processus traite uniquement les blocs dont il
+    !     possede des lignes (MYROW==PROW_K) ; IPIV deja diffuse a toute la
+    !     grille, aucune communication necessaire ici. ===
     DO K = 1, NBLK
       KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
@@ -1487,11 +1464,8 @@ CONTAINS
   END FUNCTION MPI_BLR_MATRIX_ARENA_MEMORY_BYTES
 
   !-----------------------------------------------------------------------
-  ! DIAGNOSTIC TEMPORAIRE (a retirer une fois l'investigation terminee,
-  ! voir la memoire du projet -- reste ~6x de gaspillage arena apres le
-  ! correctif de reutilisation en place, ~x28 avant) : decompose
-  ! l'empreinte OFFBLK locale (ARENA_BYTES(A_BLR%ARENA)) en 3 categories,
-  ! pour verifier l'hypothese avant de coder quoi que ce soit de plus :
+  ! Diagnostic memoire de l'arena : decompose l'empreinte OFFBLK locale
+  ! (ARENA_BYTES(A_BLR%ARENA)) en 3 categories :
   !
   !   USED_BYTES   : taille LOGIQUE actuelle (ce que BLR_BLOCK_BYTES
   !                  donnerait) -- la donnee VRAIMENT utile.
@@ -2116,8 +2090,8 @@ CONTAINS
   !   - etape 6 : copie-puis-diffuse (COPY_FIXEDCAP_TO_REGULAR, MEME
   !     pattern que l'arena) vers LRECV/URECV (BLR_BLOCK_T ordinaires,
   !     EXACTEMENT dimensionnes au rang reel), PUIS BCAST_BLR_BLOCK
-  !     INCHANGEE -- le volume MPI ne depend QUE du rang REEL, jamais de
-  !     RMAX (demande explicite de l'utilisateur).
+  !     INCHANGEE -- le volume MPI ne depend que du rang reel, jamais de
+  !     RMAX.
   !   - etape 7 : SCHUR_UPDATE_BLR_BLOCK_FIXEDCAP (ecrase en place, ZERO
   !     reallocation apres la premiere compression du bloc) -- pas de
   !     USE_MOVE_ALLOC ici, non pertinent (aucune reallocation a eviter).
@@ -2523,8 +2497,8 @@ CONTAINS
   !=========================================================================
 
   !-----------------------------------------------------------------------
-  ! ETAPE 1 (OOC) : assemblage + compression, IDENTIQUE algorithmiquement a
-  ! MPI_ASSEMBLE_BLR_MATRIX -- seule differences : les blocs diagonaux sont
+  ! Assemblage + compression, identique algorithmiquement a
+  ! MPI_ASSEMBLE_BLR_MATRIX -- seule difference : les blocs diagonaux sont
   ! ecrits directement sur STORE_A (jamais residents en dehors de cette
   ! iteration), les blocs hors-diagonale passent par CACHE_A (borne a
   ! MAX_MB_PER_PROCESS -- l'eviction naturelle du cache pendant la boucle
@@ -2550,19 +2524,18 @@ CONTAINS
     INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
     INTEGER(8), INTENT(OUT)         :: RANK_SUM
     LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
-    ! DIAGNOSTIC (demande explicite -- evaluer si une SVD randomisee vaut le
-    ! coup a la place de CGESVD dans COMPRESS_BLOCK) : T_GET_BLOCK cumule le
-    ! temps dans TOUS les appels GET_BLOCK ; T_COMPRESS cumule le temps dans
-    ! TOUS les appels COMPRESS_BLOCK (SVD complete) ; T_IO cumule le temps
+    ! DIAGNOSTIC (utile pour evaluer si une SVD randomisee vaut le coup a
+    ! la place de CGESVD dans COMPRESS_BLOCK) : T_GET_BLOCK cumule le
+    ! temps dans tous les appels GET_BLOCK ; T_COMPRESS cumule le temps dans
+    ! tous les appels COMPRESS_BLOCK (SVD complete) ; T_IO cumule le temps
     ! d'ecriture disque (bloc diagonal, insertion dans CACHE_A -- qui peut
     ! evincer donc ecrire d'autres blocs -- et le flush final des deux
     ! caches). Optionnels, aucun surcout si absents.
     !
-    ! BOGUE CORRIGE (2026-09-01, meme correctif que MPI_ASSEMBLE_BLR_MATRIX
-    ! ci-dessus, voir son commentaire pour le detail) : T_ASSEMBLE_COMPRESS/
-    ! T_GET_BLOCK/T_COMPRESS/T_IO etaient tous des valeurs LOCALES jamais
-    ! reduites. Desormais un vrai MAX sur GRID%COMM ; _MIN optionnels en
-    ! plus pour reveler un desequilibre de charge entre processus.
+    ! T_ASSEMBLE_COMPRESS/T_GET_BLOCK/T_COMPRESS/T_IO sont un vrai MAX sur
+    ! GRID%COMM (voir le commentaire equivalent sur MPI_ASSEMBLE_BLR_MATRIX
+    ! ci-dessus pour la justification) ; _MIN optionnels en plus pour
+    ! reveler un desequilibre de charge entre processus.
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_GET_BLOCK, T_COMPRESS, T_IO
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_GET_BLOCK_MIN, T_COMPRESS_MIN, T_IO_MIN
     ! Voir MPI_ASSEMBLE_BLR_MATRIX pour le detail (USE_RSVD/RSVD_OVERSAMPLE/
@@ -2678,13 +2651,12 @@ CONTAINS
   END SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_OOC
 
   !-----------------------------------------------------------------------
-  ! ETAPE 2 (OOC) : assemblage du second membre, SEPAREMENT de la matrice
-  ! (fichier scratch propre, prefixe "b"), par PAQUETS d'au plus
-  ! NRHS_BATCH colonnes GLOBALES -- chaque paquet assemble est ECRIT SUR
-  ! DISQUE puis LIBERE avant de passer au suivant (voir OOC_RHS_T) : la
-  ! memoire a cette etape est bornee par NRHS_BATCH, jamais par NRHS total,
-  ! meme si les etapes restent SEPAREES (demande explicite -- pas question
-  ! ici de fusionner assemblage et resolution du second membre).
+  ! Assemblage du second membre, separement de la matrice (fichier
+  ! scratch propre, prefixe "b"), par paquets d'au plus NRHS_BATCH
+  ! colonnes globales -- chaque paquet assemble est ecrit sur disque puis
+  ! libere avant de passer au suivant (voir OOC_RHS_T) : la memoire a
+  ! cette etape est bornee par NRHS_BATCH, jamais par NRHS total.
+  ! L'assemblage reste une etape separee de la resolution.
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_ASSEMBLE_RHS_OOC(GRID, A_BLR, NRHS, NRHS_BATCH, FILL_RHS, SCRATCH_DIR, RHS)
     INCLUDE 'mpif.h'
@@ -2775,10 +2747,10 @@ CONTAINS
   END FUNCTION MPI_BLR_MATRIX_OOC_RESIDENT_BYTES
 
   !-----------------------------------------------------------------------
-  ! ETAPE 3 (OOC) : factorisation LU EN PLACE, AVEC PIVOT -- MEME
-  ! algorithme EXACT que MPI_BLR_MATRIX_LU_FACTOR_PIVOT (voir son
-  ! commentaire de tete pour le detail complet), avec des points de
-  ! CHARGEMENT/ECRITURE explicites la ou l'original lit/ecrit
+  ! Factorisation LU en place, avec pivot -- meme algorithme exact que
+  ! MPI_BLR_MATRIX_LU_FACTOR_PIVOT (voir son commentaire de tete pour le
+  ! detail complet), avec des points de chargement/ecriture explicites la
+  ! ou l'original lit/ecrit
   ! A_BLR%DIAGBLK(K)%D ou A_BLR%OFFBLK(li,lj) directement :
   !   - DIAGBLK : passe par CACHE_D (voir blr_ooc_mod.f90), meme principe
   !     LRU que CACHE_A -- un bloc diagonal reste resident entre deux
@@ -2800,16 +2772,13 @@ CONTAINS
   !     borner la RAM, aucune logique de "streaming par colonne" explicite
   !     necessaire.
   !
-  ! RESOLU (etait "limite connue v1") : OOC_CACHE_GET/OOC_DIAG_CACHE_GET
-  ! faisaient a l'origine une recherche LINEAIRE parmi les emplacements du
-  ! cache a CHAQUE acces (meme un acces DEJA RESIDENT) -- mesure comme un
-  ! cout significatif meme a budget genereux (peu d'evictions), voir la
-  ! memoire du projet. Remplace par un lookup DIRECT O(1) (SLOT_OF(li,lj)/
-  ! SLOT_OF(K), voir blr_ooc_mod.f90) + une pile d'emplacements libres
-  ! (FREE_STACK) pour l'insertion -- seule la recherche du bloc LRU a
-  ! evincer (OOC_CACHE_MAKE_ROOM/OOC_DIAG_CACHE_MAKE_ROOM) reste lineaire,
-  ! mais seulement lors d'un MISS necessitant une eviction, pas a chaque
-  ! acces.
+  ! OOC_CACHE_GET/OOC_DIAG_CACHE_GET utilisent un lookup direct O(1)
+  ! (SLOT_OF(li,lj)/SLOT_OF(K), voir blr_ooc_mod.f90) + une pile
+  ! d'emplacements libres (FREE_STACK) pour l'insertion, plutot qu'une
+  ! recherche lineaire parmi les emplacements du cache a chaque acces --
+  ! seule la recherche du bloc LRU a evincer (OOC_CACHE_MAKE_ROOM/
+  ! OOC_DIAG_CACHE_MAKE_ROOM) reste lineaire, mais seulement lors d'un
+  ! miss necessitant une eviction, pas a chaque acces.
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC(GRID, A_BLR, TOL, INFO, &
                                                  N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
@@ -2827,7 +2796,7 @@ CONTAINS
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_FACTOR
     LOGICAL, INTENT(IN), OPTIONAL         :: SHOW_PROGRESS
     LOGICAL, INTENT(IN), OPTIONAL         :: SHOW_RSS_TRACE
-    ! DIAGNOSTIC (demande explicite -- isoler ou part le temps de la
+    ! DIAGNOSTIC (utile pour isoler ou part le temps de la
     ! factorisation OOC face au classique) : T_CACHE_GET cumule le temps
     ! passe dans TOUS les appels OOC_CACHE_GET/OOC_DIAG_CACHE_GET (lookup
     ! O(1) + lecture disque quand le bloc n'est pas deja resident) ;
@@ -2845,15 +2814,9 @@ CONTAINS
     ! OOC_T plus haut : c'est le signe que le budget est sous l'ensemble
     ! de travail reel, augmenter MAX_MB_PER_PROCESS est le seul vrai levier.
     !
-    ! BOGUE CORRIGE (2026-09-01, exploration d'une visibilite par-processus
-    ! type MPE/Jumpshot, indisponible dans cet environnement -- voir la
-    ! memoire du projet) : ces 4 sorties etaient jusqu'ici affectees a la
-    ! valeur LOCALE du rang appelant (pas de reduction), CONTRAIREMENT a
-    ! T_DIAG/T_TRSM/etc. de MPI_BLR_MATRIX_LU_FACTOR_NOPIV qui font deja un
-    ! MPI_ALLREDUCE(MAX) correct -- incoherence introduite lors de l'ajout
-    ! de ce diagnostic sur la variante OOC, jamais alignee sur la
-    ! convention NOPIV. Corrige : T_CACHE_GET/T_CACHE_EVICT/T_COMPUTE/
-    ! T_MPICALL sont maintenant un vrai MAX sur GRID%COMM. Nouveaux
+    ! T_CACHE_GET/T_CACHE_EVICT/T_COMPUTE/T_MPICALL sont un vrai MAX sur
+    ! GRID%COMM, jamais la valeur locale du rang appelant -- coherent avec
+    ! T_DIAG/T_TRSM/etc. de MPI_BLR_MATRIX_LU_FACTOR_NOPIV. Nouveaux
     ! _MIN (optionnels, meme cout : un MPI_ALLREDUCE de plus par
     ! categorie) donnent en prime un INDICATEUR DE DESEQUILIBRE DE CHARGE
     ! direct : un ecart MAX/MIN important sur T_CACHE_GET par exemple
@@ -3116,9 +3079,9 @@ CONTAINS
       END DO
 
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU ooc (pivot)', K, NBLK, PBAR_STATE)
-      ! DEMANDE EXPLICITE (2026-09-01) : n'afficher que le MAXIMUM observe
-      ! (RSS et cache resident), pas une ligne par K -- voir le commentaire
-      ! equivalent sur MPI_BLR_MATRIX_LU_FACTOR_PIVOT (version classique).
+      ! N'affiche que le maximum observe (RSS et cache resident), pas une
+      ! ligne par K -- voir le commentaire equivalent sur MPI_BLR_MATRIX_
+      ! LU_FACTOR_PIVOT (version classique).
       IF (RSS_TRACE) THEN
         RSS_MAX_MB = MAX(RSS_MAX_MB, REAL(GET_RSS_KB(),8)/1024.0D0)
         CACHE_MAX_MB = MAX(CACHE_MAX_MB, REAL(A_BLR%CACHE_A%USED_BYTES+A_BLR%CACHE_D%USED_BYTES,8)/1024.0D0/1024.0D0)
@@ -3174,16 +3137,16 @@ CONTAINS
   END FUNCTION LOCAL_ROW_OFFSET_OOC
 
   !-----------------------------------------------------------------------
-  ! ETAPE 4 (OOC) : resolution, PAR PAQUETS d'au plus NRHS_BATCH colonnes
-  ! GLOBALES (RHS, deja assemble sur disque par MPI_ASSEMBLE_RHS_OOC).
-  ! Pour CHAQUE paquet : lit B depuis RHS%STORE_B (APPEND-ONLY, jamais
-  ! recycle -- chaque paquet n'est lu qu'une fois, jamais reutilise entre
-  ! paquets, un cache n'apporterait rien ici), execute EXACTEMENT
-  ! l'algorithme de MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D (substitution avant
-  ! PUIS arriere) avec WIDTH=largeur du paquet en guise de "NRHS", puis
-  ! appelle CONSUME_X_BATCH avec la solution de ce paquet avant de passer
-  ! au suivant -- la memoire de CE FLUX (B, X) est bornee par NRHS_BATCH,
-  ! jamais par NRHS total (demande explicite).
+  ! Resolution, par paquets d'au plus NRHS_BATCH colonnes globales (RHS,
+  ! deja assemble sur disque par MPI_ASSEMBLE_RHS_OOC). Pour chaque
+  ! paquet : lit B depuis RHS%STORE_B (append-only, jamais recycle --
+  ! chaque paquet n'est lu qu'une fois, jamais reutilise entre paquets, un
+  ! cache n'apporterait rien ici), execute exactement l'algorithme de
+  ! MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D (substitution avant puis arriere) avec
+  ! WIDTH=largeur du paquet en guise de "NRHS", puis appelle
+  ! CONSUME_X_BATCH avec la solution de ce paquet avant de passer au
+  ! suivant -- la memoire de ce flux (B, X) est bornee par NRHS_BATCH,
+  ! jamais par NRHS total.
   !
   ! DIAGBLK/OFFBLK, EUX, sont LUS VIA CACHE_A/CACHE_D (memes caches que la
   ! factorisation, reutilises TELS QUELS -- ils sont vides apres le flush

@@ -1,13 +1,9 @@
 !===============================================================================
-! Utilitaire de benchmark : memoire REELLE (RSS, "Resident Set Size") du
-! processus courant, lue directement dans /proc/self/status (specifique
-! Linux/WSL2, l'environnement de developpement de ce projet). Complement
-! aux compteurs ANALYTIQUES deja existants (BLR_FACTORED_LU_MEMORY_BYTES,
-! proposition 2) : RSS mesure la memoire REELLEMENT allouee par l'OS pour
-! CE processus a l'instant de l'appel (tableaux de travail, allocateur
-! runtime inclus), pas seulement la taille theorique d'une structure de
-! donnees precise -- les deux sont rapportes cote a cote dans les
-! benchmarks pour se recouper.
+! Memoire reellement allouee par l'OS au processus courant (RSS, "Resident
+! Set Size"), lue dans /proc/self/status (Linux uniquement). Complement aux
+! compteurs analytiques de taille de structure de donnees : la RSS englobe
+! aussi les tableaux de travail transitoires et l'allocateur runtime, et
+! les deux mesures sont rapprochees dans les benchmarks.
 !===============================================================================
 MODULE BENCH_UTILS_MOD
   IMPLICIT NONE

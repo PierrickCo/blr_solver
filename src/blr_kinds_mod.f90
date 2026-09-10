@@ -1,9 +1,8 @@
 !===============================================================================
-! Parametre de precision partage par TOUS les modules du solveur -- doit
-! etre le SEUL endroit ou WP est defini (sinon "USE"-associer deux modules
-! qui redefinissent chacun leur propre WP, meme a la meme valeur, est une
-! reference ambigue pour le compilateur -- rencontre en pratique en
-! ecrivant les tests de l'etape 2).
+! Parametre de precision partage par l'ensemble du solveur. Doit rester le
+! SEUL endroit ou WP est defini : deux modules redefinissant chacun leur
+! propre WP, meme a la meme valeur, produisent une reference ambigue a la
+! compilation des qu'ils sont USE-associes ensemble.
 !===============================================================================
 MODULE BLR_KINDS_MOD
   IMPLICIT NONE

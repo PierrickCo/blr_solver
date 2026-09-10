@@ -1,9 +1,9 @@
 !===============================================================================
 ! OUT-OF-CORE (OOC) -- stockage disque des blocs BLR persistants pour la
-! variante MPI_BLR_MATRIX_OOC_T (mpi_blr_matrix_mod.f90), demandee
-! explicitement pour ne plus etre limite par la RAM disponible (ni pour la
-! matrice assemblee, ni pour les facteurs LU apres remplissage de Schur, ni
-! pour un second membre massif).
+! variante MPI_BLR_MATRIX_OOC_T (mpi_blr_matrix_mod.f90), pour ne plus
+! etre limite par la RAM disponible (ni pour la matrice assemblee, ni pour
+! les facteurs LU apres remplissage de Schur, ni pour un second membre
+! massif).
 !
 ! PRINCIPE GENERAL : chaque processus MPI possede son PROPRE fichier scratch
 ! local (jamais partage -- la distribution 2D-cyclique existante garantit
@@ -11,8 +11,8 @@
 ! coordination inter-processus n'est necessaire pour l'OOC lui-meme).
 ! Fichier ouvert en ACCES FLUX (ACCESS='STREAM').
 !
-! DEUX POLITIQUES D'ECRITURE ont coexiste au cours du developpement de ce
-! module -- SEULE la seconde est utilisee desormais (DIAGBLK et OFFBLK) :
+! DEUX POLITIQUES D'ECRITURE, utilisees selon le type de contenu (DIAGBLK
+! et OFFBLK utilisent toujours la seconde) :
 !   - APPEND-ONLY (OOC_WRITE_BLOCK_RAW) : un bloc reecrit ajoute un NOUVEL
 !     enregistrement en fin de fichier plutot que d'ecraser en place --
 !     l'ancien enregistrement devient orphelin. Encore utilisee pour le
@@ -31,8 +31,7 @@
 !     rang COURANT, jamais tout le pire cas reserve -- aucun octet
 !     orphelin, contrairement a l'append-only. Sans cette politique, un
 !     bloc touche par NBLK mises a jour de Schur gonflerait le fichier en
-!     O(NBLK^2), soit O(N^2) -- mesure et documente dans l'historique du
-!     projet, initialement seulement pour DIAGBLK puis etendu a OFFBLK.
+!     O(NBLK^2), soit O(N^2).
 !
 ! TROIS NIVEAUX AU-DESSUS DU FICHIER :
 !   1) OOC_STORE_T / OOC_WRITE_BLOCK_RAW / OOC_WRITE_BLOCK_FIXED /
@@ -95,12 +94,10 @@ MODULE BLR_OOC_MOD
   END TYPE OOC_CACHE_SLOT_T
 
   ! SLOT_OF(li,lj) : indice du slot residant pour ce bloc, 0 si absent --
-  ! lookup DIRECT O(1), remplace la recherche LINEAIRE O(NSLOTS) d'origine
-  ! (limite connue "v1" : meme un ACCES DEJA RESIDENT payait un scan complet
-  ! de tous les emplacements a chaque appel, cout qui ne depend PAS du taux
-  ! d'eviction -- mesure comme significatif meme a budget genereux, voir la
-  ! memoire du projet). FREE_STACK/NFREE : pile des emplacements libres,
-  ! evite AUSSI un scan lineaire pour trouver ou inserer un nouveau bloc.
+  ! lookup direct O(1) (une recherche lineaire O(NSLOTS) couterait cher
+  ! meme pour un acces deja resident, quel que soit le taux d'eviction).
+  ! FREE_STACK/NFREE : pile des emplacements libres, evite aussi un scan
+  ! lineaire pour trouver ou inserer un nouveau bloc.
   TYPE :: OOC_CACHE_T
     TYPE(OOC_CACHE_SLOT_T), ALLOCATABLE :: SLOTS(:)
     INTEGER, ALLOCATABLE :: SLOT_OF(:,:)

@@ -1,52 +1,44 @@
 !===============================================================================
-! PROPOSITION 3 (post-etape 6) : diffuser les panneaux L21/U12 DEJA
-! COMPRESSES au lieu de diffuser dense puis compresser apres reception
-! (ce que fait 6e/mpi_blr_lu_pivot_mod.f90). Deux gains, pas un seul :
+! Diffuse les panneaux L21/U12 deja compresses au lieu de diffuser dense
+! puis compresser apres reception. Deux gains :
 !   1) VOLUME DE COMMUNICATION : si le panneau compresse (rang R << KW),
-!      on envoie UFAC (MxR) + VFAC (RxN) au lieu du bloc dense MxN --
-!      un vrai gain propre au distribue, sans equivalent sequentiel
-!      (signale comme piste a l'etape 6e, non faite a l'epoque pour
-!      garder ce premier passage BLR+MPI simple).
-!   2) CALCUL REDONDANT EVITE (le vrai declencheur de cette proposition,
-!      trouve en relisant 6e attentivement) : en 6e, TOUS les processus
-!      RECEVANT la diffusion dense recompressent INDEPENDAMMENT (CGESVD)
-!      la MEME donnee recue -- P processus recepteurs = P appels CGESVD
-!      redondants sur des donnees identiques. Compresser UNE FOIS a la
-!      source, avant diffusion, elimine cette redondance completement,
-!      QUE le bloc soit compressible ou non.
+!      on envoie UFAC (MxR) + VFAC (RxN) au lieu du bloc dense MxN -- un
+!      gain propre au distribue, sans equivalent sequentiel.
+!   2) CALCUL REDONDANT EVITE : diffuser un panneau dense fait recompresser
+!      independamment (CGESVD) la meme donnee par chacun des P processus
+!      recepteurs -- P appels CGESVD redondants sur des donnees
+!      identiques. Compresser une fois a la source, avant diffusion,
+!      elimine cette redondance completement, que le bloc soit
+!      compressible ou non.
 !
-! MECANISME (BCAST_BLR_BLOCK, ci-dessous) : la SOURCE (qui a deja le bloc
-! dense ET vient de le compresser) diffuse d'abord un petit ENTETE (2
-! entiers : is_lowrank, rank) pour que les RECEPTEURS sachent QUOI
-! allouer/recevoir (la taille du buffer n'est plus fixe d'avance, contrai-
-! rement a 6c/6d/6e ou LBUF/UBUF ont toujours une taille connue de tous
-! sans communication) -- PREMIER usage dans ce projet d'un motif "diffuser
-! la FORME avant de diffuser les DONNEES". Puis diffusion des donnees
-! elles-memes (UFAC+VFAC si basse-rang, DENSE sinon).
+! MECANISME (BCAST_BLR_BLOCK, ci-dessous) : la source (qui a deja le bloc
+! dense et vient de le compresser) diffuse d'abord un petit entete (2
+! entiers : is_lowrank, rank) pour que les recepteurs sachent quoi
+! allouer/recevoir (la taille du buffer n'est pas fixe d'avance). Puis
+! diffusion des donnees elles-memes (UFAC+VFAC si basse-rang, DENSE
+! sinon).
 !
-! CAVEAT REEL DECOUVERT EN TESTANT (pas un bug, une propriete numerique a
-! connaitre) : le seuil "rentable" de COMPRESS_BLOCK (etape 2 --
-! RANG < 0.8*MIN(M,N)) a ete calibre pour un compromis EN FLOPS (le GEMM
-! basse-rang devient moins cher que le GEMM dense), PAS pour un compromis
-! EN OCTETS. Pour un bloc PRESQUE CARRE (M proche de N), le seuil OU la
-! compression economise reellement de la memoire/bande passante est PLUS
-! STRICT (RANG < M*N/(M+N), environ MIN(M,N)/2 pour un bloc carre) que le
-! seuil "rentable pour les flops" -- un bloc peut donc etre marque
-! "compresse" (et accelerer le GEMM) SANS pour autant reduire le volume
-! envoye ici, voire l'augmenter legerement (UFAC+VFAC > DENSE). Observe
-! concretement sur N=60,NB=5 (blocs quasi carres en fin de matrice) :
-! 101.2% du volume dense au lieu d'une reduction. Ce n'est PAS un
-! probleme pour un usage BLR realiste (NB << N, panneaux L21/U12
-! largement rectangulaires la plupart du temps) -- confirme par le reste
-! du balayage de test (N=120-200, NB=8-10 : 66.9%-75.0% du volume dense,
-! reduction reelle et systematique). A garder en tete si on reduit un
-! jour NB en-dessous du rang typique des blocs.
+! PROPRIETE NUMERIQUE A CONNAITRE (pas un bug) : le seuil "rentable" de
+! COMPRESS_BLOCK (RANG < 0.8*MIN(M,N)) est calibre pour un compromis en
+! FLOPS (le GEMM basse-rang devient moins cher que le GEMM dense), pas
+! pour un compromis en octets. Pour un bloc presque carre (M proche de N),
+! le seuil ou la compression economise reellement de la memoire/bande
+! passante est plus strict (RANG < M*N/(M+N), environ MIN(M,N)/2 pour un
+! bloc carre) que le seuil "rentable pour les flops" -- un bloc peut donc
+! etre marque "compresse" (et accelerer le GEMM) sans pour autant reduire
+! le volume envoye ici, voire l'augmenter legerement (UFAC+VFAC > DENSE).
+! Mesure sur N=60,NB=5 (blocs quasi carres en fin de matrice) : 101.2% du
+! volume dense au lieu d'une reduction. Sans consequence pour un usage BLR
+! realiste (NB << N, panneaux L21/U12 largement rectangulaires la plupart
+! du temps) : N=120-200, NB=8-10 donne 66.9%-75.0% du volume dense, une
+! reduction reelle et systematique. A garder en tete si NB descend
+! en-dessous du rang typique des blocs.
 !
-! RESTE INCHANGE PAR RAPPORT A 6e : la structure generale (phases A-E de
-! 6d/6e : rassembler-factoriser-renvoyer le panneau pivote, propager les
+! Structure generale identique aux autres variantes MPI+pivot de ce
+! solveur (rassembler-factoriser-renvoyer le panneau pivote, propager les
 ! echanges de lignes), le calcul dense de U12 par CTRSM (petit bloc DKK,
 ! toujours diffuse dense -- KW<=NB, jamais interessant a compresser), et
-! le dispatch SCHUR_UPDATE_BLOCK final. SEULE la diffusion de LBUF/UBUF
+! le dispatch SCHUR_UPDATE_BLOCK final. Seule la diffusion de LBUF/UBUF
 ! change de "dense puis compresser cote recepteur" a "compresser cote
 ! source puis diffuser compresse".
 !===============================================================================
@@ -65,23 +57,20 @@ CONTAINS
   ! ROOT doit avoir BLK deja rempli (dense ou basse-rang) ; les AUTRES
   ! membres recoivent un BLK entierement neuf (alloue ici).
   !-----------------------------------------------------------------------
-  ! CONCATENATION UFAC+VFAC (demande explicite : un appel MPI_BCAST de
-  ! moins) : au lieu de diffuser UFAC (MxR) puis VFAC (RxN) separement (2
-  ! appels), on les empile dans un buffer 1D contigu BUF (taille M*R+R*N)
-  ! et on diffuse BUF en UN SEUL appel -- 2 appels au lieu de 3 par panneau
-  ! compresse (header + BUF, au lieu de header + UFAC + VFAC), donc ~33% de
-  ! moins de rendez-vous collectifs sur le chemin dominant (latence, pas
-  ! bande passante, a cette taille de probleme -- voir l'echange avec
-  ! l'utilisateur qui a motive ce changement). RESHAPE cree une copie
-  ! temporaire (empilage/depilage) -- cout negligeable (M*R+R*N, PETIT vu
-  ! que R<<NB) compare a l'aller-retour MPI economise.
-  ! T_ALLOC/T_MPICALL (optionnels, INTENT(INOUT), CUMULES par l'appelant --
-  ! initialiser a 0 avant la premiere boucle) : instrumentation demandee
-  ! pour mesurer separement (a) le cout du DEALLOCATE/ALLOCATE de
-  ! UFAC/VFAC/DENSE cote recepteur (voir commentaire ci-dessous -- ce cout
-  ! existe car BLK est INTENT(INOUT), pas INTENT(OUT)) et (b) le temps
-  ! passe dans les appels MPI_BCAST eux-memes. Non fournis : comportement
-  ! et cout inchanges.
+  ! CONCATENATION UFAC+VFAC (un appel MPI_BCAST de moins) : au lieu de
+  ! diffuser UFAC (MxR) puis VFAC (RxN) separement (2 appels), les deux
+  ! sont empiles dans un buffer 1D contigu BUF (taille M*R+R*N), diffuse en
+  ! un seul appel -- 2 appels au lieu de 3 par panneau compresse (header +
+  ! BUF, au lieu de header + UFAC + VFAC), donc environ un tiers de moins
+  ! de rendez-vous collectifs sur le chemin dominant. RESHAPE cree une
+  ! copie temporaire (empilage/depilage) -- cout negligeable (M*R+R*N,
+  ! petit vu que R<<NB) compare a l'aller-retour MPI economise.
+  ! T_ALLOC/T_MPICALL (optionnels, INTENT(INOUT), cumules par l'appelant --
+  ! initialiser a 0 avant la premiere boucle) : mesurent separement (a) le
+  ! cout du DEALLOCATE/ALLOCATE de UFAC/VFAC/DENSE cote recepteur (voir
+  ! commentaire ci-dessous -- ce cout existe car BLK est INTENT(INOUT), pas
+  ! INTENT(OUT)) et (b) le temps passe dans les appels MPI_BCAST eux-memes.
+  ! Non fournis : comportement et cout inchanges.
   SUBROUTINE BCAST_BLR_BLOCK(COMM, ROOT, M, N, BLK, T_ALLOC, T_MPICALL)
     INCLUDE 'mpif.h'
     INTEGER, INTENT(IN)             :: COMM, ROOT, M, N
@@ -155,20 +144,19 @@ CONTAINS
   END SUBROUTINE BCAST_BLR_BLOCK
 
   !-----------------------------------------------------------------------
-  ! Identique a MPI_BLR_LU_PIVOT_FACTOR (6e) sauf la toute fin de chaque
-  ! etape de bloc : compresse LBUF/UBUF cote source AVANT diffusion (au
-  ! lieu de diffuser dense puis compresser cote recepteur).
+  ! Meme structure generale que MPI_LU_PIVOT_FACTOR (mpi_lu_pivot_mod.f90)
+  ! sauf la toute fin de chaque etape de bloc : compresse LBUF/UBUF cote
+  ! source avant diffusion (au lieu de diffuser dense puis compresser cote
+  ! recepteur).
   !-----------------------------------------------------------------------
-  ! T_BCAST (optionnel, NOUVEAU) : temps CUMULE (max/processus) passe DANS
-  ! les 2 appels BCAST_BLR_BLOCK -- a comparer directement au T_BCAST
-  ! equivalent de 6e (mpi_blr_lu_pivot_mod.f90) pour verifier l'hypothese
-  ! de serialisation discutee avec l'utilisateur : ICI, un rang NON-source
-  ! qui atteint BCAST_BLR_BLOCK est deja bloque en attente pendant que LA
-  ! SOURCE (et elle seule) termine sa compression AVANT de pouvoir emettre
-  ! quoi que ce soit -- ce temps d'attente est comptabilise DANS T_BCAST
-  ! (pas dans T_COMPRESS, qui ne mesure que le calcul de la source), donc
-  ! si l'hypothese est correcte, T_BCAST(P3) doit etre visiblement plus
-  ! grand que T_BCAST(6e) a compression egale.
+  ! T_BCAST (optionnel) : temps cumule (max/processus) passe dans les 2
+  ! appels BCAST_BLR_BLOCK. Un rang non-source qui atteint BCAST_BLR_BLOCK
+  ! est deja bloque en attente pendant que la source (et elle seule)
+  ! termine sa compression avant de pouvoir emettre quoi que ce soit -- ce
+  ! temps d'attente est comptabilise dans T_BCAST (pas dans T_COMPRESS, qui
+  ! ne mesure que le calcul de la source) : cette serialisation source-puis-
+  ! diffusion est le cout a mettre en balance avec le gain de volume de
+  ! communication documente en tete de fichier.
   SUBROUTINE MPI_BLR_LU_PIVOT_BCAST_FACTOR(GRID, N, NB, A_LOCAL, MLOC, NLOC, TOL, &
                                             IPIV_GLOBAL, INFO, N_COMPRESSED, N_TOTAL_PANELS, &
                                             RANK_SUM, BYTES_SENT, BYTES_DENSE_EQUIV, N_SWAPS, MIN_PIVOT, &
@@ -183,7 +171,7 @@ CONTAINS
     INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_TOTAL_PANELS
     INTEGER(8), INTENT(OUT)         :: RANK_SUM
     INTEGER(8), INTENT(OUT)         :: BYTES_SENT        ! diagnostic : volume REEL envoye (compresse)
-    INTEGER(8), INTENT(OUT)         :: BYTES_DENSE_EQUIV ! diagnostic : ce que 6e aurait envoye (dense)
+    INTEGER(8), INTENT(OUT)         :: BYTES_DENSE_EQUIV ! diagnostic : ce que la diffusion dense aurait envoye
     INTEGER, INTENT(OUT), OPTIONAL  :: N_SWAPS
     REAL(WP), INTENT(OUT), OPTIONAL :: MIN_PIVOT
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_COMPRESS, T_BCAST
@@ -227,7 +215,7 @@ CONTAINS
       INFO_STEP = 0
 
       ! === A+B+C : rassembler le panneau, factoriser (CGETRF), renvoyer
-      !     (identique a 6d/6e) ===
+      !     (rassembler-factoriser-renvoyer le panneau) ===
       IF (GRID%MYCOL .EQ. PCOL_K) THEN
         RSTART0    = NUMROC(KSTART-1, NB, GRID%MYROW, GRID%PR)
         NROWS_MINE = MLOC - RSTART0
@@ -315,7 +303,7 @@ CONTAINS
       CALL MPI_BCAST(IPIV_PANEL_GLOBAL, KW, MPI_INTEGER, OWNER_RANK, GRID%COMM, IERR)
       IPIV_GLOBAL(KSTART:KEND) = IPIV_PANEL_GLOBAL(1:KW)
 
-      ! === E : propager les echanges de lignes (identique a 6d/6e) ===
+      ! === E : propager les echanges de lignes (rassembler-factoriser-renvoyer le panneau) ===
       LEFT_COUNT  = NUMROC(KSTART-1, NB, GRID%MYCOL, GRID%PC)
       RIGHT_COUNT = NLOC - NUMROC(KEND, NB, GRID%MYCOL, GRID%PC)
       DO I = 1, KW
@@ -335,7 +323,7 @@ CONTAINS
         END IF
       END DO
 
-      ! === F : U12 par CTRSM (identique a 6d/6e), puis compression A LA
+      ! === F : U12 par CTRSM, puis compression A LA
       !     SOURCE + diffusion COMPRESSEE (nouveaute de cette proposition) ===
       RTRAIL0   = NUMROC(KEND, NB, GRID%MYROW, GRID%PR)
       CTRAIL0   = NUMROC(KEND, NB, GRID%MYCOL, GRID%PC)

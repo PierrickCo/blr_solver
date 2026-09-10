@@ -1,35 +1,30 @@
 !===============================================================================
-! ARENA (pool memoire) POUR LE STOCKAGE PERSISTANT DES BLOCS BLR HORS-
-! DIAGONALE PENDANT UNE FACTORISATION MPI_BLR_MATRIX_LU_FACTOR_PIVOT_ARENA
-! (voir mpi_blr_matrix_mod.f90) -- correctif "lourd" identifie et documente
-! dans la memoire du projet apres une investigation methodique de l'ecart
-! RSS-vs-theorique (~39 Mo/processus non expliques a N=20000, 4 hypotheses
-! plus legeres testees et ecartees : cache MKL, malloc_trim, MOVE_ALLOC,
-! seuil mmap -- voir examples/README.md).
+! ARENA (pool memoire) pour le stockage persistant des blocs BLR hors-
+! diagonale pendant une factorisation MPI_BLR_MATRIX_LU_FACTOR_PIVOT_ARENA
+! (voir mpi_blr_matrix_mod.f90) -- reponse a la fragmentation de tas
+! provoquee par le cycle allocate/deallocate individuel de chaque bloc
+! (voir examples/README.md pour la mesure de l'ecart RSS-vs-theorique
+! ayant motive cette conception).
 !
-! PRINCIPE : au lieu de laisser CHAQUE bloc BLR_BLOCK_T faire son propre
+! PRINCIPE : au lieu de laisser chaque bloc BLR_BLOCK_T faire son propre
 ! ALLOCATE/DEALLOCATE a chaque recompression (des milliers de cycles de
-! tailles VARIABLES pendant une factorisation, cause de la fragmentation
-! de tas observee), on reserve de GROS buffers ("chunks") a l'avance et on
-! y DECOUPE des vues (pointeurs) pour chaque bloc -- glibc ne voit alors
-! qu'une poignee de GRANDES allocations (une par chunk), jamais les
+! tailles variables pendant une factorisation, source de la fragmentation
+! de tas), de gros buffers ("chunks") sont reserves a l'avance, et des vues
+! (pointeurs) y sont decoupees pour chaque bloc -- glibc ne voit alors
+! qu'une poignee de grandes allocations (une par chunk), jamais les
 ! milliers de petites.
 !
 ! POURQUOI UN ARENA COUVRANT TOUTE LA FACTORISATION (pas un arena par
-! etape K, comme envisage initialement) : le stockage d'un bloc doit
-! SURVIVRE au-dela d'une seule etape K (il est relu/remis a jour a des
-! etapes ulterieures) -- un arena vide a chaque fin d'etape detruirait a
-! tort des blocs encore necessaires.
+! etape K) : le stockage d'un bloc doit survivre au-dela d'une seule etape
+! K (il est relu/remis a jour a des etapes ulterieures) -- un arena vide a
+! chaque fin d'etape detruirait a tort des blocs encore necessaires.
 !
-! COMPROMIS ASSUME (mesure, pas suppose -- voir examples/README.md pour
-! les chiffres) : cet arena ne RECUPERE JAMAIS l'espace d'un bloc
-! remplace par une nouvelle version (pas de compaction, cf. discussion
-! sur les limites fondamentales des allocateurs C/Fortran -- un pointeur
-! deja distribue ne peut pas etre deplace). L'arena peut donc consommer
-! PLUS de memoire au pic qu'une gestion bloc-par-bloc, en echange de
-! l'elimination de la fragmentation de tas -- c'est exactement le
-! compromis a mesurer en comparant aux executables existants (jamais
-! modifies, voir mpi_blr_matrix_mod.f90).
+! COMPROMIS ASSUME (voir examples/README.md pour les chiffres) : cet arena
+! ne recupere jamais l'espace d'un bloc remplace par une nouvelle version
+! (pas de compaction -- un pointeur deja distribue ne peut pas etre
+! deplace). L'arena peut donc consommer plus de memoire au pic qu'une
+! gestion bloc-par-bloc, en echange de l'elimination de la fragmentation
+! de tas.
 !
 ! POURQUOI CHUNKS(:) EST UN TABLEAU DE TAILLE FIXE (ARENA_MAX_CHUNKS), PAS
 ! ALLOCATABLE : agrandir un tableau ALLOCATABLE de types derives a
@@ -140,9 +135,9 @@ CONTAINS
   ! BLR_BLOCK_ARENA_T%UFAC_FLAT) s'il est deja assez grand -- ne carve un
   ! NOUVEAU chunk QUE si FLAT est encore non-associe ou trop petit.
   !
-  ! Correctif du gaspillage x28 mesure avec l'arena "pleine factorisation"
-  ! en carve-systematique (voir la memoire du projet) : un bloc dont la
-  ! taille de stockage est STABLE ou BORNEE d'une etape K a l'autre (ex. le
+  ! Reduit fortement le gaspillage face a un carve systematique (une
+  ! nouvelle allocation a chaque etape, sans reutilisation) : un bloc dont
+  ! la taille de stockage est STABLE ou BORNEE d'une etape K a l'autre (ex. le
   ! repli dense, toujours de taille MI*NJ FIXE pour un slot de bloc donne
   ! -- MI/NJ ne dependent que de la partition, jamais de K ; ou le rang
   ! d'un bloc bas-rang, fluctuant mais borne par RMAX) finit par stabiliser
@@ -174,9 +169,9 @@ CONTAINS
   ! buffers successivement abandonnes lors d'agrandissements repetes) a
   ! ~2x la taille finale, MEME dans le pire cas.
   !
-  ! POURQUOI PAS "carver directement CAP_MAX des le premier appel" (option
-  ! plus simple envisagee, ecartee) : un bloc qui tente le bas-rang puis
-  ! finit par basculer en dense (rang qui depasse le plafond de
+  ! POURQUOI PAS "carver directement CAP_MAX des le premier appel" (plus
+  ! simple, mais ecarte) : un bloc qui tente le bas-rang puis finit par
+  ! basculer en dense (rang qui depasse le plafond de
   ! compression, ex. RMAX ~ 80% de la dimension du bloc -- voir
   ! COMPRESS_WORTHWHILE_RATIO, blr_compress_mod.f90) paierait ALORS la
   ! capacite MAXIMALE en pure perte (orpheline des la bascule vers dense,
@@ -229,19 +224,17 @@ CONTAINS
   END FUNCTION ARENA_BYTES
 
   !-----------------------------------------------------------------------
-  ! DIAGNOSTIC TEMPORAIRE (voir MPI_BLR_MATRIX_ARENA_MEMORY_DIAG,
-  ! mpi_blr_matrix_mod.f90) -- somme CHUNKS(:)%USED (octets REELLEMENT
-  ! carves, qu'ils soient encore atteignables depuis un bloc ou deja
-  ! orphelins suite a un agrandissement -- voir ARENA_CARVE_REUSE), PAR
-  ! OPPOSITION a ARENA_BYTES qui compte la taille COMPLETE de chaque chunk
-  ! ALLOUE (y compris la partie jamais carvee en fin de chunk). La
-  ! difference ARENA_BYTES-ARENA_USED_BYTES isole la fragmentation INTERNE
-  ! aux chunks (fin de chunk non comblee) ; la difference
-  ! ARENA_USED_BYTES-(USED+SLACK du diagnostic bloc-par-bloc) isole les
-  ! buffers orphelins suite a un AGRANDISSEMENT (ARENA_CARVE_REUSE carve un
-  ! nouveau buffer PLUS GRAND et abandonne l'ancien, plus petit, sans
-  ! aucune trace conservee -- hypothese a confirmer/infirmer avant de
-  ! coder un correctif).
+  ! Diagnostic (voir MPI_BLR_MATRIX_ARENA_MEMORY_DIAG, mpi_blr_matrix_
+  ! mod.f90) -- somme CHUNKS(:)%USED (octets reellement carves, qu'ils
+  ! soient encore atteignables depuis un bloc ou deja orphelins suite a un
+  ! agrandissement, voir ARENA_CARVE_REUSE), par opposition a ARENA_BYTES
+  ! qui compte la taille complete de chaque chunk alloue (y compris la
+  ! partie jamais carvee en fin de chunk). La difference ARENA_BYTES-
+  ! ARENA_USED_BYTES isole la fragmentation interne aux chunks (fin de
+  ! chunk non comblee) ; la difference ARENA_USED_BYTES-(USED+SLACK du
+  ! diagnostic bloc-par-bloc) isole les buffers orphelins suite a un
+  ! agrandissement (ARENA_CARVE_REUSE carve un nouveau buffer plus grand et
+  ! abandonne l'ancien, plus petit, sans aucune trace conservee).
   !-----------------------------------------------------------------------
   FUNCTION ARENA_USED_BYTES(ARENA) RESULT(NBYTES)
     TYPE(BLR_ARENA_T), INTENT(IN) :: ARENA

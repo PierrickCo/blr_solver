@@ -1,44 +1,36 @@
 !===============================================================================
-! PIPELINE "MATRICE COMPRESSEE DE BOUT EN BOUT", demande explicite de
-! l'utilisateur pour reorganiser l'algorithme en 5 etapes clairement
+! Pipeline "matrice compressee de bout en bout", en 5 etapes clairement
 ! separees :
-!   1) Assemblage bloc par bloc, chaque bloc COMPRESSE IMMEDIATEMENT apres
+!   1) Assemblage bloc par bloc, chaque bloc compresse immediatement apres
 !      assemblage (pas de dense intermediaire garde en memoire) -- mesure
-!      COMBINEE assemblage+compression, et taux de compression de A.
+!      combinee assemblage+compression, et taux de compression de A.
 !   2) Assemblage du second membre (mesure separee).
-!   3) Factorisation LU DIRECTEMENT sur la matrice compressee (mesure du
+!   3) Factorisation LU directement sur la matrice compressee (mesure du
 !      temps, taux de compression des facteurs L/U finaux).
 !   4) Resolution.
-!   5) Verification en appliquant la matrice COMPRESSEE (pas une reference
+!   5) Verification en appliquant la matrice compressee (pas une reference
 !      dense recalculee a part).
 !
-! DIFFERENCE avec tout ce qui existait jusqu'ici (etape 2, proposition 2) :
-! CES modules partaient d'une matrice DENSE (assemblee entierement dense
-! d'abord), et compressaient soit PENDANT la mise a jour de Schur
-! (etape 2, transitoire, A reste dense), soit APRES coup sur le resultat
-! deja factorise (proposition 2, Phase 2). ICI, la matrice ENTIERE ne
-! passe JAMAIS par une forme dense intermediaire hors des blocs
-! individuels en cours de traitement -- compresse des l'assemblage,
-! reste compresse pendant toute la factorisation.
+! La matrice entiere ne passe jamais par une forme dense intermediaire
+! hors des blocs individuels en cours de traitement -- compressee des
+! l'assemblage, elle reste compressee pendant toute la factorisation.
 !
-! CHOIX DE PORTEE (comme a chaque etape "from scratch" precedente) :
-!   - SANS PIVOT (matrices a diagonale dominante uniquement, comme TOUS
-!     les benchmarks de ce projet) -- ajouter le pivot sur une
-!     representation compressee est une extension notable (voir
-!     mpi_blr_lu_nopiv_mod.f90 -> mpi_blr_lu_pivot_mod.f90 pour le meme
-!     saut de complexite deja fait cote MPI) laissee pour plus tard.
-!   - Blocs DIAGONAUX restent TOUJOURS denses (pratique standard BLR,
+! CHOIX DE PORTEE :
+!   - Sans pivot (matrices a diagonale dominante). Ajouter le pivot sur
+!     une representation compressee est une extension notable (voir
+!     mpi_blr_lu_pivot_mod.f90 pour le meme saut de complexite deja fait
+!     cote MPI).
+!   - Blocs diagonaux restent toujours denses (pratique standard BLR,
 !     necessaire pour la factorisation dense du pivot).
-!   - Mise a jour de Schur d'un bloc hors-diagonale COMPRESSE : EXPAND
+!   - Mise a jour de Schur d'un bloc hors-diagonale compresse : EXPAND
 !     (dense transitoire) -> SCHUR_UPDATE_BLOCK -> COMPRESS_BLOCK a
 !     nouveau (re-troncature). Une combinaison directe "basse-rang moins
-!     basse-rang, re-tronque" SANS repasser par le dense serait plus
-!     rapide mais BEAUCOUP plus delicate a implementer correctement (c'est
-!     exactement ce qui rend les vrais solveurs BLR/H-matrices difficiles)
-!     -- choix delibere de simplicite/fiabilite, comme SVD-pas-QR a
-!     l'etape 2.
-!   - Transformation des panneaux L21/U12 EUX-MEMES compresses : PAS
-!     d'expansion necessaire ici -- resoudre CTRSM sur le SEUL facteur
+!     basse-rang, re-tronque" sans repasser par le dense serait plus
+!     rapide mais beaucoup plus delicate a implementer correctement (c'est
+!     ce qui rend les vrais solveurs BLR/H-matrices difficiles) -- choix
+!     delibere de simplicite/fiabilite.
+!   - Transformation des panneaux L21/U12 eux-memes compresses : pas
+!     d'expansion necessaire ici -- resoudre CTRSM sur le seul facteur
 !     UFAC (ou VFAC) d'un bloc basse-rang donne directement le bon
 !     resultat (L11^-1*(UFAC*VFAC) = (L11^-1*UFAC)*VFAC), un vrai gain
 !     (CTRSM sur une matrice KWxRANG au lieu de KWxN) -- pas une
@@ -47,11 +39,10 @@
 ! GENERALISATION (librairie d'algebre lineaire bloc full/low-rank) : le
 ! facteur diagonal sans pivot, les TRSM appliques a un facteur low-rank
 ! seul, le decoupage en blocs et le calcul de taille memoire d'un bloc
-! sont desormais les primitives PARTAGEES de blr_compress_mod.f90
-! (BLR_LU_NOPIV_UNBLOCKED, BLR_TRSM_LEFT_LOWER_UNIT/BLR_TRSM_RIGHT_UPPER_
-! NONUNIT, BLOCK_PARTITION, BLR_BLOCK_BYTES) -- ce module ne les redefinit
-! plus localement (ancienne duplication avec blr_lu_mod.f90/
-! blr_lu_storage_mod.f90, supprimee).
+! sont les primitives partagees de blr_compress_mod.f90 (BLR_LU_NOPIV_
+! UNBLOCKED, BLR_TRSM_LEFT_LOWER_UNIT/BLR_TRSM_RIGHT_UPPER_NONUNIT,
+! BLOCK_PARTITION, BLR_BLOCK_BYTES) -- ce module ne les redefinit pas
+! localement.
 !===============================================================================
 MODULE BLR_MATRIX_MOD
   USE BLR_COMPRESS_MOD
@@ -82,11 +73,10 @@ MODULE BLR_MATRIX_MOD
 CONTAINS
 
   !-----------------------------------------------------------------------
-  ! ETAPE 1 : assemblage bloc par bloc + compression IMMEDIATE de chaque
-  ! bloc hors-diagonale (GET_BLOCK : callback fourni par l'appelant, ne
-  ! calcule qu'UN bloc a la fois -- jamais de tableau N x N dense complet
-  ! en memoire). T_ASSEMBLE_COMPRESS : temps COMBINE (l'utilisateur a
-  ! demande une mesure unique, pas separee).
+  ! Assemblage bloc par bloc, avec compression immediate de chaque bloc
+  ! hors-diagonale (GET_BLOCK : callback fourni par l'appelant, ne calcule
+  ! qu'un bloc a la fois -- jamais de tableau N x N dense complet en
+  ! memoire). T_ASSEMBLE_COMPRESS : temps combine (assemblage+compression).
   !-----------------------------------------------------------------------
   SUBROUTINE ASSEMBLE_BLR_MATRIX(N, NB, TOL, GET_BLOCK, A_BLR, &
                                   T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
@@ -109,12 +99,10 @@ CONTAINS
     PROGRESS = .FALSE.
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS
 
-    ! PARALLELISATION NIVEAU 2 (demande explicite) : la double boucle I,J
-    ! est independante (chaque (I,J) ecrit dans une case disjointe de
-    ! DIAGBLK/OFFBLK) -- UN workspace SVD PAR THREAD (jamais partage, voir
-    ! la note de thread-safety de BLR_WORKSPACE_T), meme principe que
-    ! blr_lu_mod.f90. Suppose GET_BLOCK thread-safe (formule pure, sans
-    ! etat partage -- vrai pour tous les callbacks ecrits jusqu'ici).
+    ! La double boucle I,J est independante (chaque (I,J) ecrit dans une
+    ! case disjointe de DIAGBLK/OFFBLK) -- un workspace SVD par thread
+    ! (jamais partage, voir la note de thread-safety de BLR_WORKSPACE_T).
+    ! Suppose GET_BLOCK thread-safe (formule pure, sans etat partage).
     NTHREADS = OMP_GET_MAX_THREADS()
     ALLOCATE(WSARR(NTHREADS))
     DO TID = 1, NTHREADS
@@ -178,9 +166,8 @@ CONTAINS
   END SUBROUTINE ASSEMBLE_BLR_MATRIX
 
   !-----------------------------------------------------------------------
-  ! Empreinte memoire reelle de A_BLR (octets) -- meme esprit que
-  ! BLR_FACTORED_LU_MEMORY_BYTES (proposition 2), pour caracteriser le
-  ! taux de compression de la matrice assemblee.
+  ! Empreinte memoire reelle de A_BLR (octets), pour caracteriser le taux
+  ! de compression de la matrice assemblee.
   !-----------------------------------------------------------------------
   FUNCTION BLR_MATRIX_MEMORY_BYTES(A_BLR) RESULT(NBYTES)
     TYPE(BLR_MATRIX_T), INTENT(IN) :: A_BLR
@@ -196,12 +183,12 @@ CONTAINS
   END FUNCTION BLR_MATRIX_MEMORY_BYTES
 
   !-----------------------------------------------------------------------
-  ! ETAPE 3 : factorisation LU EN PLACE sur A_BLR, qui reste compresse
-  ! tout du long (sauf expansion TRANSITOIRE d'un bloc hors-diagonale, le
-  ! temps de sa propre mise a jour de Schur -- voir note de tete de
-  ! fichier). SANS PIVOT. N_COMPRESSED/N_OFFDIAG/RANK_SUM en sortie
-  ! caracterisent les facteurs L/U FINAUX (releves au moment ou chaque
-  ! bloc atteint sa forme definitive, pas les etats intermediaires).
+  ! Factorisation LU en place sur A_BLR, qui reste compresse tout du long
+  ! (sauf expansion transitoire d'un bloc hors-diagonale, le temps de sa
+  ! propre mise a jour de Schur -- voir note de tete de fichier). Sans
+  ! pivot. N_COMPRESSED/N_OFFDIAG/RANK_SUM en sortie caracterisent les
+  ! facteurs L/U finaux (releves au moment ou chaque bloc atteint sa forme
+  ! definitive, pas les etats intermediaires).
   !-----------------------------------------------------------------------
   SUBROUTINE BLR_MATRIX_LU_FACTOR(A_BLR, TOL, INFO, N_COMPRESSED, N_OFFDIAG, RANK_SUM, T_FACTOR, &
                                    SHOW_PROGRESS)
@@ -223,9 +210,9 @@ CONTAINS
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS
     PBAR_STATE = -1
 
-    ! UN workspace QR+SVD PAR THREAD (mise a jour de Schur parallelisee
-    ! ci-dessous, point 4 demande) -- NB suffit comme taille : MI,NJ<=NB et
-    ! le rang recompresse RTOT<=RMAX<NB.
+    ! Un workspace QR+SVD par thread (mise a jour de Schur parallelisee
+    ! ci-dessous) -- NB suffit comme taille : MI,NJ<=NB et le rang
+    ! recompresse RTOT<=RMAX<NB.
     NTHREADS = OMP_GET_MAX_THREADS()
     ALLOCATE(WSARR(NTHREADS))
     DO TID = 1, NTHREADS
@@ -242,13 +229,14 @@ CONTAINS
     DO K = 1, NBLK
       KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
 
-      ! 1) facteur diagonal, dense, sans pivot -- appel UNIQUE et
+      ! 1) facteur diagonal, dense, sans pivot -- appel unique et
       !    sequentiel (une elimination sur un seul bloc KWxKW ne se
-      !    decoupe pas en taches independantes), mais MKL tourne a SON
-      !    NOMBRE DE THREADS MAX pendant cet appel (demande explicite :
-      !    "l'ensemble des coeurs" pour cette etape) -- restaure a 1 juste
-      !    avant nos propres boucles OpenMP ci-dessous pour eviter le
-      !    threading imbrique (nos threads OpenMP x threads MKL internes).
+      !    decoupe pas en taches independantes), mais MKL tourne a son
+      !    nombre de threads max pendant cet appel (le seul moyen de le
+      !    paralleliser, une elimination scalaire n'offrant pas de
+      !    parallelisme de tache) -- restaure a 1 juste avant les boucles
+      !    OpenMP ci-dessous pour eviter le threading imbrique (threads
+      !    OpenMP x threads MKL internes).
       CALL SET_NUM_THREADS(NTHREADS)
       CALL BLR_LU_NOPIV_UNBLOCKED(KW, A_BLR%DIAGBLK(K)%D, KW, IINFO)
       IF (IINFO .NE. 0 .AND. INFO .EQ. 0) INFO = A_BLR%BSTART(K) - 1 + IINFO
@@ -325,10 +313,9 @@ CONTAINS
   END SUBROUTINE BLR_MATRIX_LU_FACTOR
 
   !-----------------------------------------------------------------------
-  ! ETAPE 4 : resolution A*X=B par substitution avant/arriere par blocs,
-  ! directement sur les facteurs L21/U12 compresses (BLR_BLOCK_APPLY,
-  ! proposition 2 -- jamais d'expansion dense necessaire ici). B ecrase
-  ! par X.
+  ! Resolution A*X=B par substitution avant/arriere par blocs, directement
+  ! sur les facteurs L21/U12 compresses (BLR_BLOCK_APPLY -- jamais
+  ! d'expansion dense necessaire ici). B ecrase par X.
   !-----------------------------------------------------------------------
   SUBROUTINE BLR_MATRIX_LU_SOLVE(A_BLR, NRHS, B, LDB, SHOW_PROGRESS)
     TYPE(BLR_MATRIX_T), INTENT(IN) :: A_BLR
@@ -351,25 +338,23 @@ CONTAINS
     NTHREADS = OMP_GET_MAX_THREADS()
 
     ! L*Y = B (substitution avant, L unitaire, diagonale implicite). La
-    ! boucle externe sur K est SEQUENTIELLE (K depend du resultat de
-    ! K-1) -- ce qui est PARALLELISE (demande explicite), c'est la boucle
-    ! INTERNE sur I : les contributions des blocs deja resolus s'accumulent
-    ! dans la MEME case B(K,:), donc REDUCTION(+:YACC) plutot qu'ecrire
-    ! directement dans B depuis plusieurs threads (chaque thread accumule
-    ! dans sa copie privee de YACC, combinees par + a la fin du parallel
-    ! do). BLR_BLOCK_APPLY exploite deja le low-rank en interne (2 petits
-    ! GEMM via UFAC/VFAC) -- la parallelisation en multiplie le benefice
-    ! sur plusieurs coeurs. Ne vaut le cout de la region parallele que si
-    ! K-1 est assez grand (voir l'echange avec l'utilisateur).
+    ! boucle externe sur K est sequentielle (K depend du resultat de K-1) ;
+    ! la boucle interne sur I, elle, est parallelisee : les contributions
+    ! des blocs deja resolus s'accumulent dans la meme case B(K,:), donc
+    ! REDUCTION(+:YACC) plutot qu'ecrire directement dans B depuis
+    ! plusieurs threads (chaque thread accumule dans sa copie privee de
+    ! YACC, combinees par + a la fin du parallel do). BLR_BLOCK_APPLY
+    ! exploite deja le low-rank en interne (2 petits GEMM via UFAC/VFAC) --
+    ! la parallelisation en multiplie le benefice sur plusieurs coeurs. Ne
+    ! vaut le cout de la region parallele que si K-1 est assez grand.
     DO K = 1, NBLK
       KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
       IF (K .GT. 1) THEN
         ALLOCATE(YACC(KW,NRHS))
         YACC = CZERO
-        ! MKL a 1 thread/appel pendant NOTRE boucle parallele (le CGEMM
-        ! dense de BLR_BLOCK_APPLY, cas bloc-plein, est assez gros pour que
-        ! MKL le threade lui-meme en interne -- oubli trouve en comparant
-        ! les solveurs A/B, corrige ici en appliquant le meme garde-fou que
+        ! MKL a 1 thread/appel pendant la boucle parallele (le CGEMM dense
+        ! de BLR_BLOCK_APPLY, cas bloc-plein, est assez gros pour que MKL
+        ! le threade lui-meme en interne -- meme garde-fou que
         ! BLR_MATRIX_LU_FACTOR) ; restaure juste avant le CTRSM sequentiel.
         CALL SET_NUM_THREADS(1)
         !$OMP PARALLEL DO PRIVATE(I) REDUCTION(+:YACC) SCHEDULE(DYNAMIC)
@@ -413,11 +398,11 @@ CONTAINS
   END SUBROUTINE BLR_MATRIX_LU_SOLVE
 
   !-----------------------------------------------------------------------
-  ! ETAPE 5 (verification) : Y = A_BLR * X, en utilisant DIRECTEMENT la
-  ! matrice COMPRESSEE (avant factorisation -- l'appelant doit garder une
-  ! copie de A_BLR non factorisee pour ceci, peu couteux puisque
-  ! compresse). Reutilise BLR_BLOCK_APPLY pour les blocs hors-diagonale,
-  ! CGEMM dense pour les blocs diagonaux.
+  ! Verification : Y = A_BLR * X, en utilisant directement la matrice
+  ! compressee (avant factorisation -- l'appelant doit garder une copie de
+  ! A_BLR non factorisee pour ceci, peu couteux puisque compresse).
+  ! Reutilise BLR_BLOCK_APPLY pour les blocs hors-diagonale, CGEMM dense
+  ! pour les blocs diagonaux.
   !-----------------------------------------------------------------------
   SUBROUTINE APPLY_BLR_MATRIX(A_BLR, NRHS, X, LDX, Y, LDY)
     TYPE(BLR_MATRIX_T), INTENT(IN) :: A_BLR

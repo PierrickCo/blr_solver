@@ -1,38 +1,31 @@
 !===============================================================================
-! Deux variantes d'affichage de progression, desactivees par defaut
-! (SHOW_PROGRESS=.FALSE. cote appelant) -- pensees pour l'observation
-! manuelle sur de petits cas test, pas pour tourner en continu sur les gros
-! benchmarks :
+! Deux mecanismes d'affichage de progression, desactives par defaut cote
+! appelant (SHOW_PROGRESS=.FALSE.) -- destines a l'observation manuelle sur
+! des cas de taille reduite, pas a tourner en continu sur des benchmarks
+! longs.
 !
-! PRINT_PROGRESS_BAR : barre texte sur UNE SEULE LIGNE qui se REMPLIT au
-! fur et a mesure (demande explicite : plus de reecriture complete de la
-! ligne a chaque appel). AUCUN caractere de controle (ni CHAR(13), ni
-! saut de ligne avant la fin) : chaque appel se contente d'AJOUTER les
-! nouveaux caracteres '=' devenus dus depuis le dernier appel, avec
-! ADVANCE='NO' -- la ligne grandit normalement, comme n'importe quelle
-! sortie texte. Robuste PARTOUT (terminal interactif, sortie redirigee
-! vers un fichier, mpirun/srun relayant le stdout par pipe) puisqu'aucun
-! rendu special n'est requis : c'est ce qui a motive l'abandon du
-! rafraichissement par CHAR(13) (qui ne s'affichait correctement que sur
-! un vrai terminal, cf. l'historique dans la memoire du projet).
+! PRINT_PROGRESS_BAR : barre texte sur une seule ligne qui se remplit
+! progressivement. N'emet aucun caractere de controle (ni retour chariot,
+! ni saut de ligne avant la fin) : chaque appel ajoute uniquement les
+! caracteres '=' devenus dus depuis le dernier appel (ADVANCE='NO'), si
+! bien que la ligne grandit comme une sortie texte ordinaire. Rendu
+! identique sur un terminal interactif, une sortie redirigee vers un
+! fichier, ou un lanceur MPI relayant le flux par un pipe.
 !
-! ETAT PORTE PAR L'APPELANT (NFILL_STATE, INTENT(INOUT)) : un entier
-! local, initialise a une valeur < 0 AVANT la boucle -- meme convention
-! que LAST_PCT dans PRINT_PROGRESS_MILESTONE ci-dessous (aucun etat cache
-! dans le module, donc aucun risque d'interference entre plusieurs barres
-! actives en meme temps dans le meme programme). Le premier appel (etat
-! < 0) ouvre la ligne (etiquette + crochet) ; le dernier appel
-! (CURRENT>=TOTAL) referme le crochet et saute une ligne.
+! Etat porte par l'appelant (NFILL_STATE, INTENT(INOUT)) : un entier local
+! initialise a une valeur negative avant la boucle -- aucun etat n'est
+! conserve dans le module, donc plusieurs barres actives simultanement
+! dans le meme programme n'interferent jamais entre elles. Le premier
+! appel (etat negatif) ouvre la ligne (etiquette puis crochet) ; le
+! dernier appel (CURRENT>=TOTAL) referme le crochet et passe a la ligne
+! suivante.
 !
-! PRINT_PROGRESS_MILESTONE : affichage par PALIERS (tous les 5% par
-! defaut), une ligne complete normale (avec saut de ligne) par palier --
-! robuste quel que soit le lanceur (mpirun/srun) ou le terminal, puisqu'il
-! ne repose sur aucun caractere de controle. Utilisee par
-! mpi_blr_matrix_mod.f90. L'appelant fournit et conserve LAST_PCT (un
-! entier local, initialise a une valeur < 0 avant la boucle) : c'est ce
-! qui permet le throttling SANS etat cache dans le module (chaque appelant
-! garde son propre compteur, pas de risque d'interference entre plusieurs
-! barres actives en meme temps dans le meme programme).
+! PRINT_PROGRESS_MILESTONE : affichage par paliers (tous les 5% par
+! defaut), une ligne complete par palier -- ne repose sur aucun caractere
+! de controle, donc robuste quel que soit le lanceur ou le terminal.
+! Utilisee par mpi_blr_matrix_mod.f90. Meme convention d'etat porte par
+! l'appelant que ci-dessus (LAST_PCT, INTENT(INOUT), initialise a une
+! valeur negative avant la boucle).
 !===============================================================================
 MODULE PROGRESS_BAR_MOD
   IMPLICIT NONE

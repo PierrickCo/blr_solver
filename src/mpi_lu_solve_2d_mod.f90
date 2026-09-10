@@ -1,56 +1,46 @@
 !===============================================================================
-! RESOLUTION MPI DISTRIBUEE, VRAIE DISTRIBUTION 2D DU SECOND MEMBRE (demande
-! explicite : completer le facteur PR deja obtenu par mpi_lu_solve_mod.f90
-! avec le facteur PC manquant, quitte a introduire un mecanisme de
-! communication reellement nouveau -- ALLGATHERV, jamais utilise ailleurs
-! dans ce projet).
+! Resolution MPI distribuee, distribution 2D complete du second membre --
+! B est reparti a la fois sur les lignes (facteur PR) et les colonnes
+! (facteur PC), sans replication residuelle.
 !
 ! DISTRIBUTION DE B : B_LOCAL(MLOC,NRHS_LOC) -- MLOC exactement comme A
-! (lignes, NUMROC sur PR, INCHANGE par rapport a mpi_lu_solve_mod.f90),
-! NRHS_LOC = un DECOUPAGE SIMPLE PAR BLOCS (pas bloc-cyclique -- NRHS est un
-! lot de seconds membres independants, pas un axe spatial de A, donc pas
-! besoin du decoupage a la NB qui a du sens pour N) de NRHS sur PC
-! (RHS_LOCAL_RANGE, ci-dessous) -- AUCUNE replication residuelle : chaque
-! colonne de grille ne stocke NI ne calcule que SA PROPRE tranche de
-! seconds membres.
+! (lignes, NUMROC sur PR), NRHS_LOC = un decoupage simple par blocs
+! contigus (pas bloc-cyclique : NRHS est un lot de seconds membres
+! independants, pas un axe spatial de A, donc pas besoin du decoupage a la
+! NB qui a du sens pour N) de NRHS sur PC (RHS_LOCAL_RANGE, ci-dessous) --
+! chaque colonne de grille ne stocke ni ne calcule que sa propre tranche
+! de seconds membres.
 !
-! LE PROBLEME REEL (identifie AVANT d'ecrire ce module, avec l'utilisateur) :
-! une fois X(K) resolu, chaque colonne de la ligne PROW_K n'en detient QUE
-! SA PROPRE tranche (KW x NRHS_LOC) -- mais c'est le processus de colonne
-! PCOL_K (proprietaire de L(I,K)) qui doit calculer L(I,K)*X(K), et il n'a
-! QUE SA PROPRE tranche RHS, pas les PC-1 autres. Il faut donc RECONSTRUIRE
-! X(K) en entier (KW x NRHS) avant de pouvoir l'utiliser -- exactement le
-! "mismatch ligne/colonne" qu'une distribution 2D complete de B soulevait
-! deja en theorie.
+! LE PROBLEME A RESOUDRE : une fois X(K) resolu, chaque colonne de la ligne
+! PROW_K n'en detient que sa propre tranche (KW x NRHS_LOC) -- mais c'est
+! le processus de colonne PCOL_K (proprietaire de L(I,K)) qui doit calculer
+! L(I,K)*X(K), et il n'a que sa propre tranche RHS, pas les PC-1 autres. Il
+! faut donc reconstruire X(K) en entier (KW x NRHS) avant de pouvoir
+! l'utiliser -- le "mismatch ligne/colonne" inherent a une distribution 2D
+! complete de B.
 !
 ! ALGORITHME (par etape de bloc K, substitution avant -- l'arriere est
 ! symetrique, tetes au lieu de trainantes) :
-!   a) DKK diffuse le long de ROW_COMM (racine=PCOL_K) -- IDENTIQUE a la
-!      version 1D (mpi_lu_solve_mod.f90) et a la factorisation elle-meme.
-!   b) CTRSM LOCAL sur NOTRE PROPRE tranche NRHS_LOC -- PLUS de redondance
-!      inter-colonnes ici (contrairement a la version 1D ou B etait
-!      replique dans la ligne et CHAQUE colonne refaisait le MEME CTRSM) :
-!      chaque colonne calcule un morceau DIFFERENT, un vrai partage de
-!      travail en plus du partage memoire.
-!   c) MPI_ALLGATHERV DANS ROW_COMM (ligne PROW_K) : reconstruit X(K)
-!      COMPLET (KW x NRHS) a partir des PC tranches NRHS_LOC -- LE SEUL
-!      mecanisme reellement NOUVEAU de cette version.
-!   d) diffusion de ce X(K) complet le long de COL_COMM (racine=PROW_K) --
-!      IDENTIQUE a la version 1D (deja full-NRHS-width la-bas aussi).
+!   a) DKK diffuse le long de ROW_COMM (racine=PCOL_K), comme lors de la
+!      factorisation.
+!   b) CTRSM local sur la propre tranche NRHS_LOC de chaque processus --
+!      chaque colonne calcule un morceau different, sans redondance de
+!      calcul entre colonnes.
+!   c) MPI_ALLGATHERV dans ROW_COMM (ligne PROW_K) : reconstruit X(K)
+!      complet (KW x NRHS) a partir des PC tranches NRHS_LOC.
+!   d) diffusion de ce X(K) complet le long de COL_COMM (racine=PROW_K).
 !   e) le proprietaire de L(:,K) (colonne PCOL_K) calcule la contribution
-!      COMPLETE (NROWTRAIL x NRHS) via CGEMM -- IDENTIQUE a la version 1D.
-!   f) MPI_SCATTERV le long de ROW_COMM (racine=PCOL_K), PAS une diffusion :
-!      chaque colonne ne RECOIT QUE sa propre tranche NRHS_LOC -- evite le
+!      complete (NROWTRAIL x NRHS) via CGEMM.
+!   f) MPI_SCATTERV le long de ROW_COMM (racine=PCOL_K), pas une diffusion :
+!      chaque colonne ne recoit que sa propre tranche NRHS_LOC, evitant le
 !      gaspillage de bande passante d'une diffusion complete suivie d'un
-!      rejet local (contrairement a ce qu'on aurait fait par simplicite).
+!      rejet local.
 !
-! COMPROMIS ATTENDU (signale a l'utilisateur avant d'ecrire ce module) :
-! gain memoire reel et complet (facteur PR x PC au lieu de PR seul), au
-! prix d'un ALLGATHERV + 2 diffusions par etape au lieu de 2 diffusions
-! (mpi_lu_solve_mod.f90) -- strictement PLUS d'appels collectifs par etape.
-! Sur ce banc d'essai (WSL2, MPI en boucle locale), l'experience recente
-! avec la proposition 3 MPI (BCAST_BLR_BLOCK) suggere que ce surcout de
-! latence pourrait depasser le gain de volume -- A MESURER, pas supposer.
+! COMPROMIS : gain memoire complet (facteur PR x PC au lieu de PR seul), au
+! prix d'un ALLGATHERV et de deux diffusions supplementaires par etape par
+! rapport a une distribution 1D de B -- mesure sur ce projet plus rapide ET
+! moins gourmande en memoire qu'une distribution 1D a toutes les echelles
+! testees, malgre le surcout apparent en nombre d'appels collectifs.
 !===============================================================================
 MODULE MPI_LU_SOLVE_2D_MOD
   USE BLR_KINDS_MOD, ONLY: WP
@@ -95,14 +85,13 @@ CONTAINS
     CALL RHS_LOCAL_RANGE(NRHS, PC, MYCOL, DUMMY_START, NRHS_LOC)
   END FUNCTION RHS_NUMROC
 
-  ! B_LOCAL : distribue PAR LIGNES comme A (MLOC, meme NUMROC/PR que A) ET
-  ! PAR COLONNES sur les seconds membres (NRHS_LOC, RHS_NUMROC/PC ci-dessus)
-  ! -- AUCUNE replication residuelle, contrairement a mpi_lu_solve_mod.f90.
-  ! SHOW_PROGRESS (optionnel) : voir MPI_LU_PIVOT_FACTOR ci-dessus pour la
-  ! justification (affichage par paliers, pas par barre en place -- mpirun
-  ! casse le retour chariot). Une seule barre pour les 2 sous-etapes
-  ! (substitution avant + arriere, 2*NBLK etapes), chacune globalement
-  ! synchronisee -- pourcentage exact.
+  ! B_LOCAL : distribue par lignes comme A (MLOC, meme NUMROC/PR que A) ET
+  ! par colonnes sur les seconds membres (NRHS_LOC, RHS_NUMROC/PC
+  ! ci-dessus) -- aucune replication residuelle. SHOW_PROGRESS (optionnel) :
+  ! voir MPI_LU_PIVOT_FACTOR ci-dessus pour la justification de l'affichage
+  ! par paliers. Une seule barre pour les 2 sous-etapes (substitution avant
+  ! + arriere, 2*NBLK etapes), chacune globalement synchronisee --
+  ! pourcentage exact.
   SUBROUTINE MPI_LU_SOLVE_DISTRIBUTED_2D(GRID, N, NB, A_LOCAL, MLOC, NLOC, IPIV_GLOBAL, &
                                           NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS)
     INCLUDE 'mpif.h'

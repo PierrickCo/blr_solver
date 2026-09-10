@@ -1,48 +1,40 @@
 !===============================================================================
-! ETAPE 2 (partie 1/2) : primitives de compression basse-rang d'un bloc
-! dense, complexe simple precision.
+! Bibliotheque d'algebre lineaire par blocs full/low-rank : primitives de
+! compression basse-rang d'un bloc dense (complexe simple precision) et
+! catalogue complet des operations BLR/LU qui s'appuient dessus.
 !
-! METHODE : SVD tronquee (CGESVD), pas QR avec pivotage de colonnes (ce que
-! font MUMPS/STRUMPACK en production, plus rapide) -- choix DELIBERE pour
-! cette premiere version : la SVD donne directement le rang numerique (a
-! une tolerance donnee) sans bookkeeping de permutation de colonnes a
-! gerer, ce qui reduit le risque de bug pendant qu'on met l'algorithme au
-! point (cf. le bug de pivot trouve a l'etape 1). On pourra basculer vers
-! une QR tronquee plus tard une fois la logique BLR validee.
+! METHODE DE COMPRESSION : SVD tronquee (CGESVD), pas QR avec pivotage de
+! colonnes (ce que font MUMPS/STRUMPACK en production, plus rapide) --
+! choix delibere : la SVD donne directement le rang numerique (a une
+! tolerance donnee) sans bookkeeping de permutation de colonnes a gerer.
 !
-! REPRESENTATION : un bloc M x N est stocke soit DENSE (tel quel), soit
-! BASSE-RANG comme A ~= UFAC * VFAC avec UFAC (MxR) et VFAC (RxN) -- le
+! REPRESENTATION : un bloc M x N est stocke soit dense (tel quel), soit
+! basse-rang comme A ~= UFAC * VFAC avec UFAC (MxR) et VFAC (RxN) -- le
 ! facteur singulier Sigma est absorbe dans VFAC (VFAC(i,:) = S(i)*Vh(i,:)),
 ! donc UFAC*VFAC reconstruit directement l'approximation tronquee, sans
 ! manipulation supplementaire.
 !
-! SEUIL DE RANG : on ne compresse que si le rang numerique trouve (a la
-! tolerance TOL, relative a la plus grande valeur singuliere) est
-! significativement plus petit que MIN(M,N) -- sinon la compression
-! n'apporte rien (voire coute plus cher a exploiter qu'un GEMM dense direct)
-! et on garde le bloc dense.
-!===============================================================================
-! GENERALISATION (demande explicite : une librairie d'algebre lineaire sur
-! blocs full/low-rank qui tire au mieux parti de MKL/LAPACK) : ce module,
-! deja le point de convergence naturel de toutes les primitives bloc du
-! projet, en devient le catalogue COMPLET et le point d'entree UNIQUE --
-! chaque routine choisit systematiquement le chemin de calcul le moins cher
-! selon que ses operandes sont denses ou basse-rang, et s'appuie sur les
-! memes noyaux BLAS3/LAPACK threades par MKL que le reste du projet
-! (CGEMM, CTRSM, CGESVD, CGEQRF/CUNGQR) -- aucune reimplementation "maison"
-! de ces operations, uniquement de la logique de DISPATCH et de
-! recombinaison des facteurs low-rank autour d'elles. Les routines
-! partagees entre plusieurs solveurs (BLOCK_PARTITION, taille memoire d'un
-! bloc, LU sans pivot, TRSM applique a un facteur low-rank seul) ont ete
-! consolidees ICI (au lieu d'etre dupliquees dans blr_lu_mod.f90,
-! blr_lu_storage_mod.f90, blr_matrix_mod.f90 comme precedemment) : tout
-! module qui fait deja "USE BLR_COMPRESS_MOD" les recoit automatiquement,
-! aucun changement de nom de fichier/module necessaire ailleurs.
+! SEUIL DE RANG : la compression n'a lieu que si le rang numerique trouve
+! (a la tolerance TOL, relative a la plus grande valeur singuliere) est
+! significativement plus petit que MIN(M,N) -- sinon elle n'apporte rien
+! (voire coute plus cher a exploiter qu'un GEMM dense direct) et le bloc
+! reste dense.
+!
+! ROLE DE CE MODULE : point d'entree unique pour l'algebre bloc full/low-
+! rank du solveur -- chaque routine choisit systematiquement le chemin de
+! calcul le moins cher selon que ses operandes sont denses ou basse-rang,
+! et s'appuie sur les memes noyaux BLAS3/LAPACK threades par MKL (CGEMM,
+! CTRSM, CGESVD, CGEQRF/CUNGQR) -- aucune reimplementation "maison" de ces
+! operations, uniquement de la logique de dispatch et de recombinaison des
+! facteurs low-rank autour d'elles. Les routines partagees entre plusieurs
+! solveurs (BLOCK_PARTITION, taille memoire d'un bloc, LU sans pivot, TRSM
+! applique a un facteur low-rank seul) sont consolidees ici : tout module
+! qui fait "USE BLR_COMPRESS_MOD" les recoit automatiquement.
 !
 ! PISTES MKL NON ADOPTEES ICI (documentees, pas implementees -- eviter la
 ! sur-ingenierie tant que le besoin n'est pas mesure) : CGEMM3M (variante
 ! MKL de CGEMM, parfois plus rapide sur gros GEMM complexes via l'algorithme
-! 3M) pourrait remplacer CGEMM en UN SEUL point (ici) si un profilage futur
+! 3M) pourrait remplacer CGEMM en un seul point (ici) si un profilage futur
 ! le justifie ; le "batching" de petits GEMM (CGEMM_BATCH) pourrait accelerer
 ! les tres nombreuses petites operations de rang faible pendant une
 ! factorisation BLR, mais demande une refonte des boucles appelantes pour
@@ -61,34 +53,33 @@ MODULE BLR_COMPRESS_MOD
   ! R*(M+N), dense = M*N ; egaux pour R = M*N/(M+N), soit M/2 pour un
   ! bloc carre -- voir blr_compress_mod.f90/SCHUR_UPDATE_BLR_BLOCK_ARENA,
   ! meme raisonnement deja applique au plafond de croissance de l'arena).
-  ! PRECEDEMMENT 0.8 (choix tune calcul : un GEMM bas-rang a rang R coute
+  ! Un plafond a 0.8 (choix tune calcul : un GEMM bas-rang a rang R coute
   ! O(M*N*R), toujours moins cher qu'un GEMM dense O(M*N*NB) tant que
-  ! R<NB, donc accepter un rang plus eleve que le seuil memoire restait,
-  ! en theorie, un gain FLOPs). MESURE (bench/sweep_compressibility.sh,
-  ! voir memoire du projet) : avec 0.8, la zone de compressibilite
-  ! MARGINALE (rang final proche de l'ancien RMAX, ex. ~121 sur 200) est
-  ! en pratique la PLUS LENTE de tout le balayage (16.3s, plus de 2x le
-  ! cas totalement dense ~7-8s) -- l'algorithme tente la QR+SVD complete
-  ! de FAST_RECOMPRESS pour un resultat qui, une fois accepte, coute de
-  ! toute facon PLUS de memoire que le repli dense (R>M/2). 0.5 evite ce
-  ! "pire des deux mondes" : le test rapide RTOT.GT.RMAX (avant la QR+SVD
-  ! couteuse) rejette plus tot les blocs qui n'auraient de toute facon pas
-  ! ete memoire-rentables.
+  ! R<NB, donc accepter un rang plus eleve que le seuil memoire reste, en
+  ! theorie, un gain FLOPs) a ete mesure (bench/sweep_compressibility.sh)
+  ! moins bon en pratique : la zone de compressibilite marginale (rang
+  ! final proche de l'ancien RMAX, ex. ~121 sur 200) est la plus lente de
+  ! tout le balayage (16.3s, plus de 2x le cas totalement dense ~7-8s) --
+  ! l'algorithme tente la QR+SVD complete de FAST_RECOMPRESS pour un
+  ! resultat qui, une fois accepte, coute de toute facon plus de memoire
+  ! que le repli dense (R>M/2). 0.5 evite ce "pire des deux mondes" : le
+  ! test rapide RTOT.GT.RMAX (avant la QR+SVD couteuse) rejette plus tot
+  ! les blocs qui n'auraient de toute facon pas ete memoire-rentables.
   ! Variable de module (PAS PARAMETER) : valeur par defaut utilisee par
   ! TOUS les appelants existants (tous les benchmarks/tests, sauf
   ! test/bench_blr_mpi_pivot_ratio.f90 qui la surcharge explicitement pour
   ! son propre balayage), modifiable a l'execution via
   ! SET_COMPRESS_WORTHWHILE_RATIO ci-dessous.
   !
-  ! 1/3 (MESURE, voir bench/sweep_compress_ratio.sh au point marginal
-  ! EPS=1e-6, memoire du projet) : plus prudent que 0.5 (l'equilibre
-  ! MEMOIRE bas-rang/dense strict, R=MIN(M,N)/2) -- accepte un rang encore
-  ! PLUS BAS avant de basculer en dense, ce qui reste dans le plateau
-  ! "rapide" du temps de factorisation (~3.7-3.9s mesures, RATIO 0.1-0.5)
-  ! au lieu de s'approcher de la zone ou le temps commence deja a grimper
-  ! (~4.6s a 0.6, ~12.7-20s a 0.8-0.9) -- marge de securite deliberee sur
-  ! le temps, au prix de quelques opportunites de compression memoire-
-  ! rentables (rang entre M/3 et M/2) desormais rejetees.
+  ! 1/3 (mesure via bench/sweep_compress_ratio.sh au point marginal
+  ! EPS=1e-6) : plus prudent que 0.5 (l'equilibre memoire bas-rang/dense
+  ! strict, R=MIN(M,N)/2) -- accepte un rang encore plus bas avant de
+  ! basculer en dense, ce qui reste dans le plateau "rapide" du temps de
+  ! factorisation (~3.7-3.9s mesures, RATIO 0.1-0.5) au lieu de s'approcher
+  ! de la zone ou le temps commence deja a grimper (~4.6s a 0.6, ~12.7-20s
+  ! a 0.8-0.9) -- marge de securite deliberee sur le temps, au prix de
+  ! quelques opportunites de compression memoire-rentables (rang entre M/3
+  ! et M/2) rejetees.
   REAL(WP) :: COMPRESS_WORTHWHILE_RATIO = 1.0_WP/3.0_WP
 
   TYPE :: BLR_BLOCK_T
@@ -113,19 +104,19 @@ MODULE BLR_COMPRESS_MOD
     ! vue sur un PREFIXE de UFAC_FLAT si R a deja ete plus grand par le
     ! passe). Permet a ARENA_CARVE_REUSE (blr_arena_mod.f90) de reutiliser
     ! le meme buffer d'une recompression a l'autre au lieu d'en carver un
-    ! nouveau a chaque fois -- correctif du gaspillage x28 mesure avec le
-    ! carve-systematique (voir SCHUR_UPDATE_BLR_BLOCK_ARENA plus bas).
+    ! nouveau a chaque fois -- reduit fortement le gaspillage par rapport a
+    ! un carve systematique (voir SCHUR_UPDATE_BLR_BLOCK_ARENA plus bas).
     COMPLEX(WP), POINTER :: DENSE_FLAT(:) => NULL()
     COMPLEX(WP), POINTER :: UFAC_FLAT(:) => NULL(), VFAC_FLAT(:) => NULL()
   END TYPE BLR_BLOCK_ARENA_T
 
   !-----------------------------------------------------------------------
-  ! Variante "CAPACITE FIXE" (demande explicite : "les blocs LR stoquent
-  ! le maximum de rang que COMPRESS_WORTHWHILE_RATIO le permet ; les
-  ! echanges MPI et les operations associees ne se font que sur le rang
-  ! REEL") -- approche DIFFERENTE de l'arena pour le meme probleme
-  ! (fragmentation de tas due aux ALLOCATE/DEALLOCATE de taille VARIABLE a
-  ! chaque recompression, voir la memoire du projet).
+  ! Variante "CAPACITE FIXE" : les blocs bas-rang stockent en permanence
+  ! le rang maximal que COMPRESS_WORTHWHILE_RATIO autorise ; les echanges
+  ! MPI et les operations associees ne portent, eux, que sur le rang reel.
+  ! Approche differente de l'arena pour le meme probleme (fragmentation de
+  ! tas due aux ALLOCATE/DEALLOCATE de taille variable a chaque
+  ! recompression).
   !
   ! PRINCIPE : UFAC/VFAC sont alloues UNE SEULE FOIS par bloc, a la
   ! capacite MAXIMALE RMAX = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*
@@ -161,10 +152,10 @@ MODULE BLR_COMPRESS_MOD
   END TYPE BLR_BLOCK_FIXEDCAP_T
 
   !-----------------------------------------------------------------------
-  ! REUTILISATION DES TABLEAUX DE TRAVAIL TRANSITOIRES (demande explicite :
-  ! reduire l'allocation/desallocation repetee des scratch buffers de
-  ! COMPRESS_BLOCK/FAST_RECOMPRESS -- SVD, QR -- au lieu d'un ALLOCATE/
-  ! DEALLOCATE a CHAQUE appel). Toutes les matrices 2D sont dimensionnees
+  ! REUTILISATION DES TABLEAUX DE TRAVAIL TRANSITOIRES : reduit
+  ! l'allocation/desallocation repetee des scratch buffers de
+  ! COMPRESS_BLOCK/FAST_RECOMPRESS (SVD, QR) au lieu d'un ALLOCATE/
+  ! DEALLOCATE a chaque appel. Toutes les matrices 2D sont dimensionnees
   ! UNE FOIS a (MAXDIM,MAXDIM) (MAXDIM = plus grande taille de bloc/rang
   ! total attendue, typiquement NB) et REUTILISEES telles quelles via leur
   ! parametre LDA/LDU/LDVT (convention LAPACK standard : LDA >= M, on peut
@@ -438,19 +429,18 @@ CONTAINS
     OMEGA = CMPLX(2.0_WP*RE_PART-1.0_WP, 2.0_WP*IM_PART-1.0_WP, KIND=WP)
     DEALLOCATE(RE_PART, IM_PART)
 
-    ! 2) Y = B*Omega, ORTHONORMALISE IMMEDIATEMENT (voir ORTHONORMALIZE_
-    ! COLS), puis NPOWER iterations de puissance -- CHAQUE demi-iteration
-    ! (Z=B^H*Y puis Y=B*Z) est RE-orthonormalisee AUSSITOT, jamais
-    ! seulement a la toute fin. BOGUE CORRIGE (mesure) : sans cette
-    ! re-orthonormalisation intermediaire, la plage dynamique de Y/Z
-    ! explose au fil des iterations (le rapport des valeurs singulieres
-    ! extremes est porte a la puissance 2*IP+1) -- en simple precision
-    ! (WP), ca degrade CATASTROPHIQUEMENT la precision des qu'on depasse
-    ! NPOWER=1 (mesure : erreur relative x30 pire entre NPOWER=1 et
-    ! NPOWER=3 sur un cas reel, voir test/bench_rsvd_compress.f90) plutot
-    ! que de l'ameliorer comme prevu par la theorie (qui suppose une
-    ! arithmetique a precision infinie ou re-orthonormalisee a chaque
-    ! etape).
+    ! 2) Y = B*Omega, orthonormalise immediatement (voir ORTHONORMALIZE_
+    ! COLS), puis NPOWER iterations de puissance -- chaque demi-iteration
+    ! (Z=B^H*Y puis Y=B*Z) est re-orthonormalisee aussitot, jamais
+    ! seulement a la toute fin. Cette re-orthonormalisation intermediaire
+    ! est necessaire : sans elle, la plage dynamique de Y/Z explose au fil
+    ! des iterations (le rapport des valeurs singulieres extremes est
+    ! porte a la puissance 2*IP+1), ce qui degrade catastrophiquement la
+    ! precision en simple precision (WP) des qu'on depasse NPOWER=1
+    ! (erreur relative x30 pire entre NPOWER=1 et NPOWER=3 sur un cas reel,
+    ! voir test/bench_rsvd_compress.f90) plutot que de l'ameliorer comme
+    ! prevu par la theorie (qui suppose une arithmetique a precision
+    ! infinie ou re-orthonormalisee a chaque etape).
     ALLOCATE(Y(M,L))
     CALL CGEMM('No transpose', 'No transpose', M, L, N, CONE, B, LDB, OMEGA, N, CZERO, Y, M)
     DEALLOCATE(OMEGA)
@@ -612,18 +602,17 @@ CONTAINS
     ! reduire OVERSAMPLE reduirait cette bande mais aussi la marge de
     ! securite statistique du critere d'arret ailleurs.
 
-    ! BOGUE CORRIGE (mesure sur un bloc DELIBEREMENT non compressible,
-    ! voir test/bench_rsvd_compress.f90) : la version initiale ne
-    ! distinguait PAS "la marge R<=L-OVERSAMPLE a ete satisfaite" (rang
-    ! DIGNE DE CONFIANCE) de "on a atteint le plafond LCAP/MN SANS jamais
-    ! satisfaire la marge" (on a simplement ABANDONNE, R n'a AUCUNE valeur
-    ! probante) -- comme R est de toute facon toujours <= LCAP < RATIO*MN
-    ! par construction, l'ancien test final (R < RATIO*MN) etait donc
-    ! TOUJOURS vrai des qu'on atteignait le plafond, meme pour un bloc
-    ! FRANCHEMENT plein rang : mesure -> RANG INVENTE = LCAP avec une
-    ! erreur de reconstruction de 28.6% (au lieu du repli dense correct,
-    ! erreur nulle). MARGIN_OK trace desormais EXPLICITEMENT laquelle des
-    ! deux conditions d'arret a declenche la sortie de boucle.
+    ! MARGIN_OK distingue explicitement "la marge R<=L-OVERSAMPLE a ete
+    ! satisfaite" (rang digne de confiance) de "le plafond LCAP/MN a ete
+    ! atteint sans jamais satisfaire la marge" (la boucle a simplement
+    ! abandonne, R n'a alors aucune valeur probante) : comme R est de
+    ! toute facon toujours <= LCAP < RATIO*MN par construction, un test
+    ! final qui se contenterait de R < RATIO*MN serait toujours vrai des
+    ! qu'on atteint le plafond, meme pour un bloc franchement plein rang,
+    ! et inventerait un rang = LCAP au lieu du repli dense correct.
+    ! MARGIN_OK trace donc explicitement laquelle des deux conditions
+    ! d'arret a declenche la sortie de boucle, pour que la decision finale
+    ! s'appuie dessus plutot que sur une relecture de R seul.
     L = MIN(2*OVS, MN, LCAP)
     IGROW = 0
     MARGIN_OK = .FALSE.
@@ -835,11 +824,12 @@ CONTAINS
   ! ligne I et la ligne IPIV(I) -- PAS un vecteur de permutation a appliquer
   ! d'un coup, une SEQUENCE ordonnee de swaps).
   !
-  ! POURQUOI CA RESTE BON MARCHE EN BLR (le point cle du pivot confine au
-  ! bloc diagonal, cf. discussion avec l'utilisateur) : permuter des LIGNES
-  ! d'un bloc bas-rang A~=UFAC*VFAC ne touche QUE UFAC (VFAC n'a aucune
-  ! notion de ligne) -- cout O(rang) par swap, JAMAIS de decompression.
-  ! Cas dense : swap direct sur DENSE, cout O(N) par swap (standard).
+  ! POURQUOI CA RESTE BON MARCHE EN BLR (le point cle qui rend le pivot
+  ! confine au bloc diagonal compatible avec la compression) : permuter
+  ! des lignes d'un bloc bas-rang A~=UFAC*VFAC ne touche que UFAC (VFAC
+  ! n'a aucune notion de ligne) -- cout O(rang) par swap, jamais de
+  ! decompression. Cas dense : swap direct sur DENSE, cout O(N) par swap
+  ! (standard).
   !-----------------------------------------------------------------------
   SUBROUTINE BLR_BLOCK_ROW_SWAP(BLK, KW, IPIV)
     TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
@@ -1245,26 +1235,25 @@ CONTAINS
   END SUBROUTINE BLR_LU_NOPIV_UNBLOCKED
 
   !-----------------------------------------------------------------------
-  ! LU sans pivot, BLOCKEE (right-looking, meme structure que BLOCK_LU_
-  ! FACTOR/block_lu_mod.f90, mais SANS CGETRF/pivot -- ecrite pour remplacer
+  ! LU sans pivot, blockee (right-looking, meme structure que BLOCK_LU_
+  ! FACTOR/block_lu_mod.f90, mais sans CGETRF/pivot) -- remplace
   ! BLR_LU_NOPIV_UNBLOCKED sur le bloc diagonal de mpi_blr_matrix_mod.f90,
-  ! qui domine 40-50% du temps de factorisation a NB>=750 (voir memoire
-  ! projet, decomposition fine 2026-08-27) : la version non blockee ne fait
-  ! que du BLAS niveau 1/2 (CSCAL/CGERU), intrinsequement sequentiel et
-  ! sans reutilisation de cache -- ici, seul le PANNEAU (INNER_NB colonnes,
-  ! petit) reste non blocke (CALL a BLR_LU_NOPIV_UNBLOCKED ci-dessus), le
-  ! GROS du travail (mise a jour de la sous-matrice restante) passe par
-  ! CTRSM/CGEMM (BLAS niveau 3 -- threadable par MKL, bien meilleure
-  ! intensite arithmetique).
+  ! dont le cout domine 40-50% du temps de factorisation a NB>=750 : la
+  ! version non blockee ne fait que du BLAS niveau 1/2 (CSCAL/CGERU),
+  ! intrinsequement sequentiel et sans reutilisation de cache -- ici, seul
+  ! le panneau (INNER_NB colonnes, petit) reste non blocke (CALL a
+  ! BLR_LU_NOPIV_UNBLOCKED ci-dessus), le gros du travail (mise a jour de
+  ! la sous-matrice restante) passe par CTRSM/CGEMM (BLAS niveau 3 --
+  ! threadable par MKL, bien meilleure intensite arithmetique).
   !
-  ! DELIBEREMENT PAS CGETRF (LAPACK) : CGETRF fait du pivot partiel PAR
-  ! CONSTRUCTION, ce qui exigerait de propager les permutations de lignes
+  ! DELIBEREMENT PAS CGETRF (LAPACK) : CGETRF fait du pivot partiel par
+  ! construction, ce qui exigerait de propager les permutations de lignes
   ! aux blocs L21/U12 de la meme ligne/colonne pour rester correct --
-  ! exactement le travail de la Phase 2 ("pivot qui ne decompresse
-  ! jamais") explicitement reportee par l'utilisateur. Cette version reste
-  ! SANS PIVOT DE BOUT EN BOUT, seulement blockee -- meme resultat
-  ! numerique que BLR_LU_NOPIV_UNBLOCKED (mêmes operations, juste
-  ! reordonnees/groupees), pas une nouvelle methode.
+  ! un pivot qui ne decompresse jamais un bloc bas-rang, hors de la portee
+  ! de cette routine. Cette version reste sans pivot de bout en bout,
+  ! seulement blockee -- meme resultat numerique que BLR_LU_NOPIV_
+  ! UNBLOCKED (memes operations, juste reordonnees/groupees), pas une
+  ! nouvelle methode.
   !
   ! INFO : indice (1-based, GLOBAL au bloc KBxKB) du premier pivot sous
   ! PIVTOL rencontre, 0 si aucun -- meme convention que la version non
@@ -1848,11 +1837,9 @@ CONTAINS
     ! SCHUR_UPDATE_BLOCK pour les blocs diagonaux, CGEMM BETA=1) --
     ! ABLK%DENSE_FLAT (deja de la BONNE taille MI*NJ, fixe pour ce slot de
     ! bloc) est reutilise TEL QUEL, ZERO carve, ZERO copie intermediaire.
-    ! C'est le correctif du gaspillage x28 mesure avec le carve-systematique
-    ! (voir la memoire du projet) : sans cette branche, EXPAND_BLOCK_ARENA
-    ! recopierait ABLK%DENSE dans un NOUVEAU buffer a CHAQUE etape K ou ce
-    ! bloc est touche, alors que son contenu est deja exactement la ou il
-    ! doit etre.
+    ! Sans cette branche, EXPAND_BLOCK_ARENA recopierait ABLK%DENSE dans
+    ! un nouveau buffer a chaque etape K ou ce bloc est touche, alors que
+    ! son contenu est deja exactement la ou il doit etre.
     IF (.NOT. ABLK%IS_LOWRANK) THEN
       IF (PRESENT(T_PRODUCT)) TT0 = OMP_GET_WTIME()
       CALL SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, ABLK%DENSE)
