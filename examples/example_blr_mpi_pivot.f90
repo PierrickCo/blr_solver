@@ -132,7 +132,9 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
 
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
-    IF (MYID0.EQ.0) WRITE(6,*) 'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL]'
+    IF (MYID0.EQ.0) WRITE(6,*) &
+         'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] '// &
+         '[USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF

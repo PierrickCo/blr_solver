@@ -86,7 +86,9 @@ PROGRAM EXAMPLE_USER_MATRIX
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
 
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
-    IF (MYID0.EQ.0) WRITE(6,*) 'Usage: mpirun -np PR*PC ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL]'
+    IF (MYID0.EQ.0) WRITE(6,*) &
+         'Usage: mpirun -np PR*PC ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] '// &
+         '[RATIO] [USE_RSVD] [CHECK_RESIDUAL]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF

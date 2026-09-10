@@ -124,7 +124,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot_ooc PR PC [N] [NB] [NRHS] [TOL] '// &
-         '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR]'
+         '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [EPS] [RATIO] [USE_RSVD] '// &
+         '[CHECK_ERROR] [CHECK_RESIDUAL]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
