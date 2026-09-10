@@ -568,12 +568,12 @@ CONTAINS
   ! HEURISTIQUE, pas une preuve -- valider par mesure sur le cas d'usage
   ! reel avant tout usage en production.
   !-----------------------------------------------------------------------
-  SUBROUTINE COMPRESS_BLOCK_RSVD_ADAPTIVE(M, N, B, LDB, TOL, BLK, OVERSAMPLE, NPOWER, L_INIT, N_GROWTHS)
+  SUBROUTINE COMPRESS_BLOCK_RSVD_ADAPTIVE(M, N, B, LDB, TOL, BLK, OVERSAMPLE, NPOWER, N_GROWTHS)
     INTEGER, INTENT(IN)            :: M, N, LDB
     COMPLEX(WP), INTENT(IN)        :: B(LDB,N)
     REAL(WP), INTENT(IN)           :: TOL
     TYPE(BLR_BLOCK_T), INTENT(OUT) :: BLK
-    INTEGER, INTENT(IN), OPTIONAL  :: OVERSAMPLE, NPOWER, L_INIT
+    INTEGER, INTENT(IN), OPTIONAL  :: OVERSAMPLE, NPOWER
     ! N_GROWTHS (optionnel, INTENT(OUT)) : nombre de doublements de L avant
     ! arret -- diagnostic pratique pour juger si le critere d'arret
     ! converge vite (0-1 doublement, cas courant) ou tatonne (plusieurs
