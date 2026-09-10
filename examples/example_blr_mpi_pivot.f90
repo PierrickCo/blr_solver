@@ -22,9 +22,8 @@
 !         des tableaux via MOVE_ALLOC au lieu de "ABLK=NEWBLK" (qui
 !         declenche une reallocation+copie implicite supplementaire) --
 !         resultat numerique IDENTIQUE, bonne pratique defensive
-!         independante du gain memoire (voir la memoire du projet :
-!         mesure a N=20000, l'effet sur la RSS s'est avere negligeable,
-!         mais le correctif reste correct et sans risque, garde par
+!         independante du gain memoire (mesure a N=20000 : effet sur la
+!         RSS negligeable, mais reste correct et sans risque -- garde par
 !         defaut desactive pour ne rien changer au comportement existant).
 !
 ! EPS (BRUIT PLEIN-RANG, POUR EXPERIMENTER FACILEMENT AVEC LA COMPRESSIBI-
@@ -336,17 +335,16 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
 CONTAINS
 
   ! Taux de compression REEL (stockage bas-rang effectif / stockage dense
-  ! equivalent) -- PAS juste 2*NB*RANK_SUM/(NB^2*N_OFFDIAG) : RANK_SUM
-  ! (MPI_ASSEMBLE_BLR_MATRIX) melange le rang REEL des blocs compresses ET
-  ! un "rang virtuel" = NB pour chaque bloc en repli DENSE (convention
+  ! equivalent) -- pas juste 2*NB*RANK_SUM/(NB^2*N_OFFDIAG) : RANK_SUM
+  ! (MPI_ASSEMBLE_BLR_MATRIX) melange le rang reel des blocs compresses et
+  ! un "rang virtuel" = NB pour chaque bloc en repli dense (convention
   ! interne de comptage, pas un vrai stockage UV) -- un bloc dense compte
-  ! donc NB dans RANK_SUM mais occupe NB^2 elements (PAS 2*NB^2 comme le
-  ! sous-entendrait la formule naive). BOGUE CORRIGE (trouve en testant
-  ! EPS=1.0, ou TOUS les blocs tombent dense : la formule naive donnait
-  ! 200% au lieu de 100%) : on retire d'abord la contribution des N_DENSE
-  ! blocs denses (NB chacun) de RANK_SUM pour isoler le rang reel des
-  ! seuls blocs COMPRESSES, puis on recompte les blocs denses a leur cout
-  ! reel (NB^2, pas 2*NB^2).
+  ! donc NB dans RANK_SUM mais occupe NB^2 elements (pas 2*NB^2 comme le
+  ! sous-entendrait une formule naive, qui donnerait a tort 200% quand
+  ! tout est dense, ex. EPS=1.0). La contribution des N_DENSE blocs denses
+  ! (NB chacun) est donc d'abord retiree de RANK_SUM pour isoler le rang
+  ! reel des seuls blocs compresses, puis les blocs denses sont recomptes
+  ! a leur cout reel (NB^2, pas 2*NB^2).
   REAL(WP) FUNCTION REAL_COMPRESSION_PCT(NCOMP, NOFF, RSUM)
     INTEGER, INTENT(IN)     :: NCOMP, NOFF
     INTEGER(8), INTENT(IN)  :: RSUM
@@ -372,18 +370,14 @@ CONTAINS
   ! EPS dans le commentaire de tete : seul parametre qui degrade la
   ! compressibilite du reste du noyau).
   !
-  ! CORRIGE (2026-09-01, trouve en ajoutant CHECK_ERROR -- voir son
-  ! commentaire de tete) : la version PRECEDENTE utilisait une anti-
-  ! diagonale GLOBALE (GJ=N+1-GI, comme test_mpi_lu_pivot.f90/6d) -- deja
-  ! identifiee ailleurs dans le projet (voir la memoire, "Bug #1") comme
-  ! INJUSTE envers le pivotage CONFINE au bloc diagonal : l'element fort
-  ! peut tomber HORS du bloc que le pivot local peut voir, ce qui rend le
-  ! systeme catastrophiquement mal conditionne. Restait invisible tant que
-  ! les exemples n'avaient AUCUNE verification numerique -- CHECK_ERROR=1
-  ! l'a revele immediatement (erreur ~1e8 au lieu de proche de 0). Corrige
-  ! en confinant l'anti-diagonale au bloc local de GI (meme recette EXACTE
-  ! que test_mpi_blr_matrix_pivot.f90/bench_blr_mpi_pivot_compressibility.
-  ! f90), qui force un pivotage tout aussi reel mais reste bien conditionne.
+  ! L'anti-diagonale est deliberement confinee au bloc local de GI (plutot
+  ! qu'une anti-diagonale globale GJ=N+1-GI) : une anti-diagonale globale
+  ! est injuste envers le pivotage confine au bloc diagonal, puisque
+  ! l'element fort peut tomber hors du bloc que le pivot local peut voir,
+  ! ce qui rend le systeme catastrophiquement mal conditionne. Confiner
+  ! l'anti-diagonale au bloc local (meme recette que test_mpi_blr_matrix_
+  ! pivot.f90/bench_blr_mpi_pivot_compressibility.f90) force un pivotage
+  ! tout aussi reel tout en restant bien conditionne.
   ! Extrait en fonction independante (au lieu d'etre inline dans GET_BLOCK)
   ! pour etre reutilisable par FILL_B en mode CHECK_ERROR (produit brut
   ! B=A*Xexact, voir commentaire de tete).
@@ -470,9 +464,8 @@ CONTAINS
   ! de la solution exacte (contrairement a COMPUTE_ERR), utilisable meme
   ! si A et B viennent d'un vrai probleme utilisateur.
   !
-  ! OPTIMISE (2026-09-01, demande explicite -- version scalaire initiale
-  ! mesuree ~2x plus lente que necessaire a N=8000, voir la memoire du
-  ! projet pour le detail de la mesure) : DEUX changements combines --
+  ! DEUX optimisations combinees par rapport a une triple boucle scalaire
+  ! naive (mesuree ~12x plus lente a N=8000) --
   !   1) BLAS (CGEMM) au lieu d'une triple boucle scalaire : A est
   !      materialisee PAR BLOCS DE LIGNES (NB a la fois, via GET_BLOCK deja
   !      existant -- PAS la matrice entiere, juste un tampon transitoire
@@ -573,8 +566,8 @@ CONTAINS
     COMPUTE_RESIDUAL = SQRT(NUM2) / SQRT(DEN2)
   END FUNCTION COMPUTE_RESIDUAL
 
-  ! DEMANDE EXPLICITE (2026-09-01) : meme optimisation BLAS que COMPUTE_
-  ! RESIDUAL pour le cas CHECK_ERROR=1 (B=A*Xexact, seul cas ou B_ENTRY
+  ! Meme optimisation BLAS que COMPUTE_RESIDUAL pour le cas CHECK_ERROR=1
+  ! (B=A*Xexact, seul cas ou B_ENTRY
   ! fait une somme O(N) couteuse -- sinon B_ENTRY est O(1), boucle scalaire
   ! directe conservee). Pas de plafonnage par un budget memoire ICI (le
   ! solveur classique n'a pas de notion de MAX_MB_PER_PROCESS) : le tampon

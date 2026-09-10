@@ -91,9 +91,9 @@ PROGRAM EXAMPLE_BLR_SEQUENTIEL
 CONTAINS
 
   ! Matrice "diagonale + basse-rang" a diagonale dominante (ASSEMBLE_BLR_
-  ! MATRIX suppose une matrice dense en entree ; SANS PIVOT, comme tous
-  ! les solveurs de ce projet -- voir README.md, section "Limites").
-  ! Remplacer ce callback par sa propre formule/assemblage pour un cas reel.
+  ! MATRIX suppose une matrice dense en entree ; sans pivot -- voir
+  ! README.md, section "Limites"). Remplacer ce callback par sa propre
+  ! formule/assemblage pour un cas reel.
   SUBROUTINE GET_BLOCK(ISTART, IEND, JSTART, JEND, BLK)
     INTEGER, INTENT(IN)      :: ISTART, IEND, JSTART, JEND
     COMPLEX(WP), INTENT(OUT) :: BLK(IEND-ISTART+1, JEND-JSTART+1)

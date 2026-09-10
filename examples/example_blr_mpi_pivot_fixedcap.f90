@@ -7,7 +7,7 @@
 ! (example_blr_mpi_pivot_arena.f90) -- voir mpi_blr_matrix_mod.f90, type
 ! MPI_BLR_MATRIX_FIXEDCAP_T.
 !
-! PRINCIPE (demande explicite de l'utilisateur) : les blocs bas-rang
+! PRINCIPE : les blocs bas-rang
 ! stockent le rang MAXIMAL que COMPRESS_WORTHWHILE_RATIO autorise (RMAX),
 ! alloue UNE SEULE FOIS -- JAMAIS realloue ensuite, quelle que soit la
 ! fluctuation du rang REEL au fil des recompressions (voir

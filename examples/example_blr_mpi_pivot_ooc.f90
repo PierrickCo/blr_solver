@@ -5,10 +5,10 @@
 ! l'executable existant (example_blr_mpi_pivot, JAMAIS modifie) -- voir
 ! mpi_blr_matrix_mod.f90, type MPI_BLR_MATRIX_OOC_T, et blr_ooc_mod.f90.
 !
-! PRINCIPE (demande explicite : ne plus etre limite par la RAM disponible,
-! ni pour la matrice, ni pour les facteurs LU apres remplissage de Schur,
-! ni pour un second membre massif) -- 4 ETAPES SEPAREES, chacune bornee en
-! memoire par un parametre utilisateur :
+! PRINCIPE : ne plus etre limite par la RAM disponible, ni pour la
+! matrice, ni pour les facteurs LU apres remplissage de Schur, ni pour un
+! second membre massif -- 4 etapes separees, chacune bornee en memoire
+! par un parametre utilisateur :
 !   1) assemblage de A       -> ecrit sur un fichier scratch PAR PROCESSUS
 !      (jamais partage), borne par MAX_MB_PER_PROCESS (cache LRU).
 !   2) assemblage du second membre B -> ECRIT SUR DISQUE LUI AUSSI, par
@@ -26,7 +26,8 @@
 !
 ! Base sur l'algorithme CLASSIQUE (jamais l'arena -- le cycle allocate/
 ! deallocate individuel de BLR_BLOCK_T se prete naturellement a l'eviction
-! disque, voir la memoire du projet).
+! disque, contrairement a l'arena qui ne libere jamais un bloc
+! individuellement).
 !
 ! CHOISIR MAX_MB_PER_PROCESS (voir le commentaire detaille sur MPI_BLR_
 ! MATRIX_OOC_T dans mpi_blr_matrix_mod.f90, mesures a l'appui) : NE PAS le
@@ -266,7 +267,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   ! (chaotique, mal conditionnee), la valeur numerique de X(:,1) peut
   ! varier legerement avec NRHS_BATCH (simple precision + formes d'appels
   ! BLAS differentes amplifiees par le mauvais conditionnement) -- ce n'est
-  ! pas un signe d'erreur, voir la memoire du projet.
+  ! pas un signe d'erreur.
   IF (MYID0 .EQ. 0) THEN
     WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
     BLOCK
@@ -575,15 +576,14 @@ CONTAINS
   ! par entree -- boucle scalaire directe conservee) ou produit BRUT
   ! B=A*Xexact (CHECK_ERROR=1, voir commentaire de tete).
   !
-  ! DEMANDE EXPLICITE (2026-09-01) : meme optimisation BLAS que COMPUTE_
-  ! RESIDUAL pour le cas CHECK_ERROR=1, ET MEME PLAFONNAGE par
-  ! MAX_MB_PER_PROCESS -- [ISTART,IEND] (fourni par MPI_ASSEMBLE_RHS_OOC)
-  ! n'est PAS garanti respecter le budget a lui seul (sa largeur depend de
-  ! la structure BLR, pas du budget memoire utilisateur), donc le tampon
-  ! ABLOCK(CHUNK,N) est encore sous-decoupe si besoin -- EXACTEMENT le
-  ! meme raisonnement que le correctif de COMPUTE_RESIDUAL (voir son
-  ! commentaire), applique ici pour la meme raison : ne jamais laisser un
-  ! tampon BLAS depasser le budget annonce par l'utilisateur.
+  ! Meme optimisation BLAS que COMPUTE_RESIDUAL pour le cas CHECK_ERROR=1,
+  ! et meme plafonnage par MAX_MB_PER_PROCESS -- [ISTART,IEND] (fourni par
+  ! MPI_ASSEMBLE_RHS_OOC) n'est pas garanti respecter le budget a lui seul
+  ! (sa largeur depend de la structure BLR, pas du budget memoire
+  ! utilisateur), donc le tampon ABLOCK(CHUNK,N) est encore sous-decoupe
+  ! si besoin -- meme raisonnement que dans COMPUTE_RESIDUAL (voir son
+  ! commentaire) : ne jamais laisser un tampon BLAS depasser le budget
+  ! annonce par l'utilisateur.
   SUBROUTINE FILL_RHS(ISTART, IEND, RSTART, REND, BLK)
     INTEGER, INTENT(IN)      :: ISTART, IEND, RSTART, REND
     COMPLEX(WP), INTENT(OUT) :: BLK(IEND-ISTART+1, REND-RSTART+1)

@@ -28,8 +28,7 @@
 ! de compression ci-dessous.
 !
 ! X (SOLUTION) : ECRITE SUR DISQUE, jamais accumulee en RAM -- coherent
-! avec A et B, voir la memoire du projet (question explicite : "si
-! X_GLOBAL n'est plus utile, peux-tu le supprimer ?"). CONSUME_X_BATCH
+! avec A et B. CONSUME_X_BATCH
 ! ecrit CHAQUE paquet directement dans UN SEUL FICHIER PAR PROCESSUS
 ! (x_rank_NNNNNN.dat dans SCRATCH_DIR, meme convention que a_rank_*/
 ! b_rank_*), SANS AUCUNE communication MPI (chaque processus ecrit SA

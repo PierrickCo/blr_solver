@@ -8,11 +8,10 @@
 !
 ! SEULE difference : le stockage des blocs hors-diagonale (A_BLR%OFFBLK)
 ! utilise un allocateur "arena" (voir blr_arena_mod.f90) au lieu d'un
-! ALLOCATE/DEALLOCATE individuel par bloc et par recompression -- correctif
-! identifie et documente apres investigation de l'ecart RSS-vs-theorique
-! (voir examples/README.md et la memoire du projet). Ce fichier sert
-! precisement a MESURER si l'arena reduit effectivement cet ecart, au prix
-! du compromis assume (aucune recuperation de l'espace des anciennes
+! ALLOCATE/DEALLOCATE individuel par bloc et par recompression, en reponse
+! a la fragmentation de tas observee (voir examples/README.md). Ce fichier
+! sert precisement a mesurer si l'arena reduit effectivement cet ecart, au
+! prix du compromis assume (aucune recuperation de l'espace des anciennes
 ! versions de blocs -- voir blr_arena_mod.f90).
 !
 ! A_BLR doit etre declaree TARGET ICI (voir le commentaire detaille dans
