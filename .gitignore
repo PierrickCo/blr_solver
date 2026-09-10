@@ -35,8 +35,6 @@ legacy/bench_mpi_full
 
 # Sorties de scripts (regenerables, pas versionnees)
 run_all_tests_logs/
-bench/logs/
-bench/results_*.csv
 
 # Fichiers de scratch out-of-core (voir src/blr_ooc_mod.f90) : crees a
 # l'execution dans un sous-dossier relatif au repertoire de lancement,
