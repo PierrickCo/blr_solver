@@ -16,8 +16,8 @@
 ! test/test_mpi_blr_matrix_pivot.f90 pour la version qui verifie aussi la
 ! correction contre une reference independante).
 !
-! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL]
-!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 USE_MOVE_ALLOC=0 EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0)
+! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE]
+!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 USE_MOVE_ALLOC=0 EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0)
 !         USE_MOVE_ALLOC=1 : SCHUR_UPDATE_BLR_BLOCK transfere la propriete
 !         des tableaux via MOVE_ALLOC au lieu de "ABLK=NEWBLK" (qui
 !         declenche une reallocation+copie implicite supplementaire) --
@@ -101,6 +101,17 @@
 ! part), ZERO cout memoire au-dela de X_GLOBAL deja gathere sur le rang 0.
 ! Cout CALCUL O(N^2*NRHS) -- cumulatif avec CHECK_ERROR si les deux sont
 ! actifs (chacun refait sa propre passe O(N^2*NRHS), voir plus bas).
+!
+! PROFILE_USAGE (defaut 0) : si 1, chaque processus enregistre a chaque
+! etape du solveur (debut, assemblage, factorisation, second membre,
+! resolution, verifications eventuelles, fin) le temps ecoule, sa RSS
+! (Mo) et son taux d'utilisation CPU depuis l'echantillon precedent, en
+! % d'un coeur (CPU_TIME/temps ecoule -- peut depasser 100% si plusieurs
+! threads MKL/OpenMP sont actifs simultanement, comme le %CPU de `top`).
+! Ecrit un fichier usage_profile_rank<N>.csv par processus (jamais lu
+! par ce programme, cout d'echantillonnage negligeable devant le reste).
+! Tracer l'evolution : python3 examples/plot_usage_profile.py [dossier]
+! (necessite matplotlib ; lit tous les usage_profile_rank*.csv trouves).
 !===============================================================================
 PROGRAM EXAMPLE_BLR_MPI_PIVOT
   USE MPI_BLR_MATRIX_MOD
@@ -119,13 +130,23 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   INTEGER :: N_COMPRESSED, N_OFFDIAG, li, I
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR, T_SOLVE, T0, T1
-  INTEGER :: USE_MOVE_ALLOC_INT, USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT
-  LOGICAL :: USE_MOVE_ALLOC_FLAG, USE_RSVD_FLAG, CHECK_ERROR_FLAG, CHECK_RESIDUAL_FLAG
+  INTEGER :: USE_MOVE_ALLOC_INT, USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT
+  LOGICAL :: USE_MOVE_ALLOC_FLAG, USE_RSVD_FLAG, CHECK_ERROR_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG
   DOUBLE PRECISION :: RSS_MAX_B_MB, RSS_MAX_RESID_MB
   REAL(WP) :: ERR, RESID
 
+  ! Suivi memoire/CPU par etape (PROFILE_USAGE) -- tableaux de taille fixe,
+  ! largement au-dela des ~8 etapes reellement utilisees ci-dessous.
+  INTEGER, PARAMETER :: MAX_PROFILE_SAMPLES = 32
+  CHARACTER(LEN=40) :: PROF_STAGE(MAX_PROFILE_SAMPLES)
+  DOUBLE PRECISION :: PROF_T(MAX_PROFILE_SAMPLES), PROF_RSS_MB(MAX_PROFILE_SAMPLES), PROF_CPU_PCT(MAX_PROFILE_SAMPLES)
+  INTEGER :: PROF_N
+  DOUBLE PRECISION :: PROF_T_START, PROF_T_PREV
+  REAL :: PROF_CPU_PREV
+
   N = 4000; NB = 200; NRHS = 4; TOL = 1.0E-4_WP; USE_MOVE_ALLOC_INT = 0; EPS = 0.0_WP
-  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0
+  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0; PROFILE_USAGE_INT = 0
+  PROF_N = 0
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
@@ -133,7 +154,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] '// &
-         '[USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL]'
+         '[USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -169,10 +190,14 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   IF (COMMAND_ARGUMENT_COUNT() .GE. 12) THEN
     CALL GET_COMMAND_ARGUMENT(12, ARG); READ(ARG,*) CHECK_RESIDUAL_INT
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 13) THEN
+    CALL GET_COMMAND_ARGUMENT(13, ARG); READ(ARG,*) PROFILE_USAGE_INT
+  END IF
   USE_MOVE_ALLOC_FLAG = (USE_MOVE_ALLOC_INT .NE. 0)
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_ERROR_FLAG = (CHECK_ERROR_INT .NE. 0)
   CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
+  PROFILE_USAGE_FLAG = (PROFILE_USAGE_INT .NE. 0)
 
   ! Surcharge COMPRESS_WORTHWHILE_RATIO (blr_compress_mod.f90) AVANT tout
   ! assemblage/factorisation -- voir SET_COMPRESS_WORTHWHILE_RATIO et le
@@ -201,6 +226,9 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     IF (CHECK_RESIDUAL_FLAG) THEN
       WRITE(6,'(A)') ' Verification : residu ||A*X-B||/||B|| affiche en fin de resolution'
     END IF
+    IF (PROFILE_USAGE_FLAG) THEN
+      WRITE(6,'(A)') ' Profilage RSS/CPU par etape active : usage_profile_rank<N>.csv par processus'
+    END IF
   END IF
 
   ! RSS DE REFERENCE : capturee AVANT toute allocation de donnees (A_BLR,
@@ -209,6 +237,11 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! croissance imputable a NOTRE code. Comparer (RSS_apres - RSS_reference)
   ! a la valeur theorique est un test plus honnete que RSS_apres seule,
   ! qui melange les deux.
+  PROF_T_START = MPI_WTIME()
+  PROF_T_PREV = 0.0D0
+  CALL CPU_TIME(PROF_CPU_PREV)
+  CALL PROFILE_SAMPLE('debut')
+
   CALL REPORT_MEMORY_MB(GRID, 'RSS de reference (avant donnees)', GET_RSS_KB()*1024_8)
 
   ! --- 1) assemblage BLR distribue (matrice "anti-diagonale forte / diagonale
@@ -248,6 +281,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! autour de 2.5-3x (mesure) -- c'est ce second regime qui sert de
   ! reference pour detecter une VRAIE anomalie (fuite, copie oubliee).
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage)', GET_RSS_KB()*1024_8)
+  CALL PROFILE_SAMPLE('assemblage')
 
   ! --- 2) factorisation LU, AVEC pivot confine au bloc diagonal ----------
   ! SHOW_PROGRESS=.TRUE. : ici K/NBLK est un pourcentage EXACT (boucle
@@ -272,6 +306,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! de l'assemblage (fill-in de la mise a jour de Schur).
   CALL REPORT_MEMORY_MB(GRID, 'Facteurs LU (compresses)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres factorisation)', GET_RSS_KB()*1024_8)
+  CALL PROFILE_SAMPLE('factorisation')
 
   ! --- 3) second membre B, distribue par blocs-lignes ET par colonnes sur
   !     NRHS -- formule deterministe, sans communication ---
@@ -289,6 +324,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
        WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant B=A*Xexact = ', RSS_MAX_B_MB, ' Mo'
   CALL REPORT_MEMORY_MB(GRID, 'Second membre B', 8_8*INT(MLOC,8)*INT(NRHS_LOC,8))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres allocation B)', GET_RSS_KB()*1024_8)
+  CALL PROFILE_SAMPLE('second_membre')
 
   ! --- 4) resolution 2D, AVEC pivot (applique la meme sequence de swaps
   !     que celle utilisee a la factorisation, deja diffusee a la grille) --
@@ -301,6 +337,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   T1 = MPI_WTIME()
   T_SOLVE = T1 - T0
   IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Resolution : ', T_SOLVE, ' s'
+  CALL PROFILE_SAMPLE('resolution')
 
   ALLOCATE(X_GLOBAL(N,NRHS))
   CALL GATHER_2D_RHS(GRID, N, NB, NRHS, B_LOCAL, MAX(MLOC,1), NRHS_LOC, 0, X_GLOBAL)
@@ -313,6 +350,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     IF (CHECK_ERROR_FLAG) THEN
       ERR = COMPUTE_ERR(X_GLOBAL)
       WRITE(6,'(A,ES12.4)') ' Erreur relative ||X-Xexact|| / ||Xexact|| = ', ERR
+      CALL PROFILE_SAMPLE('verif_erreur')
     END IF
   END IF
 
@@ -326,7 +364,11 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
       WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant le residu = ', RSS_MAX_RESID_MB, ' Mo'
       WRITE(6,'(A,ES12.4)') ' Residu relatif ||A*X-B|| / ||B|| = ', RESID
     END IF
+    CALL PROFILE_SAMPLE('verif_residu')
   END IF
+
+  CALL PROFILE_SAMPLE('fin')
+  CALL PROFILE_WRITE_CSV()
 
   DEALLOCATE(B_LOCAL, X_GLOBAL)
   CALL MPI_FINALIZE(IERR)
@@ -352,6 +394,59 @@ CONTAINS
     REAL_COMPRESSION_PCT = 100.0_WP * (2.0_WP*REAL(NB,WP)*REAL(RSUM,WP) - REAL(NB,WP)**2*REAL(NDENSE,WP)) &
          / (REAL(NB,WP)**2 * REAL(MAX(NOFF,1),WP))
   END FUNCTION REAL_COMPRESSION_PCT
+
+  ! Echantillon RSS/CPU pour l'etape STAGE_NAME (PROFILE_USAGE, voir le
+  ! commentaire de tete) -- no-op si desactive, pour ne rien couter par
+  ! defaut. CPU_TIME (intrinseque Fortran standard) mesure le temps
+  ! PROCESSEUR consomme par CE processus (tous threads MKL/OpenMP
+  ! confondus), contrairement a MPI_WTIME qui mesure le temps HORLOGE
+  ! ecoule -- leur rapport sur l'intervalle depuis l'echantillon precedent
+  ! donne directement le nombre moyen de coeurs actifs (ex: 3.5 coeurs en
+  ! moyenne s'affiche comme 350%, meme convention que %CPU de `top`).
+  ! Chaque processus echantillonne SON PROPRE etat -- c'est la variation
+  ! ENTRE processus (deja visible ci-dessus via REPORT_MEMORY_MB, mais
+  ! seulement au travers de son max/total reduits) que ce suivi rend
+  ! exploitable point par point dans le graphe genere par
+  ! plot_usage_profile.py.
+  SUBROUTINE PROFILE_SAMPLE(STAGE_NAME)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_NAME
+    REAL :: CPU_NOW
+    DOUBLE PRECISION :: T_NOW, DT_WALL, DT_CPU
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    IF (PROF_N .GE. MAX_PROFILE_SAMPLES) RETURN
+    CALL CPU_TIME(CPU_NOW)
+    T_NOW = MPI_WTIME() - PROF_T_START
+    DT_WALL = T_NOW - PROF_T_PREV
+    DT_CPU = REAL(CPU_NOW - PROF_CPU_PREV, 8)
+    PROF_N = PROF_N + 1
+    PROF_STAGE(PROF_N) = STAGE_NAME
+    PROF_T(PROF_N) = T_NOW
+    PROF_RSS_MB(PROF_N) = REAL(GET_RSS_KB(),8) / 1024.0D0
+    IF (DT_WALL .GT. 1.0D-6) THEN
+      PROF_CPU_PCT(PROF_N) = 100.0D0 * DT_CPU / DT_WALL
+    ELSE
+      PROF_CPU_PCT(PROF_N) = 0.0D0
+    END IF
+    PROF_T_PREV = T_NOW
+    PROF_CPU_PREV = CPU_NOW
+  END SUBROUTINE PROFILE_SAMPLE
+
+  ! Ecrit les echantillons de CE processus dans son propre CSV -- un
+  ! fichier par rang (pas de rassemblement MPI) : simple, jamais de
+  ! collision, chaque rang reste responsable du sien.
+  SUBROUTINE PROFILE_WRITE_CSV()
+    INTEGER :: U, K
+    CHARACTER(LEN=64) :: FNAME
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    WRITE(FNAME,'(A,I0,A)') 'usage_profile_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'rank,stage,t_wall_s,rss_mb,cpu_pct'
+    DO K = 1, PROF_N
+      WRITE(U,'(I0,A,A,A,F12.4,A,F12.3,A,F8.2)') MYID0, ',', TRIM(PROF_STAGE(K)), ',', &
+           PROF_T(K), ',', PROF_RSS_MB(K), ',', PROF_CPU_PCT(K)
+    END DO
+    CLOSE(U)
+  END SUBROUTINE PROFILE_WRITE_CSV
 
   ! Hash deterministe (I,J) -> [-1,1) -- pas de RNG a etat, recalculable
   ! independamment pour n'importe quel bloc par n'importe quel processus

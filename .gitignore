@@ -44,3 +44,8 @@ blr_ooc_scratch*/
 # Graphe de dependances genere par tools/analyze_deps.py (regenerable,
 # pas versionne).
 depgraph.json
+
+# Profils RSS/CPU par etape (PROFILE_USAGE, example_blr_mpi_pivot.f90) et
+# le graphe genere -- un fichier par run, jamais a versionner.
+usage_profile_rank*.csv
+usage_profile.png
