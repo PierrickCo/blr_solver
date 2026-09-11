@@ -108,9 +108,14 @@
 ! (Mo) et son taux d'utilisation CPU depuis l'echantillon precedent, en
 ! % d'un coeur (CPU_TIME/temps ecoule -- peut depasser 100% si plusieurs
 ! threads MKL/OpenMP sont actifs simultanement, comme le %CPU de `top`).
-! Ecrit un fichier usage_profile_rank<N>.csv par processus (jamais lu
-! par ce programme, cout d'echantillonnage negligeable devant le reste).
-! Tracer l'evolution : python3 examples/plot_usage_profile.py [dossier]
+! DANS l'assemblage, la factorisation ET la resolution, un echantillon
+! supplementaire est pris a chaque palier de 5% de progression (via
+! PROGRESS_CALLBACK, voir mpi_blr_matrix_mod.f90) -- pas seulement au
+! debut/fin de chacune -- pour voir l'evolution FINE a l'interieur de
+! ces 3 etapes, pas seulement leurs bornes. Ecrit un fichier
+! usage_profile_rank<N>.csv par processus (jamais lu par ce programme,
+! cout d'echantillonnage negligeable devant le reste). Tracer
+! l'evolution : python3 examples/plot_usage_profile.py [dossier]
 ! (necessite matplotlib ; lit tous les usage_profile_rank*.csv trouves).
 !
 ! DUMP_STRUCTURE (defaut 0) : si 1, chaque processus ecrit la nature de
@@ -150,7 +155,10 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
 
   ! Suivi memoire/CPU par etape (PROFILE_USAGE) -- tableaux de taille fixe,
   ! largement au-dela des ~8 etapes reellement utilisees ci-dessous.
-  INTEGER, PARAMETER :: MAX_PROFILE_SAMPLES = 32
+  ! 32 suffisait pour un point par etape ; avec un echantillon tous les
+  ! 5% DANS l'assemblage/la factorisation/la resolution (~20 chacune), il
+  ! en faut nettement plus -- 128 laisse une bonne marge.
+  INTEGER, PARAMETER :: MAX_PROFILE_SAMPLES = 128
   CHARACTER(LEN=40) :: PROF_STAGE(MAX_PROFILE_SAMPLES)
   DOUBLE PRECISION :: PROF_T(MAX_PROFILE_SAMPLES), PROF_RSS_MB(MAX_PROFILE_SAMPLES), PROF_CPU_PCT(MAX_PROFILE_SAMPLES)
   INTEGER :: PROF_N
@@ -272,7 +280,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! (voir mpi_blr_matrix_mod.f90 -- approximative ici, l'assemblage n'est
   ! pas synchronise entre processus, contrairement aux 2 etapes suivantes).
   CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, T_ASM, &
-                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., USE_RSVD=USE_RSVD_FLAG)
+                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., USE_RSVD=USE_RSVD_FLAG, &
+                                PROGRESS_CALLBACK=PROFILE_CALLBACK_ASSEMBLY)
   ! N_COMPRESSED/N_OFFDIAG sont deja des sommes GLOBALES (MPI_ALLREDUCE
   ! interne a MPI_ASSEMBLE_BLR_MATRIX) -- identiques sur tous les
   ! processus, un seul affichage (rang 0) suffit, pas une approximation.
@@ -311,7 +320,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
                                        N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
                                        SHOW_PROGRESS=.TRUE., SHOW_RSS_TRACE=.TRUE., &
-                                       USE_MOVE_ALLOC=USE_MOVE_ALLOC_FLAG)
+                                       USE_MOVE_ALLOC=USE_MOVE_ALLOC_FLAG, &
+                                       PROGRESS_CALLBACK=PROFILE_CALLBACK_FACTOR)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT, INFO=', INFO
     CALL MPI_FINALIZE(IERR)
@@ -356,7 +366,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! factorisation -- boucle globalement synchronisee).
   CALL MPI_BARRIER(MPI_COMM_WORLD, IERR)
   T0 = MPI_WTIME()
-  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE.)
+  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE., &
+                                         PROGRESS_CALLBACK=PROFILE_CALLBACK_SOLVE)
   T1 = MPI_WTIME()
   T_SOLVE = T1 - T0
   IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Resolution : ', T_SOLVE, ' s'
@@ -453,6 +464,46 @@ CONTAINS
     PROF_T_PREV = T_NOW
     PROF_CPU_PREV = CPU_NOW
   END SUBROUTINE PROFILE_SAMPLE
+
+  ! Etiquette "STAGE@NN%" pour un echantillon intra-etape (voir les 3
+  ! callbacks ci-dessous). Le separateur "@" (absent des etiquettes de
+  ! bornes d'etape comme 'assemblage'/'factorisation') permet a
+  ! plot_usage_profile.py de ne tracer un trait de repere que sur les
+  ! bornes, sans encombrer le graphe d'un trait tous les 5%.
+  FUNCTION PCT_LABEL(STAGE, NDONE, NTOTAL) RESULT(LBL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    CHARACTER(LEN=40) :: LBL
+    WRITE(LBL,'(A,A,I0,A)') TRIM(STAGE), '@', (100*NDONE)/MAX(NTOTAL,1), '%'
+  END FUNCTION PCT_LABEL
+
+  ! Les 3 callbacks ci-dessous ont l'interface STAGE_PROGRESS_CALLBACK_IFACE
+  ! (mpi_blr_matrix_mod.f90) : appeles PAR LA BIBLIOTHEQUE au franchissement
+  ! de chaque palier de 5% DANS l'assemblage/la factorisation/la resolution
+  ! (voir PROGRESS_CALLBACK dans les 3 appels ci-dessus) -- c'est ce qui
+  ! rend possible un echantillon RSS/CPU a une fraction donnee d'une etape,
+  ! impossible depuis ce fichier seul puisque les boucles concernees sont
+  ! internes a mpi_blr_matrix_mod.f90. Procedures INTERNES (CONTAINS)
+  ! passees comme argument reel -- autorise depuis Fortran 2008, garde
+  ! l'acces par host-association a PROFILE_SAMPLE/PROFILE_USAGE_FLAG sans
+  ! variable de module supplementaire.
+  SUBROUTINE PROFILE_CALLBACK_ASSEMBLY(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('assemblage', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_ASSEMBLY
+
+  SUBROUTINE PROFILE_CALLBACK_FACTOR(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('factorisation', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_FACTOR
+
+  SUBROUTINE PROFILE_CALLBACK_SOLVE(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('resolution', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_SOLVE
 
   ! Ecrit les echantillons de CE processus dans son propre CSV -- un
   ! fichier par rang (pas de rassemblement MPI) : simple, jamais de

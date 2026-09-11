@@ -55,6 +55,19 @@ MODULE MPI_BLR_MATRIX_MOD
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
 
+  ! Hook optionnel pour un suivi fin (ex: RSS/CPU) de l'avancement DANS
+  ! l'assemblage/la factorisation/la resolution -- ces boucles sont
+  ! internes a ce module, invisibles depuis l'appelant, donc impossibles a
+  ! echantillonner a une fraction donnee sans un tel callback. Appele au
+  ! franchissement de chaque palier de 5% (voir STAGE_PROGRESS_SHOULD_FIRE
+  ! ci-dessous), jamais a chaque iteration -- NTOTAL peut valoir plusieurs
+  ! milliers. NDONE/NTOTAL ont le meme sens que pour PRINT_PROGRESS_BAR.
+  ABSTRACT INTERFACE
+    SUBROUTINE STAGE_PROGRESS_CALLBACK_IFACE(NDONE, NTOTAL)
+      INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    END SUBROUTINE STAGE_PROGRESS_CALLBACK_IFACE
+  END INTERFACE
+
   TYPE :: MPI_BLR_MATRIX_T
     INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
     INTEGER, ALLOCATABLE :: BSTART(:), BEND(:)           ! decoupage GLOBAL, partage
@@ -229,6 +242,21 @@ MODULE MPI_BLR_MATRIX_MOD
 CONTAINS
 
   !-----------------------------------------------------------------------
+  ! .TRUE. exactement quand NDONE fait franchir un nouveau palier de 5%
+  ! depuis NDONE-1 (comparaison par division entiere, meme technique
+  ! qu'un redessin de barre de progression), ou a la toute derniere
+  ! iteration -- garantit un dernier appel a 100% meme si NTOTAL n'est
+  ! pas un multiple de 20.
+  !-----------------------------------------------------------------------
+  LOGICAL FUNCTION STAGE_PROGRESS_SHOULD_FIRE(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    INTEGER :: NT
+    NT = MAX(NTOTAL, 1)
+    STAGE_PROGRESS_SHOULD_FIRE = (NDONE .EQ. NTOTAL) .OR. &
+         ((NDONE*20)/NT .NE. (MAX(NDONE-1,0)*20)/NT)
+  END FUNCTION STAGE_PROGRESS_SHOULD_FIRE
+
+  !-----------------------------------------------------------------------
   ! Repartition round-robin de NBLK blocs sur P proprietaires (1 bloc par
   ! cycle) -- meme principe que NUMROC mais a la granularite BLOC, pas
   ! ELEMENT (donc pas de dependance a NB ici).
@@ -252,7 +280,7 @@ CONTAINS
   SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
                                       T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
                                       SHOW_PROGRESS, T_GET_BLOCK, T_COMPRESS, T_GET_BLOCK_MIN, T_COMPRESS_MIN, &
-                                      USE_RSVD, RSVD_OVERSAMPLE, RSVD_NPOWER)
+                                      USE_RSVD, RSVD_OVERSAMPLE, RSVD_NPOWER, PROGRESS_CALLBACK)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)        :: GRID
     INTEGER, INTENT(IN)             :: N, NB
@@ -280,6 +308,13 @@ CONTAINS
     ! transmis tels quels, voir son commentaire pour leur role.
     LOGICAL, INTENT(IN), OPTIONAL   :: USE_RSVD
     INTEGER, INTENT(IN), OPTIONAL   :: RSVD_OVERSAMPLE, RSVD_NPOWER
+    ! Appele par CHAQUE processus au franchissement d'un palier de 5% de
+    ! SA PROPRE progression LOCALE (NDONE/NTOTAL=NBLKR_LOC*NBLKC_LOC) --
+    ! l'assemblage n'etant pas synchronise entre processus (voir plus
+    ! bas), les instants de franchissement different d'un processus a
+    ! l'autre, ce qui est attendu (voir example_blr_mpi_pivot.f90,
+    ! PROFILE_USAGE). Absent par defaut, aucun surcout si non fourni.
+    PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
     ! DIAGNOSTIC (utile pour evaluer si une SVD randomisee vaut le coup a
     ! la place de CGESVD dans COMPRESS_BLOCK) : T_GET_BLOCK cumule le
     ! temps dans tous les appels GET_BLOCK (evaluation du noyau, diagonal +
@@ -379,6 +414,9 @@ CONTAINS
         ! controle. Seul le rang 0 ecrit ici (PROGRESS deja gate sur
         ! GRID%MYID.EQ.0).
         IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression (rang 0)', NDONE, NTOTAL, PBAR_STATE)
+        IF (PRESENT(PROGRESS_CALLBACK)) THEN
+          IF (STAGE_PROGRESS_SHOULD_FIRE(NDONE, NTOTAL)) CALL PROGRESS_CALLBACK(NDONE, NTOTAL)
+        END IF
       END DO
     END DO
     T_ASM_L = MPI_WTIME() - T0
@@ -664,7 +702,7 @@ CONTAINS
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
                                              N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                             SHOW_PROGRESS, SHOW_RSS_TRACE, USE_MOVE_ALLOC)
+                                             SHOW_PROGRESS, SHOW_RSS_TRACE, USE_MOVE_ALLOC, PROGRESS_CALLBACK)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)          :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(INOUT) :: A_BLR
@@ -684,6 +722,12 @@ CONTAINS
     ! reallocation implicite de "ABLK = NEWBLK" au profit d'un transfert
     ! de propriete (MOVE_ALLOC). Resultat numerique IDENTIQUE.
     LOGICAL, INTENT(IN), OPTIONAL     :: USE_MOVE_ALLOC
+    ! Appele par TOUS les processus au franchissement d'un palier de 5%
+    ! de K/NBLK -- contrairement a l'assemblage, cette boucle est
+    ! GLOBALEMENT synchronisee (voir plus bas), donc tous les processus
+    ! franchissent chaque palier au meme K, pas d'ecart entre eux comme a
+    ! l'assemblage. Absent par defaut, aucun surcout si non fourni.
+    PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
@@ -855,6 +899,9 @@ CONTAINS
       END DO
 
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU (pivot)', K, NBLK, PBAR_STATE)
+      IF (PRESENT(PROGRESS_CALLBACK)) THEN
+        IF (STAGE_PROGRESS_SHOULD_FIRE(K, NBLK)) CALL PROGRESS_CALLBACK(K, NBLK)
+      END IF
       ! N'affiche que le maximum observe, pas une ligne par K -- le detail
       ! par etape sert au diagnostic fin de l'ecart RSS-vs-theorique (voir
       ! examples/README.md), le maximum seul suffit en usage courant.
@@ -1108,13 +1155,19 @@ CONTAINS
   ! CTRSM de substitution avant. La substitution arriere n'a besoin d'AUCUN
   ! pivot (U*X=Y ne depend pas de P -- convention standard P*A=L*U).
   !-----------------------------------------------------------------------
-  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS)
+  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS, &
+                                               PROGRESS_CALLBACK)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)           :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(IN) :: A_BLR
     INTEGER, INTENT(IN)                :: NRHS, NRHS_LOC, LDB
     COMPLEX(WP), INTENT(INOUT)         :: B_LOCAL(MAX(LDB,1),MAX(NRHS_LOC,1))
     LOGICAL, INTENT(IN), OPTIONAL      :: SHOW_PROGRESS
+    ! Appele par TOUS les processus au franchissement d'un palier de 5%
+    ! de STEP/NSTEPS -- boucle GLOBALEMENT synchronisee (voir plus bas),
+    ! meme remarque que pour MPI_BLR_MATRIX_LU_FACTOR_PIVOT. Absent par
+    ! defaut, aucun surcout si non fourni.
+    PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
@@ -1232,6 +1285,9 @@ CONTAINS
       DEALLOCATE(XK_FULL)
       STEP = STEP + 1
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution (pivot)', STEP, NSTEPS, PBAR_STATE)
+      IF (PRESENT(PROGRESS_CALLBACK)) THEN
+        IF (STAGE_PROGRESS_SHOULD_FIRE(STEP, NSTEPS)) CALL PROGRESS_CALLBACK(STEP, NSTEPS)
+      END IF
     END DO
 
     ! === 2) U*X = Y (substitution arriere) -- AUCUN pivot necessaire ===
@@ -1305,6 +1361,9 @@ CONTAINS
       DEALLOCATE(XK_FULL)
       STEP = STEP + 1
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution (pivot)', STEP, NSTEPS, PBAR_STATE)
+      IF (PRESENT(PROGRESS_CALLBACK)) THEN
+        IF (STAGE_PROGRESS_SHOULD_FIRE(STEP, NSTEPS)) CALL PROGRESS_CALLBACK(STEP, NSTEPS)
+      END IF
     END DO
 
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)

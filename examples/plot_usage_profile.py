@@ -76,16 +76,21 @@ def main():
     ax_cpu.set_title('Utilisation CPU par processus (100% = 1 coeur pleinement utilise)')
     ax_cpu.grid(True, alpha=0.3)
 
-    # Stage boundaries, taken from rank 0 (or the lowest rank present) as
-    # a reference timeline -- other ranks may be missing a stage (e.g.
-    # CHECK_ERROR is rank-0-only) but the timing is roughly synchronized
-    # by the solver's own MPI collectives. Fast stages (e.g. the
-    # verification passes on a small problem) can land within a fraction
-    # of a percent of the total run time of each other -- individually
-    # labeling each would just overlap into an illegible smear, so nearby
-    # boundaries are merged into a single combined label.
+    # Stage BOUNDARIES only (e.g. 'assemblage', not the fine-grained
+    # 'assemblage@45%' samples PROFILE_USAGE also records inside that
+    # stage) -- those carry the "@" separator and exist purely to give
+    # the curves themselves more resolution; marking each with its own
+    # vertical line would be ~20 lines per stage, illegible clutter.
+    # Boundaries are taken from rank 0 (or the lowest rank present) as a
+    # reference timeline -- other ranks may be missing one (e.g.
+    # CHECK_ERROR is rank-0-only) but timing is roughly synchronized by
+    # the solver's own MPI collectives. Fast stages (e.g. verification
+    # passes on a small problem) can still land within a fraction of a
+    # percent of each other -- individually labeling each would overlap
+    # into an illegible smear, so nearby boundaries are merged into one
+    # combined label.
     ref_rank = min(profiles)
-    ref_rows = profiles[ref_rank]
+    ref_rows = [r for r in profiles[ref_rank] if '@' not in r[0]]
     xlim = ax_mem.get_xlim()
     gap_threshold = 0.03 * (xlim[1] - xlim[0] or 1.0)
     clusters = []  # list of [t, [stage, ...]]
@@ -103,7 +108,7 @@ def main():
     fig.tight_layout()
     fig.savefig(output, dpi=150)
     print(f"Ecrit {output} ({len(profiles)} processus, "
-          f"{len(profiles[ref_rank])} etapes).")
+          f"{len(profiles[ref_rank])} echantillons, {len(clusters)} etapes reperees).")
 
 
 if __name__ == '__main__':
