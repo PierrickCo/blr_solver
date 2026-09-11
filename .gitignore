@@ -40,3 +40,7 @@ run_all_tests_logs/
 # l'execution dans un sous-dossier relatif au repertoire de lancement,
 # jamais a versionner.
 blr_ooc_scratch*/
+
+# Graphe de dependances genere par tools/analyze_deps.py (regenerable,
+# pas versionne).
+depgraph.json
