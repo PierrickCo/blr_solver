@@ -1220,7 +1220,6 @@ CONTAINS
       PROW_K = MOD(K-1, GRID%PR)
       PCOL_K = MOD(K-1, GRID%PC)
 
-      ALLOCATE(XK_FULL(KW,NRHS))
       IF (GRID%MYROW .EQ. PROW_K) THEN
         ALLOCATE(DKK(KW,KW))
         IF (GRID%MYCOL .EQ. PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
@@ -1234,14 +1233,36 @@ CONTAINS
         DEALLOCATE(DKK)
         ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
         IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+      END IF
+      ! Seule la colonne PCOL_K possede les blocs (I,K) necessaires a la
+      ! correction des lignes en aval (voir BLR_BLOCK_APPLY plus bas,
+      ! toujours gate sur MYCOL==PCOL_K) -- inutile de reconstituer puis
+      ! diffuser le panneau X_K en LARGEUR COMPLETE (NRHS) sur TOUTES les
+      ! colonnes, les autres ne l'auraient jamais lu. Un GATHERV (pas un
+      ! ALLGATHERV) suffit, avec un tampon complet SEULEMENT chez la
+      ! racine PCOL_K ; ailleurs, un tampon factice de taille 1 (ignore
+      ! par MPI pour un appelant non-racine).
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        ALLOCATE(XK_FULL(KW,NRHS))
+      ELSE
+        ALLOCATE(XK_FULL(1,1))
+      END IF
+      IF (GRID%MYROW .EQ. PROW_K) THEN
         DO C = 0, GRID%PC-1
           RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
         END DO
-        CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
-                             XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+        CALL MPI_GATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                          XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
         DEALLOCATE(XK_LOC)
       END IF
-      CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+      ! Diffusion DANS la colonne PCOL_K uniquement (jamais vers les
+      ! autres colonnes, qui ne l'utiliseraient pas) -- COL_COMM ne
+      ! regroupe de toute facon que les processus de MEME MYCOL, donc cet
+      ! IF ne desynchronise rien : tous les membres de CE COL_COMM (ceux
+      ! a MYCOL==PCOL_K) l'executent identiquement.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+      END IF
 
       lj = (K-1)/GRID%PC + 1
       NROWTRAIL = 0
@@ -1250,8 +1271,8 @@ CONTAINS
         IF (I .GT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
       END DO
       IF (NROWTRAIL .GT. 0) THEN
-        ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
         IF (GRID%MYCOL .EQ. PCOL_K) THEN
+          ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
           CONTRIB = CZERO
           RE = 0
           DO li = 1, A_BLR%NBLKR_LOC
@@ -1261,6 +1282,8 @@ CONTAINS
             CALL BLR_BLOCK_APPLY(A_BLR%OFFBLK(li,lj), NRHS, CONE, XK_FULL, KW, CONE, CONTRIB(RE+1,1), NROWTRAIL)
             RE = RE + MI
           END DO
+        ELSE
+          ALLOCATE(CONTRIB(1,1))
         END IF
         ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
         DO C = 0, GRID%PC-1
@@ -1296,7 +1319,6 @@ CONTAINS
       PROW_K = MOD(K-1, GRID%PR)
       PCOL_K = MOD(K-1, GRID%PC)
 
-      ALLOCATE(XK_FULL(KW,NRHS))
       IF (GRID%MYROW .EQ. PROW_K) THEN
         ALLOCATE(DKK(KW,KW))
         IF (GRID%MYCOL .EQ. PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
@@ -1310,14 +1332,25 @@ CONTAINS
         DEALLOCATE(DKK)
         ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
         IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+      END IF
+      ! Voir le meme changement dans la substitution avant ci-dessus :
+      ! seule la colonne PCOL_K possede les blocs (I,K) necessaires ici.
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        ALLOCATE(XK_FULL(KW,NRHS))
+      ELSE
+        ALLOCATE(XK_FULL(1,1))
+      END IF
+      IF (GRID%MYROW .EQ. PROW_K) THEN
         DO C = 0, GRID%PC-1
           RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
         END DO
-        CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
-                             XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, GRID%ROW_COMM, IERR)
+        CALL MPI_GATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, &
+                          XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
         DEALLOCATE(XK_LOC)
       END IF
-      CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+      END IF
 
       lj = (K-1)/GRID%PC + 1
       NROWTRAIL = 0
@@ -1326,8 +1359,8 @@ CONTAINS
         IF (I .LT. K) NROWTRAIL = NROWTRAIL + A_BLR%BEND(I)-A_BLR%BSTART(I)+1
       END DO
       IF (NROWTRAIL .GT. 0) THEN
-        ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
         IF (GRID%MYCOL .EQ. PCOL_K) THEN
+          ALLOCATE(CONTRIB(NROWTRAIL,NRHS))
           CONTRIB = CZERO
           RE = 0
           DO li = 1, A_BLR%NBLKR_LOC
@@ -1337,6 +1370,8 @@ CONTAINS
             CALL BLR_BLOCK_APPLY(A_BLR%OFFBLK(li,lj), NRHS, CONE, XK_FULL, KW, CONE, CONTRIB(RE+1,1), NROWTRAIL)
             RE = RE + MI
           END DO
+        ELSE
+          ALLOCATE(CONTRIB(1,1))
         END IF
         ALLOCATE(CONTRIB_LOC(NROWTRAIL,MAX(NRHS_LOC,1)))
         DO C = 0, GRID%PC-1
