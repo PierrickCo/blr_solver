@@ -280,7 +280,6 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     I = (li-1)*GRID%PR + GRID%MYROW + 1
     MLOC = MLOC + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
   END DO
-  NRHS_LOC = RHS_NUMROC_MBM(NRHS, GRID%PC, GRID%MYCOL)
   CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, GRID%MYCOL, RSTART_MINE, NRHS_LOC)
 
   ALLOCATE(B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
@@ -435,29 +434,17 @@ CONTAINS
     DEALLOCATE(B_REF)
   END FUNCTION COMPUTE_ERR
 
-  ! Valeur de B a l'entree (GI,R) -- SOURCE UNIQUE partagee par FILL_B
-  ! (construction du second membre reellement resolu) ET COMPUTE_RESIDUAL
-  ! (reconstruction de B pour le residu, voir plus bas) : garantit que le
-  ! residu mesure EXACTEMENT le B utilise, quel qu'il soit (arbitraire ou
-  ! B=A*Xexact). Formule arbitraire (CHECK_ERROR=0) ou produit BRUT
-  ! B=A*Xexact (CHECK_ERROR=1, cout O(N) par entree -- voir commentaire de
-  ! tete). Pour un probleme REEL fourni par l'utilisateur, cette fonction
-  ! serait remplacee par SA propre formule/lecture de B -- le principe
-  ! (recalculer plutot que stocker une seconde copie) reste identique.
+  ! Valeur de B a l'entree (GI,R) pour le cas CHECK_ERROR=0 -- SOURCE
+  ! UNIQUE partagee par FILL_B (construction du second membre reellement
+  ! resolu) ET COMPUTE_RESIDUAL (reconstruction de B pour le residu, voir
+  ! plus bas) : garantit que le residu mesure EXACTEMENT le B utilise. Le
+  ! cas CHECK_ERROR=1 (B=A*Xexact) est traite separement par ses deux
+  ! appelants via un produit CGEMM direct (LOWRANK_A/XEX_FORMULA), jamais
+  ! via cette fonction. Pour un probleme REEL fourni par l'utilisateur,
+  ! cette fonction serait remplacee par SA propre formule/lecture de B.
   COMPLEX(WP) FUNCTION B_ENTRY(GI, R)
     INTEGER, INTENT(IN) :: GI, R
-    INTEGER :: JJ
-    COMPLEX(WP) :: ACC
-    COMPLEX(WP), PARAMETER :: CZERO = (0.0_WP,0.0_WP)
-    IF (CHECK_ERROR_FLAG) THEN
-      ACC = CZERO
-      DO JJ = 1, N
-        ACC = ACC + LOWRANK_A(GI,JJ) * XEX_FORMULA(JJ,R)
-      END DO
-      B_ENTRY = ACC
-    ELSE
-      B_ENTRY = CMPLX(REAL(GI,WP)*0.01_WP, -0.3_WP*REAL(R,WP), KIND=WP)
-    END IF
+    B_ENTRY = CMPLX(REAL(GI,WP)*0.01_WP, -0.3_WP*REAL(R,WP), KIND=WP)
   END FUNCTION B_ENTRY
 
   ! Residu ||A*X-B||/||B|| -- CAS GENERAL : ne suppose AUCUNE connaissance
