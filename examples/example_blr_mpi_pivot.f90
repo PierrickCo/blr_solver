@@ -146,6 +146,10 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   COMPLEX(WP), ALLOCATABLE :: B_LOCAL(:,:), X_GLOBAL(:,:)
   INTEGER :: MLOC, NRHS_LOC, RSTART_MINE, INFO, N_SWAPS
   INTEGER :: N_COMPRESSED, N_OFFDIAG, li, I
+  ! Apercu de X(1:5,1) sans assembler X_GLOBAL en entier -- voir son
+  ! utilisation plus bas (CHECK_ERROR=0 et CHECK_RESIDUAL=0).
+  INTEGER :: NPREVIEW, PREVIEW_RS, PREVIEW_MI, PREVIEW_GI
+  COMPLEX(WP) :: PREVIEW_LOCAL(5), PREVIEW_GLOBAL(5)
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR, T_SOLVE, T0, T1
   INTEGER :: USE_MOVE_ALLOC_INT, USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT
@@ -373,38 +377,76 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Resolution : ', T_SOLVE, ' s'
   CALL PROFILE_SAMPLE('resolution')
 
-  ALLOCATE(X_GLOBAL(N,NRHS))
-  CALL GATHER_2D_RHS(GRID, N, NB, NRHS, B_LOCAL, MAX(MLOC,1), NRHS_LOC, 0, X_GLOBAL)
+  IF (CHECK_ERROR_FLAG .OR. CHECK_RESIDUAL_FLAG) THEN
+    ! X_GLOBAL(N,NRHS) n'est reellement necessaire qu'ici : COMPUTE_ERR
+    ! et COMPUTE_RESIDUAL comparent X a une reference sur toute sa
+    ! largeur. Sans verification demandee, l'assembler serait un cout
+    ! memoire O(N*NRHS) pur gaspillage -- voir la branche ELSE plus bas.
+    ALLOCATE(X_GLOBAL(N,NRHS))
+    CALL GATHER_2D_RHS(GRID, N, NB, NRHS, B_LOCAL, MAX(MLOC,1), NRHS_LOC, 0, X_GLOBAL)
 
-  IF (MYID0 .EQ. 0) THEN
-    WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
-    DO I = 1, MIN(5, N)
-      WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(X_GLOBAL(I,1)), ' + i*', AIMAG(X_GLOBAL(I,1))
-    END DO
-    IF (CHECK_ERROR_FLAG) THEN
-      ERR = COMPUTE_ERR(X_GLOBAL)
-      WRITE(6,'(A,ES12.4)') ' Erreur relative ||X-Xexact|| / ||Xexact|| = ', ERR
-      CALL PROFILE_SAMPLE('verif_erreur')
+    IF (MYID0 .EQ. 0) THEN
+      WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
+      DO I = 1, MIN(5, N)
+        WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(X_GLOBAL(I,1)), ' + i*', AIMAG(X_GLOBAL(I,1))
+      END DO
+      IF (CHECK_ERROR_FLAG) THEN
+        ERR = COMPUTE_ERR(X_GLOBAL)
+        WRITE(6,'(A,ES12.4)') ' Erreur relative ||X-Xexact|| / ||Xexact|| = ', ERR
+        CALL PROFILE_SAMPLE('verif_erreur')
+      END IF
     END IF
-  END IF
 
-  ! APPEL COLLECTIF (MPI_BCAST/MPI_ALLREDUCE a l'interieur, voir son
-  ! commentaire) -- TOUS les rangs doivent l'appeler, pas seulement le
-  ! rang 0 (contrairement a COMPUTE_ERR ci-dessus, qui n'a aucun appel MPI).
-  IF (CHECK_RESIDUAL_FLAG) THEN
-    RSS_MAX_RESID_MB = 0.0D0
-    RESID = COMPUTE_RESIDUAL(X_GLOBAL)
-    IF (MYID0.EQ.0) THEN
-      WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant le residu = ', RSS_MAX_RESID_MB, ' Mo'
-      WRITE(6,'(A,ES12.4)') ' Residu relatif ||A*X-B|| / ||B|| = ', RESID
+    ! APPEL COLLECTIF (MPI_BCAST/MPI_ALLREDUCE a l'interieur, voir son
+    ! commentaire) -- TOUS les rangs doivent l'appeler, pas seulement le
+    ! rang 0 (contrairement a COMPUTE_ERR ci-dessus, qui n'a aucun appel MPI).
+    IF (CHECK_RESIDUAL_FLAG) THEN
+      RSS_MAX_RESID_MB = 0.0D0
+      RESID = COMPUTE_RESIDUAL(X_GLOBAL)
+      IF (MYID0.EQ.0) THEN
+        WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant le residu = ', RSS_MAX_RESID_MB, ' Mo'
+        WRITE(6,'(A,ES12.4)') ' Residu relatif ||A*X-B|| / ||B|| = ', RESID
+      END IF
+      CALL PROFILE_SAMPLE('verif_residu')
     END IF
-    CALL PROFILE_SAMPLE('verif_residu')
+  ELSE
+    ! Ni CHECK_ERROR ni CHECK_RESIDUAL : X n'est jamais compare a une
+    ! reference, inutile de l'assembler en entier. On recupere quand meme
+    ! les 5 premieres valeurs de la colonne 1 pour l'affichage, sans
+    ! GATHER_2D_RHS -- chaque rang contribue la valeur reelle s'il
+    ! possede a la fois cette ligne (son A_BLR%BSTART/BEND local) et la
+    ! colonne RHS 1 (son propre RSTART_MINE/NRHS_LOC), zero sinon ; une
+    ! somme reduite sur 5 complexes suffit (cout independant de N).
+    NPREVIEW = MIN(5, N)
+    PREVIEW_LOCAL = (0.0_WP, 0.0_WP)
+    IF (RSTART_MINE .LE. 1 .AND. 1 .LE. RSTART_MINE+NRHS_LOC-1) THEN
+      PREVIEW_RS = 1
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        PREVIEW_MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+        DO PREVIEW_GI = 1, NPREVIEW
+          IF (PREVIEW_GI.GE.A_BLR%BSTART(I) .AND. PREVIEW_GI.LE.A_BLR%BEND(I)) THEN
+            PREVIEW_LOCAL(PREVIEW_GI) = B_LOCAL(PREVIEW_RS + (PREVIEW_GI-A_BLR%BSTART(I)), 1)
+          END IF
+        END DO
+        PREVIEW_RS = PREVIEW_RS + PREVIEW_MI
+      END DO
+    END IF
+    CALL MPI_REDUCE(PREVIEW_LOCAL, PREVIEW_GLOBAL, NPREVIEW, MPI_COMPLEX, MPI_SUM, 0, GRID%COMM, IERR)
+    IF (MYID0 .EQ. 0) THEN
+      WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
+      DO I = 1, NPREVIEW
+        WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(PREVIEW_GLOBAL(I)), ' + i*', AIMAG(PREVIEW_GLOBAL(I))
+      END DO
+      WRITE(6,'(A)') ' (X complet non assemble -- CHECK_ERROR=0 et CHECK_RESIDUAL=0, memoire economisee)'
+    END IF
   END IF
 
   CALL PROFILE_SAMPLE('fin')
   CALL PROFILE_WRITE_CSV()
 
-  DEALLOCATE(B_LOCAL, X_GLOBAL)
+  DEALLOCATE(B_LOCAL)
+  IF (ALLOCATED(X_GLOBAL)) DEALLOCATE(X_GLOBAL)
   CALL MPI_FINALIZE(IERR)
 
 CONTAINS
