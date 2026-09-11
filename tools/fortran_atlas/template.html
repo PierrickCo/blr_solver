@@ -1,0 +1,867 @@
+<title>__ATLAS_TITLE__</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f4f6f0;
+    --surface: #ffffff;
+    --surface-2: #eaeee2;
+    --surface-3: #dde2d3;
+    --border: #d3d9c7;
+    --text: #1b2118;
+    --text-dim: #5c6656;
+    --text-faint: #8a9280;
+    --accent: #2f7d4f;
+    --accent-strong: #1f5c39;
+    --accent-soft: #dcefe1;
+    --accent-soft-border: #b9dcc4;
+    --kind-exec: #a6790a;
+    --kind-exec-soft: #f3e6c6;
+    --kind-module: #2b6e8f;
+    --kind-module-soft: #d9eaf1;
+    --kind-sub: #2f7d4f;
+    --kind-sub-soft: #dcefe1;
+    --kind-func: #6a4e9c;
+    --kind-func-soft: #e6ddf3;
+    --shadow: 0 1px 2px rgba(20, 30, 15, 0.06), 0 4px 14px rgba(20, 30, 15, 0.06);
+    --focus-ring: #2f7d4f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #10140d;
+      --surface: #171c14;
+      --surface-2: #1e2419;
+      --surface-3: #29321f;
+      --border: #2b3423;
+      --text: #e8ecdf;
+      --text-dim: #a3ae95;
+      --text-faint: #77836a;
+      --accent: #6fdb96;
+      --accent-strong: #93e8b1;
+      --accent-soft: rgba(111, 219, 150, 0.14);
+      --accent-soft-border: rgba(111, 219, 150, 0.32);
+      --kind-exec: #e0ac3c;
+      --kind-exec-soft: rgba(224, 172, 60, 0.16);
+      --kind-module: #79c6e8;
+      --kind-module-soft: rgba(121, 198, 232, 0.14);
+      --kind-sub: #6fdb96;
+      --kind-sub-soft: rgba(111, 219, 150, 0.14);
+      --kind-func: #b79ce0;
+      --kind-func-soft: rgba(183, 156, 224, 0.16);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 18px rgba(0, 0, 0, 0.35);
+      --focus-ring: #93e8b1;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #10140d;
+    --surface: #171c14;
+    --surface-2: #1e2419;
+    --surface-3: #29321f;
+    --border: #2b3423;
+    --text: #e8ecdf;
+    --text-dim: #a3ae95;
+    --text-faint: #77836a;
+    --accent: #6fdb96;
+    --accent-strong: #93e8b1;
+    --accent-soft: rgba(111, 219, 150, 0.14);
+    --accent-soft-border: rgba(111, 219, 150, 0.32);
+    --kind-exec: #e0ac3c;
+    --kind-exec-soft: rgba(224, 172, 60, 0.16);
+    --kind-module: #79c6e8;
+    --kind-module-soft: rgba(121, 198, 232, 0.14);
+    --kind-sub: #6fdb96;
+    --kind-sub-soft: rgba(111, 219, 150, 0.14);
+    --kind-func: #b79ce0;
+    --kind-func-soft: rgba(183, 156, 224, 0.16);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 18px rgba(0, 0, 0, 0.35);
+    --focus-ring: #93e8b1;
+  }
+
+  * { box-sizing: border-box; }
+  html { color-scheme: light dark; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    height: 100vh;
+    overflow: hidden;
+  }
+  code, .mono, .id { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+  a { color: inherit; }
+  button { font: inherit; color: inherit; }
+  ::selection { background: var(--accent-soft); }
+
+  .app {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    height: 100%;
+  }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    white-space: nowrap;
+  }
+  .brand .mark {
+    font-family: "IBM Plex Mono", monospace;
+    font-weight: 600;
+    font-size: 15px;
+    color: var(--accent-strong);
+    letter-spacing: 0.02em;
+  }
+  .brand .sub {
+    font-size: 12px;
+    color: var(--text-faint);
+  }
+  .searchwrap {
+    flex: 1;
+    max-width: 560px;
+    position: relative;
+  }
+  .searchwrap input {
+    width: 100%;
+    padding: 7px 12px 7px 30px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 13px;
+    outline: none;
+  }
+  .searchwrap input:focus { border-color: var(--focus-ring); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .searchwrap svg {
+    position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
+    width: 14px; height: 14px; color: var(--text-faint);
+  }
+  .stats {
+    display: flex;
+    gap: 14px;
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .stats b { color: var(--text); font-weight: 600; }
+
+  /* ---------- panes ---------- */
+  .panes {
+    display: grid;
+    grid-template-columns: 250px 340px 1fr;
+    min-height: 0;
+  }
+  .pane {
+    min-height: 0;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+  }
+  .pane:last-child { border-right: none; }
+  .pane-head {
+    position: sticky; top: 0;
+    background: var(--surface);
+    padding: 10px 14px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    border-bottom: 1px solid var(--border);
+    z-index: 2;
+  }
+
+  #pane-exec { background: var(--surface); }
+  #pane-mid { background: var(--surface); }
+  #pane-detail { background: var(--bg); }
+
+  .exec-group-label {
+    padding: 10px 14px 4px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  .exec-item, .file-row, .routine-row, .result-row {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text);
+  }
+  .exec-item {
+    padding: 6px 14px 6px 18px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px;
+    border-left: 2px solid transparent;
+  }
+  .exec-item:hover { background: var(--surface-2); }
+  .exec-item.active {
+    background: var(--accent-soft);
+    border-left-color: var(--accent);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+
+  .file-block { border-bottom: 1px solid var(--border); }
+  .file-row {
+    padding: 9px 14px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .file-row .path { color: var(--text); }
+  .file-row svg { width: 12px; height: 12px; flex: none; color: var(--text-faint); transition: transform .12s; }
+  .file-block.open .file-row svg { transform: rotate(90deg); }
+  .routine-list { display: none; }
+  .file-block.open .routine-list { display: block; }
+  .routine-row {
+    padding: 5px 14px 5px 30px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+  }
+  .routine-row:hover { background: var(--surface-2); }
+  .routine-row.active { background: var(--accent-soft); }
+
+  .kind-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    padding: 1px 5px;
+    border-radius: 4px;
+    flex: none;
+    text-transform: uppercase;
+  }
+  .kind-badge.exec { background: var(--kind-exec-soft); color: var(--kind-exec); }
+  .kind-badge.module { background: var(--kind-module-soft); color: var(--kind-module); }
+  .kind-badge.subroutine { background: var(--kind-sub-soft); color: var(--kind-sub); }
+  .kind-badge.function { background: var(--kind-func-soft); color: var(--kind-func); }
+  .kind-badge.external { background: var(--surface-3); color: var(--text-dim); }
+
+  .result-row {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .result-row:hover { background: var(--surface-2); }
+  .result-row .name { font-family: "IBM Plex Mono", monospace; font-size: 13px; font-weight: 600; }
+  .result-row .meta { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
+
+  .empty-hint {
+    padding: 24px 16px;
+    color: var(--text-faint);
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+
+  /* ---------- detail pane ---------- */
+  .detail-inner { padding: 22px 28px 40px; max-width: 900px; }
+  .detail-empty {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: var(--text-dim);
+    gap: 10px;
+    padding: 40px;
+  }
+  .detail-empty .big { font-family: "IBM Plex Mono", monospace; font-size: 30px; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .detail-empty .grid-stats { display:flex; gap: 28px; margin-top: 6px; }
+  .detail-empty .grid-stats div { text-align:center; }
+  .detail-empty .grid-stats b { display:block; font-family:"IBM Plex Mono",monospace; font-size:22px; color:var(--text); }
+  .detail-empty .grid-stats span { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
+
+  .r-kicker { display:flex; align-items:center; gap:8px; margin-bottom: 6px; }
+  .r-title {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 24px;
+    font-weight: 600;
+    text-wrap: balance;
+    word-break: break-word;
+  }
+  .r-loc {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+  .r-loc .path { color: var(--accent); cursor: pointer; }
+  .r-loc .path:hover { text-decoration: underline; }
+
+  .r-owner {
+    margin-top: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+  }
+  .r-owner button {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px;
+    color: var(--text);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  .r-owner button:hover { border-color: var(--accent); }
+
+  .diagram-card {
+    margin-top: 22px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px 4px;
+    box-shadow: var(--shadow);
+  }
+  .diagram-card svg { width: 100%; height: auto; display: block; }
+  figcaption {
+    font-size: 11.5px;
+    color: var(--text-faint);
+    padding: 6px 2px 10px;
+  }
+
+  .section {
+    margin-top: 26px;
+  }
+  .section-title {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .section-title .count {
+    font-family: "IBM Plex Mono", monospace;
+    background: var(--surface-3);
+    color: var(--text-dim);
+    border-radius: 999px;
+    padding: 0px 7px;
+    font-size: 10.5px;
+  }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+    padding: 4px 9px;
+    border-radius: 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .chip:hover { border-color: var(--accent); color: var(--accent-strong); }
+  .chip .from { color: var(--text-faint); font-size: 10.5px; }
+  .chip.ext { cursor: default; color: var(--text-dim); }
+  .chip.ext:hover { border-color: var(--border); color: var(--text-dim); }
+
+  .empty-note { font-size: 12px; color: var(--text-faint); font-style: italic; }
+
+  .code-viewer {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-height: 480px;
+    overflow: auto;
+    white-space: pre;
+  }
+  .code-line {
+    display: flex;
+    padding: 0 12px;
+  }
+  .code-line.def-line { background: var(--accent-soft); }
+  .code-line .ln {
+    flex: 0 0 auto;
+    width: 3.4em;
+    text-align: right;
+    margin-right: 14px;
+    color: var(--text-faint);
+    user-select: none;
+  }
+  .code-line .code { color: var(--text); }
+  .callref {
+    cursor: pointer;
+    border-radius: 3px;
+    color: var(--accent-strong);
+    text-decoration: underline;
+    text-decoration-color: var(--accent-soft-border);
+    text-underline-offset: 2px;
+  }
+  .callref:hover { background: var(--accent-soft); }
+  .callref.self { color: inherit; cursor: default; text-decoration: none; }
+  .callref.ext { color: var(--text-dim); cursor: default; text-decoration-style: dotted; }
+  .code-empty-note { padding: 10px 2px; }
+
+  kbd {
+    font-family: "IBM Plex Mono", monospace;
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 0 5px;
+    font-size: 11px;
+  }
+
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+
+<div class="app">
+  <header>
+    <div class="brand">
+      <span class="mark">&gt;_ __ATLAS_MARK__</span>
+      <span class="sub">__ATLAS_SUBTITLE__</span>
+    </div>
+    <div class="searchwrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input id="search" type="text" placeholder="Chercher un executable, un fichier, une subroutine, une function... (/)" autocomplete="off">
+    </div>
+    <div class="stats" id="header-stats"></div>
+  </header>
+
+  <div class="panes">
+    <div class="pane" id="pane-exec">
+      <div class="pane-head">Executables</div>
+      <div id="exec-list"></div>
+    </div>
+    <div class="pane" id="pane-mid">
+      <div class="pane-head" id="mid-head">Fichiers sources</div>
+      <div id="mid-body"></div>
+    </div>
+    <div class="pane" id="pane-detail">
+      <div id="detail-body"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+let DATA = null;
+let byKey = new Map();      // "file::NAME" -> routine object (with file attached)
+let byName = new Map();     // "NAME" -> [ "file::NAME", ... ]
+let currentExec = null;
+let currentRoutineKey = null;
+
+function kindBadge(kind) {
+  const label = kind === "subroutine" ? "SUB" : kind === "function" ? "FUN" : kind === "module" ? "MOD" : kind === "program" ? "PRG" : kind === "executable" ? "EXE" : "EXT";
+  const cls = kind === "program" ? "module" : kind;
+  return `<span class="kind-badge ${cls}">${label}</span>`;
+}
+
+function basename(p) { return p.split("/").pop(); }
+
+function execDisplayName(name) {
+  return name.startsWith("bin/") ? name.slice(4) : name;
+}
+
+async function boot() {
+  DATA = JSON.parse(document.getElementById("depgraph-data").textContent);
+  index();
+  renderHeaderStats();
+  renderExecList();
+  renderDetailEmpty();
+  wireSearch();
+  window.addEventListener("hashchange", applyHash);
+  applyHash();
+}
+
+function index() {
+  for (const [file, fdata] of Object.entries(DATA.files)) {
+    for (const r of fdata.routines) {
+      const key = file + "::" + r.name;
+      const full = Object.assign({file}, r);
+      byKey.set(key, full);
+      if (!byName.has(r.name)) byName.set(r.name, []);
+      byName.get(r.name).push(key);
+    }
+  }
+}
+
+function renderHeaderStats() {
+  const nFiles = Object.keys(DATA.files).length;
+  const nExec = DATA.executables.length;
+  const nRoutines = byName.size;
+  document.getElementById("header-stats").innerHTML =
+    `<span><b>${nExec}</b> executables</span><span><b>${nFiles}</b> fichiers</span><span><b>${nRoutines}</b> routines</span>`;
+}
+
+function renderExecList() {
+  const groups = new Map();
+  for (const e of DATA.executables) {
+    const grp = e.makefile.startsWith("legacy/") ? "legacy/Makefile" : e.makefile;
+    if (!groups.has(grp)) groups.set(grp, []);
+    groups.get(grp).push(e);
+  }
+  let html = "";
+  for (const [grp, list] of groups) {
+    html += `<div class="exec-group-label">${grp}</div>`;
+    list.sort((a, b) => execDisplayName(a.name).localeCompare(execDisplayName(b.name)));
+    for (const e of list) {
+      html += `<button class="exec-item" data-exec="${encodeURIComponent(e.name)}">${execDisplayName(e.name)}</button>`;
+    }
+  }
+  document.getElementById("exec-list").innerHTML = html;
+  document.getElementById("exec-list").addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".exec-item");
+    if (!btn) return;
+    goExec(decodeURIComponent(btn.dataset.exec));
+  });
+}
+
+function goExec(name) {
+  location.hash = "exe=" + encodeURIComponent(name);
+}
+function goRoutine(key) {
+  location.hash = "r=" + encodeURIComponent(key);
+}
+
+function applyHash() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const exe = h.get("exe");
+  const r = h.get("r");
+  if (exe) selectExec(exe, {skipHash:true});
+  if (r) selectRoutine(r, {skipHash:true});
+  if (!exe && !r) renderDetailEmpty();
+}
+
+function selectExec(name, opts) {
+  currentExec = name;
+  document.querySelectorAll(".exec-item").forEach(b => {
+    b.classList.toggle("active", decodeURIComponent(b.dataset.exec) === name);
+  });
+  const entry = DATA.executables.find(e => e.name === name);
+  document.getElementById("mid-head").textContent = execDisplayName(name) + "  ·  fichiers sources";
+  if (!entry) { document.getElementById("mid-body").innerHTML = `<div class="empty-hint">Executable introuvable.</div>`; return; }
+
+  let html = "";
+  for (const src of entry.sources) {
+    const fdata = DATA.files[src];
+    const routines = fdata ? fdata.routines.slice().sort((a,b)=>a.line-b.line) : [];
+    const prog = routines.find(r => r.kind === "program");
+    const modLabel = fdata && fdata.modules.length ? fdata.modules.join(", ") : (prog ? prog.name : "");
+    html += `<div class="file-block" data-file="${encodeURIComponent(src)}">
+      <button class="file-row">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="path">${src}</span>
+        <span style="margin-left:auto;color:var(--text-faint);font-size:10.5px;">${modLabel || ""}</span>
+      </button>
+      <div class="routine-list">
+        ${routines.map(r => `<button class="routine-row" data-key="${encodeURIComponent(src + '::' + r.name)}">${kindBadge(r.kind)} ${r.name}</button>`).join("")}
+      </div>
+    </div>`;
+  }
+  document.getElementById("mid-body").innerHTML = html || `<div class="empty-hint">Aucun fichier source resolu pour cet executable.</div>`;
+
+  document.querySelectorAll(".file-block .file-row").forEach(row => {
+    row.addEventListener("click", () => row.closest(".file-block").classList.toggle("open"));
+  });
+  document.querySelectorAll(".routine-row").forEach(row => {
+    row.addEventListener("click", () => goRoutine(decodeURIComponent(row.dataset.key)));
+  });
+  // auto-open the first file for convenience
+  const first = document.querySelector(".file-block");
+  if (first) first.classList.add("open");
+
+  if (!opts || !opts.skipHash) location.hash = "exe=" + encodeURIComponent(name);
+}
+
+function svgDiagram(key, routine) {
+  const callers = routine.called_by.slice(0, 5);
+  const callees = routine.calls.slice(0, 5);
+  const extraCallers = routine.called_by.length - callers.length;
+  const extraCallees = routine.calls.length - callees.length;
+
+  const rows = Math.max(callers.length, callees.length, 1);
+  const rowH = 30;
+  const H = 40 + rows * rowH;
+  const W = 640;
+  const midX = W / 2, midW = 168;
+  const sideW = 210;
+
+  function shortLabel(nameOrKey, isCaller) {
+    if (isCaller) {
+      const parts = nameOrKey.split("::");
+      return {top: parts[1], bottom: basename(parts[0])};
+    }
+    // callee: could be a known routine name or an external (BLAS/MPI) symbol
+    const defs = byName.get(nameOrKey);
+    if (defs && defs.length) {
+      const f = defs[0].split("::")[0];
+      return {top: nameOrKey, bottom: basename(f)};
+    }
+    return {top: nameOrKey, bottom: "externe (BLAS/MPI/LAPACK)"};
+  }
+
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Appelants et appels d'un hop autour de ${routine.name}">`;
+  svg += `<defs><marker id="arrow-${cssId(key)}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="currentColor"/></marker></defs>`;
+
+  const centerY = H / 2;
+  svg += box(midX - midW/2, centerY - 16, midW, 32, routine.name, "var(--accent)", true, key);
+
+  callers.forEach((ckey, i) => {
+    const y = 20 + i * rowH;
+    const lbl = shortLabel(ckey, true);
+    svg += box(20, y, sideW, 24, lbl.top, "var(--border)", false, null, lbl.bottom);
+    svg += arrow(20 + sideW, y + 12, midX - midW/2, centerY, cssId(key));
+  });
+  if (extraCallers > 0) {
+    svg += `<text x="20" y="${20 + callers.length * rowH + 14}" font-size="11" fill="var(--text-faint)">+${extraCallers} autre(s) appelant(s)</text>`;
+  }
+
+  callees.forEach((cname, i) => {
+    const y = 20 + i * rowH;
+    const lbl = shortLabel(cname, false);
+    svg += box(W - 20 - sideW, y, sideW, 24, lbl.top, "var(--border)", false, null, lbl.bottom);
+    svg += arrow(midX + midW/2, centerY, W - 20 - sideW, y + 12, cssId(key));
+  });
+  if (extraCallees > 0) {
+    svg += `<text x="${W-20-sideW}" y="${20 + callees.length * rowH + 14}" font-size="11" fill="var(--text-faint)">+${extraCallees} autre(s) appel(s)</text>`;
+  }
+
+  if (callers.length) svg += `<text x="${(20+sideW+midX-midW/2)/2}" y="${centerY-8}" font-size="10.5" fill="var(--text-faint)" text-anchor="middle">appelle</text>`;
+  if (callees.length) svg += `<text x="${(midX+midW/2+W-20-sideW)/2}" y="${centerY-8}" font-size="10.5" fill="var(--text-faint)" text-anchor="middle">appelle</text>`;
+
+  svg += "</svg>";
+  return svg;
+
+  function cssId(k){ return k.replace(/[^A-Za-z0-9]/g,"_"); }
+  function box(x,y,w,h,label,stroke,strong,keyForClick,sub) {
+    const tx = x + w/2;
+    let out = `<g ${keyForClick ? '' : ''} color="${stroke}">`;
+    out += `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6" fill="${strong ? 'var(--accent-soft)' : 'var(--surface)'}" stroke="currentColor" stroke-width="${strong?1.6:1}"/>`;
+    out += `<text x="${tx}" y="${y + (sub ? h/2 - 1 : h/2 + 4)}" font-family="IBM Plex Mono, monospace" font-size="11.5" font-weight="${strong?600:500}" text-anchor="middle" fill="${strong ? 'var(--accent-strong)' : 'var(--text)'}">${truncate(label, 22)}</text>`;
+    if (sub) out += `<text x="${tx}" y="${y + h/2 + 11}" font-size="9" text-anchor="middle" fill="var(--text-faint)">${truncate(sub, 26)}</text>`;
+    out += `</g>`;
+    return out;
+  }
+  function arrow(x1,y1,x2,y2,idsuf) {
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--border)" stroke-width="1.4" marker-end="url(#arrow-${idsuf})" color="var(--border)"/>`;
+  }
+  function truncate(s, n) { return s.length > n ? s.slice(0, n-1) + "…" : s; }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function codeViewerHtml(key, routine) {
+  const fdata = DATA.files[routine.file];
+  if (!fdata || !fdata.source || !fdata.source.length) {
+    return `<div class="code-empty-note empty-note">Code source indisponible pour ce fichier.</div>`;
+  }
+  const start = routine.line;
+  const end = routine.end_line || routine.line;
+  const slice = fdata.source.slice(start - 1, end);
+
+  // Clickable identifiers reuse the same call list already resolved for the
+  // "Appelle" chips below -- one regex pass per call name, longest first so
+  // e.g. "FOO_BAR" isn't shadowed by a shorter "FOO" also being called.
+  const names = Array.from(new Set(routine.calls)).sort((a, b) => b.length - a.length);
+  const escRe = names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const nameRe = escRe.length ? new RegExp("\\b(" + escRe.join("|") + ")\\b", "gi") : null;
+
+  function linkify(escapedLine) {
+    if (!nameRe) return escapedLine;
+    return escapedLine.replace(nameRe, (m) => {
+      const upper = m.toUpperCase();
+      const defs = byName.get(upper);
+      if (defs && defs.length) {
+        const sameFile = defs.find(k => k.startsWith(routine.file + "::"));
+        const target = sameFile || defs[0];
+        if (target === key) return `<span class="callref self">${m}</span>`;
+        return `<span class="callref" data-goto="${encodeURIComponent(target)}">${m}</span>`;
+      }
+      return `<span class="callref ext" title="Symbole externe (BLAS/LAPACK/MPI ou non resolu)">${m}</span>`;
+    });
+  }
+
+  let rows = "";
+  for (let i = 0; i < slice.length; i++) {
+    const lineNo = start + i;
+    const codeHtml = linkify(escapeHtml(slice[i])) || "&nbsp;";
+    rows += `<div class="code-line${lineNo === routine.line ? " def-line" : ""}"><span class="ln">${lineNo}</span><span class="code">${codeHtml}</span></div>`;
+  }
+  return `<div class="code-viewer">${rows}</div>`;
+}
+
+function selectRoutine(key, opts) {
+  currentRoutineKey = key;
+  document.querySelectorAll(".routine-row").forEach(row => {
+    row.classList.toggle("active", decodeURIComponent(row.dataset.key) === key);
+  });
+  const routine = byKey.get(key);
+  if (!routine) {
+    document.getElementById("detail-body").innerHTML = `<div class="detail-empty"><div>Routine introuvable : <code>${key}</code></div></div>`;
+    return;
+  }
+
+  // if this routine's exec isn't the one loaded, still show it -- but try to
+  // sync the middle pane to a sensible executable that reaches it.
+  if (!currentExec) {
+    const owner = DATA.executables.find(e => e.sources.includes(routine.file));
+    if (owner) selectExec(owner.name, {skipHash:true});
+  }
+
+  const usesHtml = routine.uses.length
+    ? `<div class="chip-list">${routine.uses.map(u => `<span class="chip ext">${u}</span>`).join("")}</div>`
+    : `<div class="empty-note">aucune (pas de USE au-dela des modules intrinseques)</div>`;
+
+  const callsHtml = routine.calls.length
+    ? `<div class="chip-list">${routine.calls.map(c => {
+        const defs = byName.get(c);
+        if (defs && defs.length) {
+          const target = defs[0];
+          return `<span class="chip" data-goto="${encodeURIComponent(target)}">${c}${defs.length>1 ? ` <span class="from">(${defs.length})</span>`:""}</span>`;
+        }
+        return `<span class="chip ext" title="Symbole externe (BLAS/LAPACK/MPI ou non resolu)">${c}</span>`;
+      }).join("")}</div>`
+    : `<div class="empty-note">aucun appel detecte</div>`;
+
+  const calledByHtml = routine.called_by.length
+    ? `<div class="chip-list">${routine.called_by.map(cb => {
+        const [f, n] = cb.split("::");
+        return `<span class="chip" data-goto="${encodeURIComponent(cb)}">${n} <span class="from">${basename(f)}</span></span>`;
+      }).join("")}</div>`
+    : `<div class="empty-note">aucun appelant detecte dans les fichiers analyses</div>`;
+
+  document.getElementById("detail-body").innerHTML = `
+    <div class="detail-inner">
+      <div class="r-kicker">${kindBadge(routine.kind)}<span style="font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.05em;">${routine.kind === "function" ? "Function" : routine.kind === "program" ? "Programme principal" : "Subroutine"}</span></div>
+      <div class="r-title">${routine.name}</div>
+      <div class="r-loc"><span class="path" data-goto-file="${encodeURIComponent(routine.file)}">${routine.file}</span> : ligne ${routine.line}</div>
+      ${routine.owner ? `<div class="r-owner">definie dans
+        <button data-goto-owner="${encodeURIComponent(routine.owner)}">${kindBadge(routine.owner_kind || "module")} ${routine.owner}</button>
+      </div>` : ""}
+
+      <figure class="diagram-card">
+        ${svgDiagram(key, routine)}
+        <figcaption>Voisinage a un saut : qui appelle <code>${routine.name}</code> (gauche) et ce que <code>${routine.name}</code> appelle (droite). Liste complete ci-dessous.</figcaption>
+      </figure>
+
+      <div class="section">
+        <div class="section-title">Modules utilises (USE) <span class="count">${routine.uses.length}</span></div>
+        ${usesHtml}
+      </div>
+      <div class="section">
+        <div class="section-title">Appelle <span class="count">${routine.calls.length}</span></div>
+        ${callsHtml}
+      </div>
+      <div class="section">
+        <div class="section-title">Appele par <span class="count">${routine.called_by.length}</span></div>
+        ${calledByHtml}
+      </div>
+      <div class="section">
+        <div class="section-title">Code source <span class="count">${(routine.end_line || routine.line) - routine.line + 1} lignes</span></div>
+        ${codeViewerHtml(key, routine)}
+      </div>
+    </div>
+  `;
+
+  document.getElementById("detail-body").querySelectorAll("[data-goto]").forEach(el => {
+    el.addEventListener("click", () => goRoutine(decodeURIComponent(el.dataset.goto)));
+  });
+  document.getElementById("detail-body").querySelectorAll("[data-goto-owner]").forEach(el => {
+    el.addEventListener("click", () => {
+      const owner = decodeURIComponent(el.dataset.gotoOwner);
+      const modKeys = byName.get(owner);
+      if (modKeys && modKeys.length) goRoutine(modKeys[0]);
+    });
+  });
+
+  if (!opts || !opts.skipHash) location.hash = "r=" + encodeURIComponent(key);
+}
+
+function renderDetailEmpty() {
+  const nFiles = Object.keys(DATA.files).length;
+  const nExec = DATA.executables.length;
+  const nRoutines = byName.size;
+  document.getElementById("detail-body").innerHTML = `
+    <div class="detail-empty">
+      <div class="big">&gt;_</div>
+      <div style="max-width:420px;">Choisis un executable a gauche, ou cherche une subroutine/function en haut pour explorer ses appels et ses appelants.</div>
+      <div class="grid-stats">
+        <div><b>${nExec}</b><span>Executables</span></div>
+        <div><b>${nFiles}</b><span>Fichiers</span></div>
+        <div><b>${nRoutines}</b><span>Routines</span></div>
+      </div>
+    </div>
+  `;
+}
+
+function wireSearch() {
+  const input = document.getElementById("search");
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "/" && document.activeElement !== input) { e.preventDefault(); input.focus(); }
+    if (e.key === "Escape") input.blur();
+  });
+  input.addEventListener("input", () => {
+    const q = input.value.trim().toUpperCase();
+    if (!q) { document.getElementById("mid-head").textContent = "Fichiers sources"; if (currentExec) selectExec(currentExec, {skipHash:true}); else document.getElementById("mid-body").innerHTML = ""; return; }
+    const results = [];
+    for (const e of DATA.executables) {
+      if (execDisplayName(e.name).toUpperCase().includes(q)) results.push({type:"exec", label: execDisplayName(e.name), meta: e.makefile, action: () => goExec(e.name)});
+    }
+    for (const [file] of Object.entries(DATA.files)) {
+      if (file.toUpperCase().includes(q)) results.push({type:"file", label: basename(file), meta: file, action: () => { const first = DATA.files[file].routines[0]; if (first) goRoutine(file+"::"+first.name); }});
+    }
+    for (const [name, keys] of byName) {
+      if (name.includes(q)) {
+        for (const k of keys.slice(0,4)) {
+          const r = byKey.get(k);
+          results.push({type:r.kind, label:name, meta: r.file + ":" + r.line, action: () => goRoutine(k)});
+        }
+      }
+    }
+    document.getElementById("mid-head").textContent = `Resultats (${results.length})`;
+    document.getElementById("mid-body").innerHTML = results.slice(0, 200).map((r,i) =>
+      `<button class="result-row" data-i="${i}"><span class="name">${kindBadge(r.type==="exec"?"executable":r.type)} ${r.label}</span><div class="meta">${r.meta}</div></button>`
+    ).join("") || `<div class="empty-hint">Aucun resultat pour "${input.value}".</div>`;
+    document.querySelectorAll(".result-row").forEach((row,i) => row.addEventListener("click", () => results[i].action()));
+  });
+}
+
+boot();
+</script>
