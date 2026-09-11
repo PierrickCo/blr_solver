@@ -49,3 +49,8 @@ depgraph.json
 # le graphe genere -- un fichier par run, jamais a versionner.
 usage_profile_rank*.csv
 usage_profile.png
+
+# Structure BLR par bloc (DUMP_STRUCTURE, example_blr_mpi_pivot.f90) et
+# le graphe genere -- idem, un fichier par run.
+blr_structure_*.csv
+blr_structure.png

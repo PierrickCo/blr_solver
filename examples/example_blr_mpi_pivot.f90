@@ -16,8 +16,8 @@
 ! test/test_mpi_blr_matrix_pivot.f90 pour la version qui verifie aussi la
 ! correction contre une reference independante).
 !
-! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE]
-!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 USE_MOVE_ALLOC=0 EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0)
+! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]
+!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 USE_MOVE_ALLOC=0 EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
 !         USE_MOVE_ALLOC=1 : SCHUR_UPDATE_BLR_BLOCK transfere la propriete
 !         des tableaux via MOVE_ALLOC au lieu de "ABLK=NEWBLK" (qui
 !         declenche une reallocation+copie implicite supplementaire) --
@@ -112,6 +112,19 @@
 ! par ce programme, cout d'echantillonnage negligeable devant le reste).
 ! Tracer l'evolution : python3 examples/plot_usage_profile.py [dossier]
 ! (necessite matplotlib ; lit tous les usage_profile_rank*.csv trouves).
+!
+! DUMP_STRUCTURE (defaut 0) : si 1, chaque processus ecrit la nature de
+! CHACUN de ses blocs LOCAUX (diagonal/dense/bas-rang, et le rang associe)
+! a la fin de l'assemblage ET a la fin de la factorisation -- deux
+! instantanes distincts, puisque le fill-in de la mise a jour de Schur
+! peut faire passer certains blocs de bas-rang a dense entre les deux
+! (voir SHOW_RSS_TRACE dans MPI_BLR_MATRIX_LU_FACTOR_PIVOT). Ecrit
+! blr_structure_assembly_rank<N>.csv et blr_structure_factorization_
+! rank<N>.csv par processus (jamais relu par ce programme). Tracer :
+! python3 examples/plot_blr_structure.py [dossier] (necessite matplotlib) --
+! une figure a deux panneaux (assemblage / factorisation), un pixel par
+! bloc GLOBAL, colore par rang (bas-rang) ou par categorie fixe
+! (diagonal, dense).
 !===============================================================================
 PROGRAM EXAMPLE_BLR_MPI_PIVOT
   USE MPI_BLR_MATRIX_MOD
@@ -130,8 +143,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   INTEGER :: N_COMPRESSED, N_OFFDIAG, li, I
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR, T_SOLVE, T0, T1
-  INTEGER :: USE_MOVE_ALLOC_INT, USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT
-  LOGICAL :: USE_MOVE_ALLOC_FLAG, USE_RSVD_FLAG, CHECK_ERROR_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG
+  INTEGER :: USE_MOVE_ALLOC_INT, USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT
+  LOGICAL :: USE_MOVE_ALLOC_FLAG, USE_RSVD_FLAG, CHECK_ERROR_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG, DUMP_STRUCTURE_FLAG
   DOUBLE PRECISION :: RSS_MAX_B_MB, RSS_MAX_RESID_MB
   REAL(WP) :: ERR, RESID
 
@@ -146,6 +159,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
 
   N = 4000; NB = 200; NRHS = 4; TOL = 1.0E-4_WP; USE_MOVE_ALLOC_INT = 0; EPS = 0.0_WP
   RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0; PROFILE_USAGE_INT = 0
+  DUMP_STRUCTURE_INT = 0
   PROF_N = 0
 
   CALL MPI_INIT(IERR)
@@ -154,7 +168,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] '// &
-         '[USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE]'
+         '[USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -193,11 +207,15 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   IF (COMMAND_ARGUMENT_COUNT() .GE. 13) THEN
     CALL GET_COMMAND_ARGUMENT(13, ARG); READ(ARG,*) PROFILE_USAGE_INT
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 14) THEN
+    CALL GET_COMMAND_ARGUMENT(14, ARG); READ(ARG,*) DUMP_STRUCTURE_INT
+  END IF
   USE_MOVE_ALLOC_FLAG = (USE_MOVE_ALLOC_INT .NE. 0)
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_ERROR_FLAG = (CHECK_ERROR_INT .NE. 0)
   CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
   PROFILE_USAGE_FLAG = (PROFILE_USAGE_INT .NE. 0)
+  DUMP_STRUCTURE_FLAG = (DUMP_STRUCTURE_INT .NE. 0)
 
   ! Surcharge COMPRESS_WORTHWHILE_RATIO (blr_compress_mod.f90) AVANT tout
   ! assemblage/factorisation -- voir SET_COMPRESS_WORTHWHILE_RATIO et le
@@ -228,6 +246,9 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     END IF
     IF (PROFILE_USAGE_FLAG) THEN
       WRITE(6,'(A)') ' Profilage RSS/CPU par etape active : usage_profile_rank<N>.csv par processus'
+    END IF
+    IF (DUMP_STRUCTURE_FLAG) THEN
+      WRITE(6,'(A)') ' Structure BLR (dense/bas-rang) exportee : blr_structure_<etape>_rank<N>.csv par processus'
     END IF
   END IF
 
@@ -282,6 +303,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   ! reference pour detecter une VRAIE anomalie (fuite, copie oubliee).
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage)', GET_RSS_KB()*1024_8)
   CALL PROFILE_SAMPLE('assemblage')
+  CALL DUMP_BLR_STRUCTURE('assembly')
 
   ! --- 2) factorisation LU, AVEC pivot confine au bloc diagonal ----------
   ! SHOW_PROGRESS=.TRUE. : ici K/NBLK est un pourcentage EXACT (boucle
@@ -307,6 +329,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   CALL REPORT_MEMORY_MB(GRID, 'Facteurs LU (compresses)', MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres factorisation)', GET_RSS_KB()*1024_8)
   CALL PROFILE_SAMPLE('factorisation')
+  CALL DUMP_BLR_STRUCTURE('factorization')
 
   ! --- 3) second membre B, distribue par blocs-lignes ET par colonnes sur
   !     NRHS -- formule deterministe, sans communication ---
@@ -447,6 +470,42 @@ CONTAINS
     END DO
     CLOSE(U)
   END SUBROUTINE PROFILE_WRITE_CSV
+
+  ! Ecrit la nature de chaque bloc LOCAL de A_BLR (DUMP_STRUCTURE, voir le
+  ! commentaire de tete) -- un fichier par processus, jamais rassemble ici
+  ! (meme principe que PROFILE_WRITE_CSV) : plot_blr_structure.py
+  ! reconstitue la grille GLOBALE NBLK x NBLK en lisant tous les fichiers
+  ! d'un meme STAGE_LABEL. Un bloc diagonal (I,I) n'est possede que par UN
+  ! SEUL processus (DIAGBLK(I)%D alloue seulement chez son proprietaire) ;
+  ! les blocs hors-diagonale locaux sont parcourus via (li,lj) -> (I,J)
+  ! comme partout ailleurs dans ce fichier (voir MPI_ASSEMBLE_BLR_MATRIX).
+  SUBROUTINE DUMP_BLR_STRUCTURE(STAGE_LABEL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_LABEL
+    INTEGER :: U, li, lj, I, J
+    CHARACTER(LEN=96) :: FNAME
+    IF (.NOT. DUMP_STRUCTURE_FLAG) RETURN
+    WRITE(FNAME,'(A,A,A,I0,A)') 'blr_structure_', TRIM(STAGE_LABEL), '_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'block_row,block_col,kind,rank'
+    DO I = 1, A_BLR%NBLK
+      IF (ALLOCATED(A_BLR%DIAGBLK(I)%D)) THEN
+        WRITE(U,'(I0,A,I0,A,I0)') I, ',', I, ',diagonal,', A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END IF
+    END DO
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I .EQ. J) CYCLE
+        IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',lowrank,', A_BLR%OFFBLK(li,lj)%RANK
+        ELSE
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',dense,', A_BLR%BEND(J)-A_BLR%BSTART(J)+1
+        END IF
+      END DO
+    END DO
+    CLOSE(U)
+  END SUBROUTINE DUMP_BLR_STRUCTURE
 
   ! Hash deterministe (I,J) -> [-1,1) -- pas de RNG a etat, recalculable
   ! independamment pour n'importe quel bloc par n'importe quel processus
