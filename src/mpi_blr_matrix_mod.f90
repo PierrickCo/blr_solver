@@ -2605,7 +2605,7 @@ CONTAINS
                                           T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
                                           SHOW_PROGRESS, T_GET_BLOCK, T_COMPRESS, T_IO, &
                                           T_GET_BLOCK_MIN, T_COMPRESS_MIN, T_IO_MIN, &
-                                          USE_RSVD, RSVD_OVERSAMPLE, RSVD_NPOWER)
+                                          USE_RSVD, RSVD_OVERSAMPLE, RSVD_NPOWER, PROGRESS_CALLBACK)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)        :: GRID
     INTEGER, INTENT(IN)             :: N, NB
@@ -2636,6 +2636,10 @@ CONTAINS
     ! RSVD_NPOWER, meme convention).
     LOGICAL, INTENT(IN), OPTIONAL   :: USE_RSVD
     INTEGER, INTENT(IN), OPTIONAL   :: RSVD_OVERSAMPLE, RSVD_NPOWER
+    ! Voir MPI_ASSEMBLE_BLR_MATRIX pour le detail (meme convention -- appele
+    ! par CHAQUE processus au franchissement d'un palier de 5% de SA PROPRE
+    ! progression LOCALE). Absent par defaut, aucun surcout si non fourni.
+    PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
 
     COMPLEX(WP), ALLOCATABLE :: TMP(:,:), TMPD(:,:)
     TYPE(BLR_BLOCK_T) :: TMPBLK, DBLK
@@ -2720,6 +2724,9 @@ CONTAINS
         NDONE = NDONE + 1
         ! Voir MPI_ASSEMBLE_BLR_MATRIX pour le detail du choix barre vs paliers.
         IF (PROGRESS) CALL PRINT_PROGRESS_BAR('1) Assemblage+compression ooc (rang 0)', NDONE, NTOTAL, PBAR_STATE)
+        IF (PRESENT(PROGRESS_CALLBACK)) THEN
+          IF (STAGE_PROGRESS_SHOULD_FIRE(NDONE, NTOTAL)) CALL PROGRESS_CALLBACK(NDONE, NTOTAL)
+        END IF
       END DO
     END DO
 
@@ -2878,7 +2885,8 @@ CONTAINS
                                                  N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
                                                  SHOW_PROGRESS, SHOW_RSS_TRACE, &
                                                  T_CACHE_GET, T_CACHE_EVICT, T_COMPUTE, T_MPICALL, &
-                                                 T_CACHE_GET_MIN, T_CACHE_EVICT_MIN, T_COMPUTE_MIN, T_MPICALL_MIN)
+                                                 T_CACHE_GET_MIN, T_CACHE_EVICT_MIN, T_COMPUTE_MIN, T_MPICALL_MIN, &
+                                                 PROGRESS_CALLBACK)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)              :: GRID
     TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(INOUT) :: A_BLR
@@ -2919,6 +2927,8 @@ CONTAINS
     ! non uniforme), invisible tant qu'on ne voit que la valeur MAX seule.
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_CACHE_GET, T_CACHE_EVICT, T_COMPUTE, T_MPICALL
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_CACHE_GET_MIN, T_CACHE_EVICT_MIN, T_COMPUTE_MIN, T_MPICALL_MIN
+    ! Voir MPI_BLR_MATRIX_LU_FACTOR_PIVOT pour le detail (meme convention).
+    PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), DIAGTMP(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
@@ -3173,6 +3183,9 @@ CONTAINS
       END DO
 
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU ooc (pivot)', K, NBLK, PBAR_STATE)
+      IF (PRESENT(PROGRESS_CALLBACK)) THEN
+        IF (STAGE_PROGRESS_SHOULD_FIRE(K, NBLK)) CALL PROGRESS_CALLBACK(K, NBLK)
+      END IF
       ! N'affiche que le maximum observe (RSS et cache resident), pas une
       ! ligne par K -- voir le commentaire equivalent sur MPI_BLR_MATRIX_
       ! LU_FACTOR_PIVOT (version classique).
@@ -3267,13 +3280,19 @@ CONTAINS
   ! passages sur un meme bloc) annule le benefice (voir le commentaire
   ! "DIMENSIONNER MAX_MB_PER_PROCESS" sur MPI_BLR_MATRIX_OOC_T).
   !-----------------------------------------------------------------------
-  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS)
+  SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS, &
+                                                   PROGRESS_CALLBACK)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)                  :: GRID
     TYPE(MPI_BLR_MATRIX_OOC_T), INTENT(INOUT) :: A_BLR
     TYPE(OOC_RHS_T), INTENT(INOUT)            :: RHS
     PROCEDURE(CONSUME_X_BATCH_IFACE)          :: CONSUME_X_BATCH
     LOGICAL, INTENT(IN), OPTIONAL             :: SHOW_PROGRESS
+    ! Voir MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D pour le detail (meme
+    ! convention) -- NSTEPS/STEP redemarrent a chaque PAQUET de second
+    ! membre (RHS%NBATCHES), donc les paliers de 5% le font aussi : chaque
+    ! paquet est traite comme sa propre etape du point de vue du callback.
+    PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
@@ -3402,6 +3421,9 @@ CONTAINS
         DEALLOCATE(XK_FULL)
         STEP = STEP + 1
         IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution ooc (pivot)', STEP, NSTEPS, PBAR_STATE)
+        IF (PRESENT(PROGRESS_CALLBACK)) THEN
+          IF (STAGE_PROGRESS_SHOULD_FIRE(STEP, NSTEPS)) CALL PROGRESS_CALLBACK(STEP, NSTEPS)
+        END IF
       END DO
 
       ! === 2) U*X = Y (substitution arriere) -- AUCUN pivot necessaire ===
@@ -3480,6 +3502,9 @@ CONTAINS
         DEALLOCATE(XK_FULL)
         STEP = STEP + 1
         IF (PROGRESS) CALL PRINT_PROGRESS_BAR('4) Resolution ooc (pivot)', STEP, NSTEPS, PBAR_STATE)
+        IF (PRESENT(PROGRESS_CALLBACK)) THEN
+          IF (STAGE_PROGRESS_SHOULD_FIRE(STEP, NSTEPS)) CALL PROGRESS_CALLBACK(STEP, NSTEPS)
+        END IF
       END DO
 
       DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
