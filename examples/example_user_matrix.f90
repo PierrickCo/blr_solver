@@ -56,12 +56,34 @@
 !     (meme si "Blocs compresses" affiche 100%) ; proche de 0% = tres
 !     bonne compression.
 !
-! Usage : mpirun -np <PR*PC> ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] [RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]
-!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
+! Usage : mpirun -np <PR*PC> ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] [RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE] [MATGEN]
+!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0 MATGEN=0)
 !
 ! PROFILE_USAGE / DUMP_STRUCTURE : voir example_blr_mpi_pivot.f90 pour le
 ! detail complet (memes parametres, meme comportement, memes scripts de
 ! trace python3 examples/plot_usage_profile.py / plot_blr_structure.py).
+!
+! MATGEN (defaut 0 = noyau 1/(1+|i-j|) ci-dessus) : si 1, GET_BLOCK/FILL_B
+! generent a la place une matrice de TEST generique (equivalent local, SANS
+! dependance externe, d'un generateur style PxMATGEN de ScaLAPACK) --
+! utile pour brancher rapidement un remplacant si vous avez deja un tel
+! generateur cote ScaLAPACK mais ne pouvez pas le lier ici (ex.
+! PSRAND/XJUMPM/JUMPIT/SETRAN, les 4 routines du generateur pseudo-
+! aleatoire "a saut" de ScaLAPACK, ne sont ni dans MKL ni dans un
+! ScaLAPACK de reference a portee de main). Meme principe qu'un vrai
+! PxMATGEN (valeur en (i,j) global deterministe, recalculable
+! independamment par n'importe quel processus, sans communication) mais
+! implemente ICI par un hash trigonometrique (meme technique que
+! HASH_NOISE dans example_blr_mpi_pivot.f90), pas par un vrai generateur
+! congruentiel a saut -- donc PAS bit-a-bit identique a un PxMATGEN reel,
+! juste la MEME propriete utile pour ce role. Genere une matrice PLEINE
+! (aucune structure bas-rang), rendue diagonale dominante pour rester
+! resoluble : la compression BLR n'y trouvera RIEN a compresser (tous les
+! blocs tombent en repli dense, comportement SUR mais sans gain -- voir
+! le commentaire COMPRESSIBILITE ci-dessus). Utile pour verifier le
+! branchement/la robustesse du solveur sur une matrice non structuree,
+! pas pour demontrer l'avantage BLR (qui demande un noyau a rang faible,
+! comme le placeholder MATGEN=0 ou votre vrai probleme physique).
 !===============================================================================
 PROGRAM EXAMPLE_USER_MATRIX
   USE MPI_BLR_MATRIX_MOD
@@ -81,8 +103,8 @@ PROGRAM EXAMPLE_USER_MATRIX
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR, T_SOLVE, T0, T1
   REAL(WP) :: RESID
-  INTEGER :: USE_RSVD_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT
-  LOGICAL :: USE_RSVD_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG, DUMP_STRUCTURE_FLAG
+  INTEGER :: USE_RSVD_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT, MATGEN_INT
+  LOGICAL :: USE_RSVD_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG, DUMP_STRUCTURE_FLAG, MATGEN_RANDOM_FLAG
 
   ! Apercu de X(1:5,1) sans assembler X_GLOBAL en entier (CHECK_RESIDUAL=0) --
   ! voir example_blr_mpi_pivot.f90 pour le detail complet de la technique.
@@ -100,7 +122,7 @@ PROGRAM EXAMPLE_USER_MATRIX
 
   N = 4000; NB = 200; NRHS = 1; TOL = 1.0E-4_WP
   RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_RESIDUAL_INT = 0
-  PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0
+  PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0; MATGEN_INT = 0
   PROF_N = 0
 
   CALL MPI_INIT(IERR)
@@ -109,7 +131,7 @@ PROGRAM EXAMPLE_USER_MATRIX
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] '// &
-         '[RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]'
+         '[RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE] [MATGEN]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -142,10 +164,14 @@ PROGRAM EXAMPLE_USER_MATRIX
   IF (COMMAND_ARGUMENT_COUNT() .GE. 11) THEN
     CALL GET_COMMAND_ARGUMENT(11, ARG); READ(ARG,*) DUMP_STRUCTURE_INT
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 12) THEN
+    CALL GET_COMMAND_ARGUMENT(12, ARG); READ(ARG,*) MATGEN_INT
+  END IF
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
   PROFILE_USAGE_FLAG = (PROFILE_USAGE_INT .NE. 0)
   DUMP_STRUCTURE_FLAG = (DUMP_STRUCTURE_INT .NE. 0)
+  MATGEN_RANDOM_FLAG = (MATGEN_INT .NE. 0)
 
   ! Voir example_blr_mpi_pivot.f90/SET_COMPRESS_WORTHWHILE_RATIO pour le
   ! detail -- AVANT tout assemblage/factorisation.
@@ -164,6 +190,10 @@ PROGRAM EXAMPLE_USER_MATRIX
       WRITE(6,'(A)') ' Compression : SVD randomisee adaptative (COMPRESS_BLOCK_RSVD_ADAPTIVE)'
     ELSE
       WRITE(6,'(A)') ' Compression : SVD complete (COMPRESS_BLOCK, CGESVD)'
+    END IF
+    IF (MATGEN_RANDOM_FLAG) THEN
+      WRITE(6,'(A)') ' Matrice de test : generateur aleatoire generique (MATGEN=1) -- '// &
+           'PAS de structure bas-rang, tous les blocs tomberont en repli dense'
     END IF
     IF (PROFILE_USAGE_FLAG) THEN
       WRITE(6,'(A)') ' Profilage RSS/CPU par etape active : usage_profile_rank<N>.csv par processus'
@@ -409,12 +439,33 @@ CONTAINS
          / (REAL(NB,WP)**2 * REAL(MAX(NOFF,1),WP))
   END FUNCTION REAL_COMPRESSION_PCT
 
+  ! Hash deterministe (I,J) -> [-1,1) -- pas de RNG a etat, recalculable
+  ! independamment pour n'importe quel bloc par n'importe quel processus,
+  ! sans communication (meme recette que HASH_NOISE dans example_blr_mpi_
+  ! pivot.f90). Sert de remplacant SANS DEPENDANCE EXTERNE a un
+  ! generateur style PxMATGEN de ScaLAPACK (voir MATGEN dans le
+  ! commentaire de tete) : meme propriete utile (deterministe, distribue,
+  ! independant), pas le meme algorithme -- ne genere PAS une matrice
+  ! bas-rang, voir MATGEN plus haut.
+  REAL(WP) FUNCTION HASH01(I, J)
+    INTEGER, INTENT(IN) :: I, J
+    REAL(WP) :: S
+    S = SIN(REAL(I,WP)*12.9898_WP + REAL(J,WP)*78.233_WP) * 43758.5453_WP
+    HASH01 = 2.0_WP*(S - REAL(FLOOR(S),WP)) - 1.0_WP
+  END FUNCTION HASH01
+
   !===========================================================================
   ! REMPLACEZ CETTE FONCTION par votre propre matrice A.
   ! BLK(i,j) doit contenir A(ISTART+i-1, JSTART+j-1) -- appelee par blocs,
-  ! jamais pour la matrice entiere. Le placeholder ci-dessous (noyau
-  ! 1/(1+|i-j|), diagonale=N pour la dominance) n'est qu'un exemple
-  ! RUNNABLE, sans signification physique.
+  ! jamais pour la matrice entiere. Deux placeholders RUNNABLE, sans
+  ! signification physique, selon MATGEN (voir le commentaire de tete) :
+  !   MATGEN=0 (defaut) : noyau 1/(1+|i-j|), diagonale=N pour la
+  !     dominance -- BAS RANG hors-diagonale, demontre un vrai gain BLR.
+  !   MATGEN=1 : matrice generique pleine (hash, voir HASH01 ci-dessus),
+  !     diagonale dominante pour rester resoluble -- AUCUNE structure
+  !     bas-rang, la compression BLR n'y trouvera rien (voir le
+  !     commentaire MATGEN de tete pour le contexte : remplacant sans
+  !     dependance a un generateur ScaLAPACK indisponible ici).
   !===========================================================================
   SUBROUTINE GET_BLOCK(ISTART, IEND, JSTART, JEND, BLK)
     INTEGER, INTENT(IN)      :: ISTART, IEND, JSTART, JEND
@@ -424,6 +475,8 @@ CONTAINS
       DO II = ISTART, IEND
         IF (II .EQ. JJ) THEN
           BLK(II-ISTART+1, JJ-JSTART+1) = CMPLX(REAL(N,WP), 0.0_WP, KIND=WP)
+        ELSE IF (MATGEN_RANDOM_FLAG) THEN
+          BLK(II-ISTART+1, JJ-JSTART+1) = CMPLX(HASH01(II,JJ), HASH01(JJ,II), KIND=WP)
         ELSE
           BLK(II-ISTART+1, JJ-JSTART+1) = CMPLX(1.0_WP/(1.0_WP+ABS(REAL(II-JJ,WP))), 0.0_WP, KIND=WP)
         END IF
@@ -435,7 +488,9 @@ CONTAINS
   ! REMPLACEZ CETTE FONCTION par votre propre second membre b.
   ! Remplit les lignes GLOBALES possedees LOCALEMENT par ce processus (deja
   ! calculees via A_BLR%BSTART/BEND -- ne pas y toucher) pour les colonnes
-  ! RSTART..RSTART+NRL-1. Placeholder : b = vecteur de 1.
+  ! RSTART..RSTART+NRL-1. MATGEN=0 (defaut) : b = vecteur de 1. MATGEN=1 :
+  ! meme hash que GET_BLOCK, decale pour ne pas reutiliser la meme suite
+  ! de valeurs que A (voir HASH01 ci-dessus).
   !===========================================================================
   SUBROUTINE FILL_B(AB, GD, NRL, RSTART, BL, ML)
     TYPE(MPI_BLR_MATRIX_T), INTENT(IN) :: AB
@@ -443,12 +498,18 @@ CONTAINS
     INTEGER, INTENT(IN)                :: NRL, RSTART, ML
     COMPLEX(WP), INTENT(OUT)           :: BL(MAX(ML,1),MAX(NRL,1))
     INTEGER :: lli, II, GII, RR, RS
+    INTEGER, PARAMETER :: RHS_HASH_OFFSET = 1000003
     RS = 1
     DO lli = 1, AB%NBLKR_LOC
       II = (lli-1)*GD%PR + GD%MYROW + 1
       DO GII = AB%BSTART(II), AB%BEND(II)
         DO RR = 1, NRL
-          BL(RS + (GII-AB%BSTART(II)), RR) = CMPLX(1.0_WP, 0.0_WP, KIND=WP)
+          IF (MATGEN_RANDOM_FLAG) THEN
+            BL(RS + (GII-AB%BSTART(II)), RR) = &
+                 CMPLX(HASH01(GII, RSTART+RR-1+RHS_HASH_OFFSET), 0.0_WP, KIND=WP)
+          ELSE
+            BL(RS + (GII-AB%BSTART(II)), RR) = CMPLX(1.0_WP, 0.0_WP, KIND=WP)
+          END IF
         END DO
       END DO
       RS = RS + (AB%BEND(II)-AB%BSTART(II)+1)
