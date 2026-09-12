@@ -62,12 +62,21 @@
 ! Memoire bornee : jamais plus d'UN SEUL bloc de lignes de A, ni plus
 ! d'UN SEUL paquet de X pleinement rassemble, a la fois.
 !
-! Usage : mpirun -np <PR*PC> ./example_user_matrix_ooc PR PC [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [RATIO] [USE_RSVD] [CHECK_RESIDUAL]
-!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0)
+! Usage : mpirun -np <PR*PC> ./example_user_matrix_ooc PR PC [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]
+!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
+!
+! PROFILE_USAGE / DUMP_STRUCTURE : voir example_blr_mpi_pivot.f90 pour le
+! detail complet (memes parametres, memes scripts de trace). Comme pour
+! example_blr_mpi_pivot_ooc.f90, l'echantillonnage tous les 5% DANS la
+! resolution redemarre a chaque PAQUET de second membre. X est deja ecrite
+! directement sur disque par paquet (voir plus haut) -- aucune economie
+! supplementaire n'est necessaire ici (contrairement a example_blr_mpi_
+! pivot_ooc.f90, qui accumulait X_GLOBAL en RAM).
 !===============================================================================
 PROGRAM EXAMPLE_USER_MATRIX_OOC
   USE MPI_BLR_MATRIX_MOD
   USE MPI_LU_SOLVE_2D_MOD, ONLY: GATHER_2D_RHS
+  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
   INCLUDE 'mpif.h'
 
@@ -82,14 +91,25 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR
   REAL(WP) :: RESID
-  INTEGER :: USE_RSVD_INT, CHECK_RESIDUAL_INT
-  LOGICAL :: USE_RSVD_FLAG, CHECK_RESIDUAL_FLAG
+  INTEGER :: USE_RSVD_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT
+  LOGICAL :: USE_RSVD_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG, DUMP_STRUCTURE_FLAG
   INTEGER :: UNIT_X, NBATCH_WRITTEN
   CHARACTER(LEN=16) :: RANKSTR
+
+  ! Suivi memoire/CPU par etape (PROFILE_USAGE) -- voir example_blr_mpi_
+  ! pivot.f90 pour le detail complet de la technique.
+  INTEGER, PARAMETER :: MAX_PROFILE_SAMPLES = 128
+  CHARACTER(LEN=40) :: PROF_STAGE(MAX_PROFILE_SAMPLES)
+  DOUBLE PRECISION :: PROF_T(MAX_PROFILE_SAMPLES), PROF_RSS_MB(MAX_PROFILE_SAMPLES), PROF_CPU_PCT(MAX_PROFILE_SAMPLES)
+  INTEGER :: PROF_N
+  DOUBLE PRECISION :: PROF_T_START, PROF_T_PREV
+  REAL :: PROF_CPU_PREV
 
   N = 4000; NB = 200; NRHS = 1; TOL = 1.0E-4_WP
   MAX_MB_PER_PROCESS = 64.0_WP; NRHS_BATCH = 2; SCRATCH_DIR = './blr_ooc_scratch'
   RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_RESIDUAL_INT = 0
+  PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0
+  PROF_N = 0
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
@@ -97,7 +117,8 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_user_matrix_ooc PR PC [N] [NB] [NRHS] [TOL] '// &
-         '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [RATIO] [USE_RSVD] [CHECK_RESIDUAL]'
+         '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [RATIO] [USE_RSVD] [CHECK_RESIDUAL] '// &
+         '[PROFILE_USAGE] [DUMP_STRUCTURE]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -133,8 +154,16 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
   IF (COMMAND_ARGUMENT_COUNT() .GE. 12) THEN
     CALL GET_COMMAND_ARGUMENT(12, ARG); READ(ARG,*) CHECK_RESIDUAL_INT
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 13) THEN
+    CALL GET_COMMAND_ARGUMENT(13, ARG); READ(ARG,*) PROFILE_USAGE_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 14) THEN
+    CALL GET_COMMAND_ARGUMENT(14, ARG); READ(ARG,*) DUMP_STRUCTURE_INT
+  END IF
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
+  PROFILE_USAGE_FLAG = (PROFILE_USAGE_INT .NE. 0)
+  DUMP_STRUCTURE_FLAG = (DUMP_STRUCTURE_INT .NE. 0)
 
   CALL SET_COMPRESS_WORTHWHILE_RATIO(RATIO)
 
@@ -153,12 +182,23 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
     ELSE
       WRITE(6,'(A)') ' Compression : SVD complete (COMPRESS_BLOCK, CGESVD)'
     END IF
+    IF (PROFILE_USAGE_FLAG) THEN
+      WRITE(6,'(A)') ' Profilage RSS/CPU par etape active : usage_profile_rank<N>.csv par processus'
+    END IF
+    IF (DUMP_STRUCTURE_FLAG) THEN
+      WRITE(6,'(A)') ' Structure BLR (dense/bas-rang) exportee : blr_structure_<etape>_rank<N>.csv par processus'
+    END IF
   END IF
+
+  PROF_T_START = MPI_WTIME()
+  PROF_T_PREV = 0.0D0
+  CALL CPU_TIME(PROF_CPU_PREV)
+  CALL PROFILE_SAMPLE('debut')
 
   ! --- 1) assemblage BLR distribue, out-of-core -> disque -------------------
   CALL MPI_ASSEMBLE_BLR_MATRIX_OOC(GRID, N, NB, TOL, GET_BLOCK, A_BLR, SCRATCH_DIR, MAX_MB_PER_PROCESS, &
                                     T_ASM, N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., &
-                                    USE_RSVD=USE_RSVD_FLAG)
+                                    USE_RSVD=USE_RSVD_FLAG, PROGRESS_CALLBACK=PROFILE_CALLBACK_ASSEMBLY)
   IF (MYID0.EQ.0) THEN
     WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
@@ -166,6 +206,8 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
     WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (bas-rang / dense equivalent) : ', &
          REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
   END IF
+  CALL PROFILE_SAMPLE('assemblage')
+  CALL DUMP_BLR_STRUCTURE('assembly')
 
   ! Cache de A pour CHECK_RESIDUAL : AVANT la factorisation, qui ecrase A
   ! par L/U en place -- GET_BLOCK n'est plus jamais rappelee ensuite.
@@ -173,6 +215,7 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
 
   ! --- 2) second membre, SEPAREMENT, aussi sur disque ------------------------
   CALL MPI_ASSEMBLE_RHS_OOC(GRID, A_BLR, NRHS, NRHS_BATCH, FILL_RHS, SCRATCH_DIR, RHS)
+  CALL PROFILE_SAMPLE('second_membre')
 
   ! Cache de B pour CHECK_RESIDUAL -- FILL_RHS n'est plus jamais rappelee.
   IF (CHECK_RESIDUAL_FLAG) CALL CACHE_B_FOR_CHECK(GRID, N, NB, NRHS, NRHS_BATCH)
@@ -180,7 +223,7 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
   ! --- 3) factorisation LU, avec pivot, out-of-core --------------------------
   CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC(GRID, A_BLR, TOL, INFO, &
                                            N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                           SHOW_PROGRESS=.TRUE.)
+                                           SHOW_PROGRESS=.TRUE., PROGRESS_CALLBACK=PROFILE_CALLBACK_FACTOR)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC, INFO=', INFO
     CALL MPI_FINALIZE(IERR)
@@ -193,6 +236,8 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
     WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (fin factorisation) : ', &
          REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
   END IF
+  CALL PROFILE_SAMPLE('factorisation')
+  CALL DUMP_BLR_STRUCTURE('factorization')
 
   ! --- 4) resolution, out-of-core, par paquets de second membre --------------
   ! Fichier de CE processus, jamais partage -- meme convention de nommage
@@ -203,11 +248,13 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
        ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
   NBATCH_WRITTEN = 0
 
-  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS=.TRUE.)
+  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS=.TRUE., &
+                                             PROGRESS_CALLBACK=PROFILE_CALLBACK_SOLVE)
 
   CLOSE(UNIT_X)
   IF (MYID0.EQ.0) WRITE(6,'(A,I0,A)') ' Resolution terminee. ', NBATCH_WRITTEN, &
        ' paquet(s) ecrit(s) sur disque par processus (voir SCRATCH_DIR/x_rank_*.dat).'
+  CALL PROFILE_SAMPLE('resolution')
 
   ! --- 5) verification ||A*X-B||/||B|| -- APPEL COLLECTIF (tous les rangs) --
   ! Consomme et supprime x_rank_*.dat et acheck_rank_*.dat au passage ;
@@ -219,13 +266,117 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
       WRITE(6,'(A)') ' x_rank_*.dat et acheck_rank_*.dat supprimes ; '// &
            'bcheck_rank_*.dat contient desormais X (economie d''espace disque).'
     END IF
+    CALL PROFILE_SAMPLE('verif_residu')
   END IF
+
+  CALL PROFILE_SAMPLE('fin')
+  CALL PROFILE_WRITE_CSV()
 
   CALL OOC_RHS_FREE(RHS)
   CALL MPI_BLR_MATRIX_OOC_FREE(A_BLR)
   CALL MPI_FINALIZE(IERR)
 
 CONTAINS
+
+  ! Echantillon RSS/CPU pour l'etape STAGE_NAME (PROFILE_USAGE) -- voir
+  ! example_blr_mpi_pivot.f90 pour le detail complet de la technique.
+  SUBROUTINE PROFILE_SAMPLE(STAGE_NAME)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_NAME
+    REAL :: CPU_NOW
+    DOUBLE PRECISION :: T_NOW, DT_WALL, DT_CPU
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    IF (PROF_N .GE. MAX_PROFILE_SAMPLES) RETURN
+    CALL CPU_TIME(CPU_NOW)
+    T_NOW = MPI_WTIME() - PROF_T_START
+    DT_WALL = T_NOW - PROF_T_PREV
+    DT_CPU = REAL(CPU_NOW - PROF_CPU_PREV, 8)
+    PROF_N = PROF_N + 1
+    PROF_STAGE(PROF_N) = STAGE_NAME
+    PROF_T(PROF_N) = T_NOW
+    PROF_RSS_MB(PROF_N) = REAL(GET_RSS_KB(),8) / 1024.0D0
+    IF (DT_WALL .GT. 1.0D-6) THEN
+      PROF_CPU_PCT(PROF_N) = 100.0D0 * DT_CPU / DT_WALL
+    ELSE
+      PROF_CPU_PCT(PROF_N) = 0.0D0
+    END IF
+    PROF_T_PREV = T_NOW
+    PROF_CPU_PREV = CPU_NOW
+  END SUBROUTINE PROFILE_SAMPLE
+
+  FUNCTION PCT_LABEL(STAGE, NDONE, NTOTAL) RESULT(LBL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    CHARACTER(LEN=40) :: LBL
+    WRITE(LBL,'(A,A,I0,A)') TRIM(STAGE), '@', (100*NDONE)/MAX(NTOTAL,1), '%'
+  END FUNCTION PCT_LABEL
+
+  ! Callbacks PROGRESS_CALLBACK -- voir example_blr_mpi_pivot_ooc.f90 pour
+  ! le detail complet (NDONE/NTOTAL de la resolution redemarrent a chaque
+  ! PAQUET de second membre).
+  SUBROUTINE PROFILE_CALLBACK_ASSEMBLY(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('assemblage', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_ASSEMBLY
+
+  SUBROUTINE PROFILE_CALLBACK_FACTOR(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('factorisation', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_FACTOR
+
+  SUBROUTINE PROFILE_CALLBACK_SOLVE(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('resolution', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_SOLVE
+
+  ! Ecrit les echantillons de CE processus (usage_profile_rank<N>.csv) --
+  ! voir example_blr_mpi_pivot.f90 pour le detail complet.
+  SUBROUTINE PROFILE_WRITE_CSV()
+    INTEGER :: U, K
+    CHARACTER(LEN=64) :: FNAME
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    WRITE(FNAME,'(A,I0,A)') 'usage_profile_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'rank,stage,t_wall_s,rss_mb,cpu_pct'
+    DO K = 1, PROF_N
+      WRITE(U,'(I0,A,A,A,F12.4,A,F12.3,A,F8.2)') MYID0, ',', TRIM(PROF_STAGE(K)), ',', &
+           PROF_T(K), ',', PROF_RSS_MB(K), ',', PROF_CPU_PCT(K)
+    END DO
+    CLOSE(U)
+  END SUBROUTINE PROFILE_WRITE_CSV
+
+  ! Ecrit la nature de chaque bloc LOCAL de A_BLR (DUMP_STRUCTURE) -- voir
+  ! example_blr_mpi_pivot_ooc.f90 pour le detail complet de la technique
+  ! (OOC_BLOCK_DESC_T, ownership du bloc diagonal via OFFSET>=0).
+  SUBROUTINE DUMP_BLR_STRUCTURE(STAGE_LABEL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_LABEL
+    INTEGER :: U, li, lj, I, J
+    CHARACTER(LEN=96) :: FNAME
+    IF (.NOT. DUMP_STRUCTURE_FLAG) RETURN
+    WRITE(FNAME,'(A,A,A,I0,A)') 'blr_structure_', TRIM(STAGE_LABEL), '_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'block_row,block_col,kind,rank'
+    DO I = 1, A_BLR%NBLK
+      IF (A_BLR%DIAGBLK(I)%OFFSET .GE. 0_8) THEN
+        WRITE(U,'(I0,A,I0,A,I0)') I, ',', I, ',diagonal,', A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END IF
+    END DO
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I .EQ. J) CYCLE
+        IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',lowrank,', A_BLR%OFFBLK(li,lj)%RANK
+        ELSE
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',dense,', A_BLR%BEND(J)-A_BLR%BSTART(J)+1
+        END IF
+      END DO
+    END DO
+    CLOSE(U)
+  END SUBROUTINE DUMP_BLR_STRUCTURE
 
   ! Voir example_user_matrix.f90 pour le detail du correctif.
   REAL(WP) FUNCTION REAL_COMPRESSION_PCT(NCOMP, NOFF, RSUM)
