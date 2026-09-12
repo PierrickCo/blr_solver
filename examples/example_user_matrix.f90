@@ -56,12 +56,17 @@
 !     (meme si "Blocs compresses" affiche 100%) ; proche de 0% = tres
 !     bonne compression.
 !
-! Usage : mpirun -np <PR*PC> ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] [RATIO] [USE_RSVD] [CHECK_RESIDUAL]
-!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0)
+! Usage : mpirun -np <PR*PC> ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] [RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]
+!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
+!
+! PROFILE_USAGE / DUMP_STRUCTURE : voir example_blr_mpi_pivot.f90 pour le
+! detail complet (memes parametres, meme comportement, memes scripts de
+! trace python3 examples/plot_usage_profile.py / plot_blr_structure.py).
 !===============================================================================
 PROGRAM EXAMPLE_USER_MATRIX
   USE MPI_BLR_MATRIX_MOD
   USE MPI_LU_SOLVE_2D_MOD, ONLY: GATHER_2D_RHS
+  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
   INCLUDE 'mpif.h'
 
@@ -76,11 +81,27 @@ PROGRAM EXAMPLE_USER_MATRIX
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR, T_SOLVE, T0, T1
   REAL(WP) :: RESID
-  INTEGER :: USE_RSVD_INT, CHECK_RESIDUAL_INT
-  LOGICAL :: USE_RSVD_FLAG, CHECK_RESIDUAL_FLAG
+  INTEGER :: USE_RSVD_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT
+  LOGICAL :: USE_RSVD_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG, DUMP_STRUCTURE_FLAG
+
+  ! Apercu de X(1:5,1) sans assembler X_GLOBAL en entier (CHECK_RESIDUAL=0) --
+  ! voir example_blr_mpi_pivot.f90 pour le detail complet de la technique.
+  INTEGER :: NPREVIEW, PREVIEW_RS, PREVIEW_MI, PREVIEW_GI
+  COMPLEX(WP) :: PREVIEW_LOCAL(5), PREVIEW_GLOBAL(5)
+
+  ! Suivi memoire/CPU par etape (PROFILE_USAGE) -- voir example_blr_mpi_
+  ! pivot.f90 pour le detail complet de la technique.
+  INTEGER, PARAMETER :: MAX_PROFILE_SAMPLES = 128
+  CHARACTER(LEN=40) :: PROF_STAGE(MAX_PROFILE_SAMPLES)
+  DOUBLE PRECISION :: PROF_T(MAX_PROFILE_SAMPLES), PROF_RSS_MB(MAX_PROFILE_SAMPLES), PROF_CPU_PCT(MAX_PROFILE_SAMPLES)
+  INTEGER :: PROF_N
+  DOUBLE PRECISION :: PROF_T_START, PROF_T_PREV
+  REAL :: PROF_CPU_PREV
 
   N = 4000; NB = 200; NRHS = 1; TOL = 1.0E-4_WP
   RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_RESIDUAL_INT = 0
+  PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0
+  PROF_N = 0
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
@@ -88,7 +109,7 @@ PROGRAM EXAMPLE_USER_MATRIX
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_user_matrix PR PC [N] [NB] [NRHS] [TOL] '// &
-         '[RATIO] [USE_RSVD] [CHECK_RESIDUAL]'
+         '[RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -115,8 +136,16 @@ PROGRAM EXAMPLE_USER_MATRIX
   IF (COMMAND_ARGUMENT_COUNT() .GE. 9) THEN
     CALL GET_COMMAND_ARGUMENT(9, ARG); READ(ARG,*) CHECK_RESIDUAL_INT
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 10) THEN
+    CALL GET_COMMAND_ARGUMENT(10, ARG); READ(ARG,*) PROFILE_USAGE_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 11) THEN
+    CALL GET_COMMAND_ARGUMENT(11, ARG); READ(ARG,*) DUMP_STRUCTURE_INT
+  END IF
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
+  PROFILE_USAGE_FLAG = (PROFILE_USAGE_INT .NE. 0)
+  DUMP_STRUCTURE_FLAG = (DUMP_STRUCTURE_INT .NE. 0)
 
   ! Voir example_blr_mpi_pivot.f90/SET_COMPRESS_WORTHWHILE_RATIO pour le
   ! detail -- AVANT tout assemblage/factorisation.
@@ -136,11 +165,23 @@ PROGRAM EXAMPLE_USER_MATRIX
     ELSE
       WRITE(6,'(A)') ' Compression : SVD complete (COMPRESS_BLOCK, CGESVD)'
     END IF
+    IF (PROFILE_USAGE_FLAG) THEN
+      WRITE(6,'(A)') ' Profilage RSS/CPU par etape active : usage_profile_rank<N>.csv par processus'
+    END IF
+    IF (DUMP_STRUCTURE_FLAG) THEN
+      WRITE(6,'(A)') ' Structure BLR (dense/bas-rang) exportee : blr_structure_<etape>_rank<N>.csv par processus'
+    END IF
   END IF
+
+  PROF_T_START = MPI_WTIME()
+  PROF_T_PREV = 0.0D0
+  CALL CPU_TIME(PROF_CPU_PREV)
+  CALL PROFILE_SAMPLE('debut')
 
   ! --- 1) assemblage BLR distribue -----------------------------------------
   CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_BLR, T_ASM, &
-                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., USE_RSVD=USE_RSVD_FLAG)
+                                N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., USE_RSVD=USE_RSVD_FLAG, &
+                                PROGRESS_CALLBACK=PROFILE_CALLBACK_ASSEMBLY)
   IF (MYID0.EQ.0) THEN
     WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
@@ -148,11 +189,13 @@ PROGRAM EXAMPLE_USER_MATRIX
     WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (bas-rang / dense equivalent) : ', &
          REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
   END IF
+  CALL PROFILE_SAMPLE('assemblage')
+  CALL DUMP_BLR_STRUCTURE('assembly')
 
   ! --- 2) factorisation LU, pivot confine au bloc diagonal -----------------
   CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
                                        N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                       SHOW_PROGRESS=.TRUE.)
+                                       SHOW_PROGRESS=.TRUE., PROGRESS_CALLBACK=PROFILE_CALLBACK_FACTOR)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT, INFO=', INFO
     CALL MPI_FINALIZE(IERR)
@@ -165,6 +208,8 @@ PROGRAM EXAMPLE_USER_MATRIX
     WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (fin factorisation) : ', &
          REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
   END IF
+  CALL PROFILE_SAMPLE('factorisation')
+  CALL DUMP_BLR_STRUCTURE('factorization')
 
   ! --- 3) second membre local, distribue comme A ---------------------------
   MLOC = 0
@@ -178,36 +223,176 @@ PROGRAM EXAMPLE_USER_MATRIX
   ALLOCATE(B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1)), B_ORIG_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
   CALL FILL_B(A_BLR, GRID, NRHS_LOC, RSTART_MINE, B_LOCAL, MLOC)
   B_ORIG_LOCAL = B_LOCAL   ! B_LOCAL sera ecrase EN PLACE par la resolution -- garder une copie pour le residu
+  CALL PROFILE_SAMPLE('second_membre')
 
   ! --- 4) resolution 2D, avec pivot -----------------------------------------
   CALL MPI_BARRIER(MPI_COMM_WORLD, IERR)
   T0 = MPI_WTIME()
-  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE.)
+  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE., &
+                                         PROGRESS_CALLBACK=PROFILE_CALLBACK_SOLVE)
   T1 = MPI_WTIME()
   T_SOLVE = T1 - T0
   IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Resolution : ', T_SOLVE, ' s'
-
-  ALLOCATE(X_GLOBAL(N,NRHS))
-  CALL GATHER_2D_RHS(GRID, N, NB, NRHS, B_LOCAL, MAX(MLOC,1), NRHS_LOC, 0, X_GLOBAL)
-  IF (MYID0 .EQ. 0) THEN
-    WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
-    DO I = 1, MIN(5, N)
-      WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(X_GLOBAL(I,1)), ' + i*', AIMAG(X_GLOBAL(I,1))
-    END DO
-  END IF
+  CALL PROFILE_SAMPLE('resolution')
 
   ! --- 5) verification ||A*X-B||/||B|| -- APPEL COLLECTIF (tous les rangs) -
   ! Optionnelle (CHECK_RESIDUAL=0 par defaut) : cout CALCUL reel meme
   ! optimise, voir le commentaire de tete.
   IF (CHECK_RESIDUAL_FLAG) THEN
+    ! X_GLOBAL(N,NRHS) n'est reellement necessaire que pour COMPUTE_RESIDUAL
+    ! (comparaison sur toute sa largeur) -- voir example_blr_mpi_pivot.f90
+    ! pour le detail complet de l'economie memoire ci-dessous.
+    ALLOCATE(X_GLOBAL(N,NRHS))
+    CALL GATHER_2D_RHS(GRID, N, NB, NRHS, B_LOCAL, MAX(MLOC,1), NRHS_LOC, 0, X_GLOBAL)
+    IF (MYID0 .EQ. 0) THEN
+      WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
+      DO I = 1, MIN(5, N)
+        WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(X_GLOBAL(I,1)), ' + i*', AIMAG(X_GLOBAL(I,1))
+      END DO
+    END IF
     RESID = COMPUTE_RESIDUAL(X_GLOBAL, B_ORIG_LOCAL, GRID, N, NB, NRHS, NRHS_LOC, MLOC)
     IF (MYID0.EQ.0) WRITE(6,'(A,ES12.4)') ' Residu relatif ||A*X-B|| / ||B|| = ', RESID
+    CALL PROFILE_SAMPLE('verif_residu')
+  ELSE
+    ! Pas de verification demandee : apercu de X(1:5,1) SANS assembler
+    ! X_GLOBAL en entier -- chaque rang contribue la valeur reelle s'il
+    ! possede a la fois cette ligne et la colonne RHS 1, zero sinon ; une
+    ! somme reduite sur 5 complexes suffit (cout independant de N). Voir
+    ! example_blr_mpi_pivot.f90 pour le detail complet de la technique.
+    NPREVIEW = MIN(5, N)
+    PREVIEW_LOCAL = (0.0_WP, 0.0_WP)
+    IF (RSTART_MINE .LE. 1 .AND. 1 .LE. RSTART_MINE+NRHS_LOC-1) THEN
+      PREVIEW_RS = 1
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        PREVIEW_MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+        DO PREVIEW_GI = 1, NPREVIEW
+          IF (PREVIEW_GI.GE.A_BLR%BSTART(I) .AND. PREVIEW_GI.LE.A_BLR%BEND(I)) THEN
+            PREVIEW_LOCAL(PREVIEW_GI) = B_LOCAL(PREVIEW_RS + (PREVIEW_GI-A_BLR%BSTART(I)), 1)
+          END IF
+        END DO
+        PREVIEW_RS = PREVIEW_RS + PREVIEW_MI
+      END DO
+    END IF
+    CALL MPI_REDUCE(PREVIEW_LOCAL, PREVIEW_GLOBAL, NPREVIEW, MPI_COMPLEX, MPI_SUM, 0, GRID%COMM, IERR)
+    IF (MYID0 .EQ. 0) THEN
+      WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
+      DO I = 1, NPREVIEW
+        WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(PREVIEW_GLOBAL(I)), ' + i*', AIMAG(PREVIEW_GLOBAL(I))
+      END DO
+      WRITE(6,'(A)') ' (X complet non assemble -- CHECK_RESIDUAL=0, memoire economisee)'
+    END IF
   END IF
 
-  DEALLOCATE(B_LOCAL, B_ORIG_LOCAL, X_GLOBAL)
+  CALL PROFILE_SAMPLE('fin')
+  CALL PROFILE_WRITE_CSV()
+
+  DEALLOCATE(B_LOCAL, B_ORIG_LOCAL)
+  IF (ALLOCATED(X_GLOBAL)) DEALLOCATE(X_GLOBAL)
   CALL MPI_FINALIZE(IERR)
 
 CONTAINS
+
+  ! Echantillon RSS/CPU pour l'etape STAGE_NAME (PROFILE_USAGE) -- voir
+  ! example_blr_mpi_pivot.f90 pour le detail complet de la technique
+  ! (CPU_TIME/MPI_WTIME). No-op si desactive.
+  SUBROUTINE PROFILE_SAMPLE(STAGE_NAME)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_NAME
+    REAL :: CPU_NOW
+    DOUBLE PRECISION :: T_NOW, DT_WALL, DT_CPU
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    IF (PROF_N .GE. MAX_PROFILE_SAMPLES) RETURN
+    CALL CPU_TIME(CPU_NOW)
+    T_NOW = MPI_WTIME() - PROF_T_START
+    DT_WALL = T_NOW - PROF_T_PREV
+    DT_CPU = REAL(CPU_NOW - PROF_CPU_PREV, 8)
+    PROF_N = PROF_N + 1
+    PROF_STAGE(PROF_N) = STAGE_NAME
+    PROF_T(PROF_N) = T_NOW
+    PROF_RSS_MB(PROF_N) = REAL(GET_RSS_KB(),8) / 1024.0D0
+    IF (DT_WALL .GT. 1.0D-6) THEN
+      PROF_CPU_PCT(PROF_N) = 100.0D0 * DT_CPU / DT_WALL
+    ELSE
+      PROF_CPU_PCT(PROF_N) = 0.0D0
+    END IF
+    PROF_T_PREV = T_NOW
+    PROF_CPU_PREV = CPU_NOW
+  END SUBROUTINE PROFILE_SAMPLE
+
+  FUNCTION PCT_LABEL(STAGE, NDONE, NTOTAL) RESULT(LBL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    CHARACTER(LEN=40) :: LBL
+    WRITE(LBL,'(A,A,I0,A)') TRIM(STAGE), '@', (100*NDONE)/MAX(NTOTAL,1), '%'
+  END FUNCTION PCT_LABEL
+
+  ! Callbacks PROGRESS_CALLBACK (STAGE_PROGRESS_CALLBACK_IFACE) -- appeles
+  ! PAR LA BIBLIOTHEQUE tous les 5% de progression DANS l'assemblage/la
+  ! factorisation/la resolution. Voir example_blr_mpi_pivot.f90 pour le
+  ! detail complet.
+  SUBROUTINE PROFILE_CALLBACK_ASSEMBLY(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('assemblage', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_ASSEMBLY
+
+  SUBROUTINE PROFILE_CALLBACK_FACTOR(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('factorisation', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_FACTOR
+
+  SUBROUTINE PROFILE_CALLBACK_SOLVE(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('resolution', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_SOLVE
+
+  ! Ecrit les echantillons de CE processus (usage_profile_rank<N>.csv) --
+  ! voir example_blr_mpi_pivot.f90 pour le detail complet.
+  SUBROUTINE PROFILE_WRITE_CSV()
+    INTEGER :: U, K
+    CHARACTER(LEN=64) :: FNAME
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    WRITE(FNAME,'(A,I0,A)') 'usage_profile_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'rank,stage,t_wall_s,rss_mb,cpu_pct'
+    DO K = 1, PROF_N
+      WRITE(U,'(I0,A,A,A,F12.4,A,F12.3,A,F8.2)') MYID0, ',', TRIM(PROF_STAGE(K)), ',', &
+           PROF_T(K), ',', PROF_RSS_MB(K), ',', PROF_CPU_PCT(K)
+    END DO
+    CLOSE(U)
+  END SUBROUTINE PROFILE_WRITE_CSV
+
+  ! Ecrit la nature de chaque bloc LOCAL de A_BLR (DUMP_STRUCTURE) -- voir
+  ! example_blr_mpi_pivot.f90 pour le detail complet de la technique.
+  SUBROUTINE DUMP_BLR_STRUCTURE(STAGE_LABEL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_LABEL
+    INTEGER :: U, li, lj, I, J
+    CHARACTER(LEN=96) :: FNAME
+    IF (.NOT. DUMP_STRUCTURE_FLAG) RETURN
+    WRITE(FNAME,'(A,A,A,I0,A)') 'blr_structure_', TRIM(STAGE_LABEL), '_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'block_row,block_col,kind,rank'
+    DO I = 1, A_BLR%NBLK
+      IF (ALLOCATED(A_BLR%DIAGBLK(I)%D)) THEN
+        WRITE(U,'(I0,A,I0,A,I0)') I, ',', I, ',diagonal,', A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END IF
+    END DO
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I .EQ. J) CYCLE
+        IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',lowrank,', A_BLR%OFFBLK(li,lj)%RANK
+        ELSE
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',dense,', A_BLR%BEND(J)-A_BLR%BSTART(J)+1
+        END IF
+      END DO
+    END DO
+    CLOSE(U)
+  END SUBROUTINE DUMP_BLR_STRUCTURE
 
   ! Taux de compression REEL (stockage bas-rang effectif / stockage dense
   ! equivalent) -- PAS un simple pourcentage de blocs "compresses" (voir
