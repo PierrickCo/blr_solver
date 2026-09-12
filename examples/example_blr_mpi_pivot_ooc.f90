@@ -39,8 +39,8 @@
 ! Choisir large par defaut, et ne descendre que si la RAM disponible
 ! l'impose vraiment.
 !
-! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot_ooc PR PC [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL]
-!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0)
+! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot_ooc PR PC [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]
+!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
 !
 ! EPS (BRUIT PLEIN-RANG, POUR EXPERIMENTER FACILEMENT AVEC LA COMPRESSIBI-
 ! LITE -- IDENTIQUE a example_blr_mpi_pivot.f90, voir son commentaire de
@@ -90,6 +90,15 @@
 ! OOC_WRITE_BLOCK_FIXED dans blr_ooc_mod.f90) -- a la fin,
 ! acheck_rank_*.dat est supprime, bcheck_rank_*.dat survit et contient
 ! desormais X (copie disque de la solution, en plus de X_GLOBAL en RAM).
+!
+! PROFILE_USAGE / DUMP_STRUCTURE : voir example_blr_mpi_pivot.f90 pour le
+! detail complet (memes parametres, memes scripts de trace). Ici,
+! l'echantillonnage tous les 5% DANS la resolution redemarre a chaque
+! PAQUET de second membre (NRHS_BATCH) -- chaque paquet est sa propre
+! "etape" du point de vue du profilage. Sans CHECK_ERROR ni
+! CHECK_RESIDUAL, X_GLOBAL(N,NRHS) n'est PAS accumule (voir CONSUME_X_
+! BATCH) -- seul un apercu de X(1:5,1) est recupere, sans le cout memoire
+! ni communication du rassemblement complet a chaque paquet.
 !===============================================================================
 PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   USE MPI_BLR_MATRIX_MOD
@@ -110,14 +119,32 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   INTEGER :: N_COMPRESSED, N_OFFDIAG
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR
-  INTEGER :: USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT
-  LOGICAL :: USE_RSVD_FLAG, CHECK_ERROR_FLAG, CHECK_RESIDUAL_FLAG
+  INTEGER :: USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT
+  LOGICAL :: USE_RSVD_FLAG, CHECK_ERROR_FLAG, CHECK_RESIDUAL_FLAG, PROFILE_USAGE_FLAG, DUMP_STRUCTURE_FLAG
   DOUBLE PRECISION :: RSS_MAX_RHS_MB, RSS_MAX_RESID_MB
   REAL(WP) :: ERR, RESID
+
+  ! Apercu de X(1:5,1) sans accumuler X_GLOBAL en entier (CHECK_ERROR=0 et
+  ! CHECK_RESIDUAL=0) -- accumule DANS CONSUME_X_BATCH (voir plus bas),
+  ! reduit UNE FOIS apres la resolution complete (tous paquets confondus).
+  LOGICAL :: WANT_FULL_X
+  INTEGER :: NPREVIEW
+  COMPLEX(WP) :: PREVIEW_LOCAL(5), PREVIEW_GLOBAL(5)
+
+  ! Suivi memoire/CPU par etape (PROFILE_USAGE) -- voir example_blr_mpi_
+  ! pivot.f90 pour le detail complet de la technique.
+  INTEGER, PARAMETER :: MAX_PROFILE_SAMPLES = 128
+  CHARACTER(LEN=40) :: PROF_STAGE(MAX_PROFILE_SAMPLES)
+  DOUBLE PRECISION :: PROF_T(MAX_PROFILE_SAMPLES), PROF_RSS_MB(MAX_PROFILE_SAMPLES), PROF_CPU_PCT(MAX_PROFILE_SAMPLES)
+  INTEGER :: PROF_N
+  DOUBLE PRECISION :: PROF_T_START, PROF_T_PREV
+  REAL :: PROF_CPU_PREV
 
   N = 4000; NB = 200; NRHS = 4; TOL = 1.0E-4_WP
   MAX_MB_PER_PROCESS = 64.0_WP; NRHS_BATCH = 2; SCRATCH_DIR = './blr_ooc_scratch'; EPS = 0.0_WP
   RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0
+  PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0
+  PROF_N = 0
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
@@ -126,7 +153,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot_ooc PR PC [N] [NB] [NRHS] [TOL] '// &
          '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [EPS] [RATIO] [USE_RSVD] '// &
-         '[CHECK_ERROR] [CHECK_RESIDUAL]'
+         '[CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -168,9 +195,18 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   IF (COMMAND_ARGUMENT_COUNT() .GE. 14) THEN
     CALL GET_COMMAND_ARGUMENT(14, ARG); READ(ARG,*) CHECK_RESIDUAL_INT
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 15) THEN
+    CALL GET_COMMAND_ARGUMENT(15, ARG); READ(ARG,*) PROFILE_USAGE_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 16) THEN
+    CALL GET_COMMAND_ARGUMENT(16, ARG); READ(ARG,*) DUMP_STRUCTURE_INT
+  END IF
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_ERROR_FLAG = (CHECK_ERROR_INT .NE. 0)
   CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
+  PROFILE_USAGE_FLAG = (PROFILE_USAGE_INT .NE. 0)
+  DUMP_STRUCTURE_FLAG = (DUMP_STRUCTURE_INT .NE. 0)
+  WANT_FULL_X = (CHECK_ERROR_FLAG .OR. CHECK_RESIDUAL_FLAG)
 
   ! Voir example_blr_mpi_pivot.f90 pour le detail (SET_COMPRESS_WORTHWHILE_
   ! RATIO, blr_compress_mod.f90).
@@ -198,14 +234,25 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
     IF (CHECK_RESIDUAL_FLAG) THEN
       WRITE(6,'(A)') ' Verification : residu ||A*X-B||/||B|| affiche en fin de resolution'
     END IF
+    IF (PROFILE_USAGE_FLAG) THEN
+      WRITE(6,'(A)') ' Profilage RSS/CPU par etape active : usage_profile_rank<N>.csv par processus'
+    END IF
+    IF (DUMP_STRUCTURE_FLAG) THEN
+      WRITE(6,'(A)') ' Structure BLR (dense/bas-rang) exportee : blr_structure_<etape>_rank<N>.csv par processus'
+    END IF
   END IF
+
+  PROF_T_START = MPI_WTIME()
+  PROF_T_PREV = 0.0D0
+  CALL CPU_TIME(PROF_CPU_PREV)
+  CALL PROFILE_SAMPLE('debut')
 
   CALL REPORT_MEMORY_MB(GRID, 'RSS de reference (avant donnees)', GET_RSS_KB()*1024_8)
 
   ! --- 1) assemblage BLR distribue, out-of-core -> disque ----------------
   CALL MPI_ASSEMBLE_BLR_MATRIX_OOC(GRID, N, NB, TOL, GET_BLOCK, A_BLR, SCRATCH_DIR, MAX_MB_PER_PROCESS, &
                                     T_ASM, N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., &
-                                    USE_RSVD=USE_RSVD_FLAG)
+                                    USE_RSVD=USE_RSVD_FLAG, PROGRESS_CALLBACK=PROFILE_CALLBACK_ASSEMBLY)
   IF (MYID0.EQ.0) THEN
     WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
     WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (assemblage) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
@@ -218,6 +265,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   END IF
   CALL REPORT_MEMORY_MB(GRID, 'RAM residente (cache, apres assemblage)', MPI_BLR_MATRIX_OOC_RESIDENT_BYTES(A_BLR))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage)', GET_RSS_KB()*1024_8)
+  CALL PROFILE_SAMPLE('assemblage')
+  CALL DUMP_BLR_STRUCTURE('assembly')
 
   ! Cache de A pour CHECK_RESIDUAL : AVANT la factorisation, qui ecrase A
   ! par L/U en place -- GET_BLOCK n'est plus jamais rappelee ensuite.
@@ -229,6 +278,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   IF (CHECK_ERROR_FLAG .AND. MYID0.EQ.0) &
        WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant B=A*Xexact = ', RSS_MAX_RHS_MB, ' Mo'
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage B)', GET_RSS_KB()*1024_8)
+  CALL PROFILE_SAMPLE('second_membre')
 
   ! Cache de B pour CHECK_RESIDUAL -- deja coherente avec CHECK_ERROR
   ! puisque FILL_RHS (rappelee ici) applique la meme logique qu'a
@@ -238,7 +288,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   ! --- 3) factorisation LU, AVEC pivot, out-of-core -----------------------
   CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC(GRID, A_BLR, TOL, INFO, &
                                            N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                           SHOW_PROGRESS=.TRUE., SHOW_RSS_TRACE=.TRUE.)
+                                           SHOW_PROGRESS=.TRUE., SHOW_RSS_TRACE=.TRUE., &
+                                           PROGRESS_CALLBACK=PROFILE_CALLBACK_FACTOR)
   IF (INFO .NE. 0) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC, INFO=', INFO
     CALL MPI_FINALIZE(IERR)
@@ -253,11 +304,22 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   END IF
   CALL REPORT_MEMORY_MB(GRID, 'RAM residente (cache, apres factorisation)', MPI_BLR_MATRIX_OOC_RESIDENT_BYTES(A_BLR))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres factorisation)', GET_RSS_KB()*1024_8)
+  CALL PROFILE_SAMPLE('factorisation')
+  CALL DUMP_BLR_STRUCTURE('factorization')
 
   ! --- 4) resolution, out-of-core, par paquets de second membre -----------
-  ALLOCATE(X_GLOBAL(N,NRHS))
-  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS=.TRUE.)
+  ! X_GLOBAL(N,NRHS) n'est accumule (par CONSUME_X_BATCH) que si
+  ! CHECK_ERROR ou CHECK_RESIDUAL le necessite -- sinon CONSUME_X_BATCH ne
+  ! recupere qu'un apercu de X(1:5,1) (PREVIEW_LOCAL/PREVIEW_GLOBAL, voir
+  ! le commentaire de tete et la fonction elle-meme), sans jamais assembler
+  ! X en entier ni meme le paquet contenant la colonne RHS 1.
+  IF (WANT_FULL_X) ALLOCATE(X_GLOBAL(N,NRHS))
+  NPREVIEW = MIN(5, N)
+  PREVIEW_LOCAL = (0.0_WP, 0.0_WP)
+  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS=.TRUE., &
+                                             PROGRESS_CALLBACK=PROFILE_CALLBACK_SOLVE)
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres resolution)', GET_RSS_KB()*1024_8)
+  CALL PROFILE_SAMPLE('resolution')
 
   ! PAS de verification independante ICI (voir test/test_mpi_blr_matrix_
   ! pivot_ooc.f90 pour la validation rigoureuse, X_exact connu, quel que
@@ -268,17 +330,28 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   ! varier legerement avec NRHS_BATCH (simple precision + formes d'appels
   ! BLAS differentes amplifiees par le mauvais conditionnement) -- ce n'est
   ! pas un signe d'erreur.
+  IF (.NOT. WANT_FULL_X) THEN
+    CALL MPI_REDUCE(PREVIEW_LOCAL, PREVIEW_GLOBAL, NPREVIEW, MPI_COMPLEX, MPI_SUM, 0, GRID%COMM, IERR)
+  END IF
   IF (MYID0 .EQ. 0) THEN
     WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
     BLOCK
       INTEGER :: I
-      DO I = 1, MIN(5, N)
-        WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(X_GLOBAL(I,1)), ' + i*', AIMAG(X_GLOBAL(I,1))
-      END DO
+      IF (WANT_FULL_X) THEN
+        DO I = 1, NPREVIEW
+          WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(X_GLOBAL(I,1)), ' + i*', AIMAG(X_GLOBAL(I,1))
+        END DO
+      ELSE
+        DO I = 1, NPREVIEW
+          WRITE(6,'(A,I0,A,ES12.4,A,ES12.4)') '   X(', I, ',1) = ', REAL(PREVIEW_GLOBAL(I)), ' + i*', AIMAG(PREVIEW_GLOBAL(I))
+        END DO
+        WRITE(6,'(A)') ' (X complet non accumule -- CHECK_ERROR=0 et CHECK_RESIDUAL=0, memoire economisee)'
+      END IF
     END BLOCK
     IF (CHECK_ERROR_FLAG) THEN
       ERR = COMPUTE_ERR(X_GLOBAL)
       WRITE(6,'(A,ES12.4)') ' Erreur relative ||X-Xexact|| / ||Xexact|| = ', ERR
+      CALL PROFILE_SAMPLE('verif_erreur')
     END IF
   END IF
 
@@ -295,14 +368,126 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
       WRITE(6,'(A)') ' acheck_rank_*.dat supprime ; bcheck_rank_*.dat contient desormais X '// &
            '(economie d''espace disque).'
     END IF
+    CALL PROFILE_SAMPLE('verif_residu')
   END IF
 
-  DEALLOCATE(X_GLOBAL)
+  CALL PROFILE_SAMPLE('fin')
+  CALL PROFILE_WRITE_CSV()
+
+  IF (ALLOCATED(X_GLOBAL)) DEALLOCATE(X_GLOBAL)
   CALL OOC_RHS_FREE(RHS)
   CALL MPI_BLR_MATRIX_OOC_FREE(A_BLR)
   CALL MPI_FINALIZE(IERR)
 
 CONTAINS
+
+  ! Echantillon RSS/CPU pour l'etape STAGE_NAME (PROFILE_USAGE) -- voir
+  ! example_blr_mpi_pivot.f90 pour le detail complet de la technique.
+  SUBROUTINE PROFILE_SAMPLE(STAGE_NAME)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_NAME
+    REAL :: CPU_NOW
+    DOUBLE PRECISION :: T_NOW, DT_WALL, DT_CPU
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    IF (PROF_N .GE. MAX_PROFILE_SAMPLES) RETURN
+    CALL CPU_TIME(CPU_NOW)
+    T_NOW = MPI_WTIME() - PROF_T_START
+    DT_WALL = T_NOW - PROF_T_PREV
+    DT_CPU = REAL(CPU_NOW - PROF_CPU_PREV, 8)
+    PROF_N = PROF_N + 1
+    PROF_STAGE(PROF_N) = STAGE_NAME
+    PROF_T(PROF_N) = T_NOW
+    PROF_RSS_MB(PROF_N) = REAL(GET_RSS_KB(),8) / 1024.0D0
+    IF (DT_WALL .GT. 1.0D-6) THEN
+      PROF_CPU_PCT(PROF_N) = 100.0D0 * DT_CPU / DT_WALL
+    ELSE
+      PROF_CPU_PCT(PROF_N) = 0.0D0
+    END IF
+    PROF_T_PREV = T_NOW
+    PROF_CPU_PREV = CPU_NOW
+  END SUBROUTINE PROFILE_SAMPLE
+
+  FUNCTION PCT_LABEL(STAGE, NDONE, NTOTAL) RESULT(LBL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    CHARACTER(LEN=40) :: LBL
+    WRITE(LBL,'(A,A,I0,A)') TRIM(STAGE), '@', (100*NDONE)/MAX(NTOTAL,1), '%'
+  END FUNCTION PCT_LABEL
+
+  ! Callbacks PROGRESS_CALLBACK (STAGE_PROGRESS_CALLBACK_IFACE) -- pour la
+  ! resolution, NDONE/NTOTAL redemarrent a chaque PAQUET de second membre
+  ! (voir MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D), donc l'etiquette
+  ! "resolution@NN%" se repete une fois par paquet -- attendu, voir le
+  ! commentaire de tete.
+  SUBROUTINE PROFILE_CALLBACK_ASSEMBLY(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('assemblage', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_ASSEMBLY
+
+  SUBROUTINE PROFILE_CALLBACK_FACTOR(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('factorisation', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_FACTOR
+
+  SUBROUTINE PROFILE_CALLBACK_SOLVE(NDONE, NTOTAL)
+    INTEGER, INTENT(IN) :: NDONE, NTOTAL
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    CALL PROFILE_SAMPLE(PCT_LABEL('resolution', NDONE, NTOTAL))
+  END SUBROUTINE PROFILE_CALLBACK_SOLVE
+
+  ! Ecrit les echantillons de CE processus (usage_profile_rank<N>.csv) --
+  ! voir example_blr_mpi_pivot.f90 pour le detail complet.
+  SUBROUTINE PROFILE_WRITE_CSV()
+    INTEGER :: U, K
+    CHARACTER(LEN=64) :: FNAME
+    IF (.NOT. PROFILE_USAGE_FLAG) RETURN
+    WRITE(FNAME,'(A,I0,A)') 'usage_profile_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'rank,stage,t_wall_s,rss_mb,cpu_pct'
+    DO K = 1, PROF_N
+      WRITE(U,'(I0,A,A,A,F12.4,A,F12.3,A,F8.2)') MYID0, ',', TRIM(PROF_STAGE(K)), ',', &
+           PROF_T(K), ',', PROF_RSS_MB(K), ',', PROF_CPU_PCT(K)
+    END DO
+    CLOSE(U)
+  END SUBROUTINE PROFILE_WRITE_CSV
+
+  ! Ecrit la nature de chaque bloc LOCAL de A_BLR (DUMP_STRUCTURE) -- voir
+  ! example_blr_mpi_pivot.f90 pour le detail complet de la technique.
+  ! DIFFERENCE avec la version RAM : A_BLR%DIAGBLK(I) est ici un
+  ! OOC_BLOCK_DESC_T (descripteur LEGER, pas un tableau dense) -- son
+  ! proprietaire se detecte via OFFSET>=0 (ecrit sur disque par
+  ! OOC_WRITE_BLOCK_FIXED, voir blr_ooc_mod.f90), au lieu de
+  ! ALLOCATED(...%D). A_BLR%OFFBLK(li,lj)%IS_LOWRANK/RANK restent, eux,
+  ! toujours valides des l'assemblage (poses directement sur le
+  ! descripteur en RAM), qu'ils aient ete evinces sur disque ou non.
+  SUBROUTINE DUMP_BLR_STRUCTURE(STAGE_LABEL)
+    CHARACTER(LEN=*), INTENT(IN) :: STAGE_LABEL
+    INTEGER :: U, li, lj, I, J
+    CHARACTER(LEN=96) :: FNAME
+    IF (.NOT. DUMP_STRUCTURE_FLAG) RETURN
+    WRITE(FNAME,'(A,A,A,I0,A)') 'blr_structure_', TRIM(STAGE_LABEL), '_rank', MYID0, '.csv'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U,'(A)') 'block_row,block_col,kind,rank'
+    DO I = 1, A_BLR%NBLK
+      IF (A_BLR%DIAGBLK(I)%OFFSET .GE. 0_8) THEN
+        WRITE(U,'(I0,A,I0,A,I0)') I, ',', I, ',diagonal,', A_BLR%BEND(I)-A_BLR%BSTART(I)+1
+      END IF
+    END DO
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I .EQ. J) CYCLE
+        IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',lowrank,', A_BLR%OFFBLK(li,lj)%RANK
+        ELSE
+          WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',dense,', A_BLR%BEND(J)-A_BLR%BSTART(J)+1
+        END IF
+      END DO
+    END DO
+    CLOSE(U)
+  END SUBROUTINE DUMP_BLR_STRUCTURE
 
   ! Voir example_blr_mpi_pivot.f90 pour le detail du correctif.
   REAL(WP) FUNCTION REAL_COMPRESSION_PCT(NCOMP, NOFF, RSUM)
@@ -623,19 +808,40 @@ CONTAINS
     END IF
   END SUBROUTINE FILL_RHS
 
-  ! Rassemble CE paquet resolu dans X_GLOBAL (verification/demonstration
-  ! uniquement -- un vrai cas massivement second membre ecrirait plutot
-  ! CE paquet directement sur disque ici, voir commentaire de tete).
+  ! Rassemble CE paquet resolu dans X_GLOBAL SI CHECK_ERROR/CHECK_RESIDUAL
+  ! le necessite (verification -- un vrai cas massivement second membre
+  ! ecrirait plutot CE paquet directement sur disque ici, voir commentaire
+  ! de tete). SINON, extrait juste l'apercu de X(1:5,1) SANS assembler quoi
+  ! que ce soit -- SEUL le paquet qui possede effectivement la colonne RHS
+  ! globale 1 (GSTART<=1<=GEND) contribue, les autres ne font rien ; meme
+  ! technique que example_blr_mpi_pivot.f90 (X_LOCAL joue ici le role de
+  ! B_LOCAL la-bas, PREVIEW_LOCAL est reduit UNE FOIS apres la resolution
+  ! complete, voir le site d'appel).
   SUBROUTINE CONSUME_X_BATCH(BATCH_RSTART, BATCH_REND, GSTART, GEND, X_LOCAL, LDX, NRHS_LOC_B)
     INTEGER, INTENT(IN)      :: BATCH_RSTART, BATCH_REND, GSTART, GEND, LDX, NRHS_LOC_B
     COMPLEX(WP), INTENT(IN)  :: X_LOCAL(LDX,MAX(NRHS_LOC_B,1))
     COMPLEX(WP), ALLOCATABLE :: X_BATCH_GLOBAL(:,:)
-    INTEGER :: WIDTH
-    WIDTH = BATCH_REND - BATCH_RSTART + 1
-    ALLOCATE(X_BATCH_GLOBAL(N,WIDTH))
-    CALL GATHER_2D_RHS(GRID, N, NB, WIDTH, X_LOCAL, LDX, NRHS_LOC_B, 0, X_BATCH_GLOBAL)
-    IF (MYID0 .EQ. 0) X_GLOBAL(:,BATCH_RSTART:BATCH_REND) = X_BATCH_GLOBAL
-    DEALLOCATE(X_BATCH_GLOBAL)
+    INTEGER :: WIDTH, li, I, PREVIEW_RS, PREVIEW_MI, PREVIEW_GI, LOCAL_COL
+    IF (WANT_FULL_X) THEN
+      WIDTH = BATCH_REND - BATCH_RSTART + 1
+      ALLOCATE(X_BATCH_GLOBAL(N,WIDTH))
+      CALL GATHER_2D_RHS(GRID, N, NB, WIDTH, X_LOCAL, LDX, NRHS_LOC_B, 0, X_BATCH_GLOBAL)
+      IF (MYID0 .EQ. 0) X_GLOBAL(:,BATCH_RSTART:BATCH_REND) = X_BATCH_GLOBAL
+      DEALLOCATE(X_BATCH_GLOBAL)
+    ELSE IF (GSTART .LE. 1 .AND. 1 .LE. GEND) THEN
+      LOCAL_COL = 1 - GSTART + 1
+      PREVIEW_RS = 1
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        PREVIEW_MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+        DO PREVIEW_GI = 1, NPREVIEW
+          IF (PREVIEW_GI.GE.A_BLR%BSTART(I) .AND. PREVIEW_GI.LE.A_BLR%BEND(I)) THEN
+            PREVIEW_LOCAL(PREVIEW_GI) = X_LOCAL(PREVIEW_RS + (PREVIEW_GI-A_BLR%BSTART(I)), LOCAL_COL)
+          END IF
+        END DO
+        PREVIEW_RS = PREVIEW_RS + PREVIEW_MI
+      END DO
+    END IF
   END SUBROUTINE CONSUME_X_BATCH
 
 END PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
