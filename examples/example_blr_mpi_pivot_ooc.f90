@@ -39,8 +39,8 @@
 ! Choisir large par defaut, et ne descendre que si la RAM disponible
 ! l'impose vraiment.
 !
-! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot_ooc PR PC [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]
-!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
+! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot_ooc PR PC [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE] [SAVE_MATRIX] [SAVE_RHS] [SAVE_FACTORED] [SAVE_SOLUTION] [LOAD_MATRIX] [LOAD_FACTORED] [LOAD_RHS] [CHECKPOINT_DIR]
+!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0 SAVE_MATRIX=0 SAVE_RHS=0 SAVE_FACTORED=0 SAVE_SOLUTION=0 LOAD_MATRIX=0 LOAD_FACTORED=0 LOAD_RHS=0 CHECKPOINT_DIR=.)
 !
 ! EPS (BRUIT PLEIN-RANG, POUR EXPERIMENTER FACILEMENT AVEC LA COMPRESSIBI-
 ! LITE -- IDENTIQUE a example_blr_mpi_pivot.f90, voir son commentaire de
@@ -99,6 +99,48 @@
 ! CHECK_RESIDUAL, X_GLOBAL(N,NRHS) n'est PAS accumule (voir CONSUME_X_
 ! BATCH) -- seul un apercu de X(1:5,1) est recupere, sans le cout memoire
 ! ni communication du rassemblement complet a chaque paquet.
+!
+! SAVE_MATRIX/SAVE_RHS/SAVE_FACTORED/SAVE_SOLUTION et LOAD_MATRIX/
+! LOAD_FACTORED/LOAD_RHS (+ CHECKPOINT_DIR, defaut '.', doit deja exister)
+! -- meme fonctionnalite que example_blr_mpi_pivot.f90 (voir son
+! commentaire de tete pour la description generale), adaptee au stockage
+! OOC : UN FICHIER PAR PROCESSUS dans CHECKPOINT_DIR (STREAM non formate),
+! DISTINCT des fichiers scratch internes a_rank_*.dat/b_rank_*.dat
+! (SCRATCH_DIR) -- ceux-ci restent du scratch PUR, supprimes en fin
+! d'execution (OOC_STORE_FREE), alors que les fichiers de checkpoint
+! (prefixe saved_..._ooc_) sont PERSISTANTS, jamais supprimes
+! automatiquement :
+!   - saved_matrix_ooc_rank<N>.dat / saved_factored_ooc_rank<N>.dat :
+!     en-tete (N/NB/grille) puis, pour chaque bloc LOCAL de A_BLR (relu
+!     depuis le fichier scratch OOC via OOC_READ_BLOCK_RAW -- les caches
+!     CACHE_A/CACHE_D sont d'abord vidangees via OOC_CACHE_FLUSH_ALL/
+!     OOC_DIAG_CACHE_FLUSH_ALL pour garantir un OFFSET valide sur TOUS les
+!     blocs, y compris ceux jamais encore evinces), les memes champs que
+!     la version RAM (IS_LOWRANK/M/N/RANK + UFAC/VFAC ou DENSE) ; IPIV en
+!     plus pour la version factorisee. LOAD_* reconstruit A_BLR (BSTART/
+!     BEND/NBLKR_LOC/NBLKC_LOC via BLOCK_PARTITION/BLOCK_NUMROC, comme une
+!     assemblage neuve), REINITIALISE le stockage OOC (OOC_STORE_INIT/
+!     OOC_CACHE_INIT/OOC_DIAG_CACHE_INIT, comme MPI_ASSEMBLE_BLR_MATRIX_
+!     OOC), puis reecrit chaque bloc lu sur le NOUVEAU fichier scratch via
+!     OOC_WRITE_BLOCK_FIXED -- exactement comme si le bloc venait d'etre
+!     compresse pour la premiere fois (RAM residente reste bornee : un
+!     seul bloc a la fois, jamais toute la matrice).
+!   - saved_rhs_ooc_rank<N>.dat : en-tete (N/NRHS/grille/MLOC/NRHS_BATCH/
+!     NBATCHES) puis chaque paquet RHS (relu via OOC_READ_BLOCK_RAW, aucun
+!     cache a vidanger ici -- RHS%STORE_B est toujours ecrit directement,
+!     voir blr_ooc_mod.f90). LOAD_RHS_OOC reconstruit OOC_RHS_T a
+!     l'identique (meme STORE_B/BATCH neufs, remplis via OOC_WRITE_BLOCK_
+!     RAW dans le meme ordre).
+!   - saved_solution_ooc_rank<N>.dat : PAS de contrepartie RAM a relire
+!     (comme dans la version RAM, aucun LOAD_SOLUTION) -- X n'existe nulle
+!     part en un seul bloc pour l'OOC (voir CONSUME_X_BATCH), donc chaque
+!     paquet resolu est ecrit AU FIL DE L'EAU, directement depuis CONSUME_
+!     X_BATCH, des qu'il est calcule (jamais accumule au-dela d'un seul
+!     paquet a la fois -- l'avantage memoire de l'OOC reste entier).
+! Comme la version RAM : en-tete verifie (N/NB ou NRHS/grille) avant tout
+! chargement, arret COLLECTIF propre (MPI_ALLREDUCE) si un seul rang
+! detecte une incoherence, et LOAD_FACTORED prioritaire sur LOAD_MATRIX si
+! les deux sont positionnes.
 !===============================================================================
 PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   USE MPI_BLR_MATRIX_MOD
@@ -124,6 +166,19 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   DOUBLE PRECISION :: RSS_MAX_RHS_MB, RSS_MAX_RESID_MB
   REAL(WP) :: ERR, RESID
 
+  ! Sauvegarde/reprise (voir le commentaire de tete) -- un fichier par
+  ! processus dans CHECKPOINT_DIR par objet sauvegarde/relu, DISTINCT des
+  ! fichiers scratch internes (SCRATCH_DIR).
+  INTEGER :: SAVE_MATRIX_INT, SAVE_RHS_INT, SAVE_FACTORED_INT, SAVE_SOLUTION_INT
+  INTEGER :: LOAD_MATRIX_INT, LOAD_FACTORED_INT, LOAD_RHS_INT
+  LOGICAL :: SAVE_MATRIX_FLAG, SAVE_RHS_FLAG, SAVE_FACTORED_FLAG, SAVE_SOLUTION_FLAG
+  LOGICAL :: LOAD_MATRIX_FLAG, LOAD_FACTORED_FLAG, LOAD_RHS_FLAG, OK
+  CHARACTER(LEN=256) :: CHECKPOINT_DIR
+  ! Unite ouverte pendant TOUTE la resolution quand SAVE_SOLUTION_FLAG :
+  ! chaque paquet resolu (CONSUME_X_BATCH) y ecrit sa part au fil de
+  ! l'eau, jamais d'accumulation au-dela d'un seul paquet a la fois.
+  INTEGER :: SAVE_SOLUTION_UNIT
+
   ! Apercu de X(1:5,1) sans accumuler X_GLOBAL en entier (CHECK_ERROR=0 et
   ! CHECK_RESIDUAL=0) -- accumule DANS CONSUME_X_BATCH (voir plus bas),
   ! reduit UNE FOIS apres la resolution complete (tous paquets confondus).
@@ -144,6 +199,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   MAX_MB_PER_PROCESS = 64.0_WP; NRHS_BATCH = 2; SCRATCH_DIR = './blr_ooc_scratch'; EPS = 0.0_WP
   RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0
   PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0
+  SAVE_MATRIX_INT = 0; SAVE_RHS_INT = 0; SAVE_FACTORED_INT = 0; SAVE_SOLUTION_INT = 0
+  LOAD_MATRIX_INT = 0; LOAD_FACTORED_INT = 0; LOAD_RHS_INT = 0; CHECKPOINT_DIR = '.'
   PROF_N = 0
 
   CALL MPI_INIT(IERR)
@@ -153,7 +210,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot_ooc PR PC [N] [NB] [NRHS] [TOL] '// &
          '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [EPS] [RATIO] [USE_RSVD] '// &
-         '[CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]'
+         '[CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE] [SAVE_MATRIX] [SAVE_RHS] '// &
+         '[SAVE_FACTORED] [SAVE_SOLUTION] [LOAD_MATRIX] [LOAD_FACTORED] [LOAD_RHS] [CHECKPOINT_DIR]'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -201,6 +259,37 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   IF (COMMAND_ARGUMENT_COUNT() .GE. 16) THEN
     CALL GET_COMMAND_ARGUMENT(16, ARG); READ(ARG,*) DUMP_STRUCTURE_INT
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 17) THEN
+    CALL GET_COMMAND_ARGUMENT(17, ARG); READ(ARG,*) SAVE_MATRIX_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 18) THEN
+    CALL GET_COMMAND_ARGUMENT(18, ARG); READ(ARG,*) SAVE_RHS_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 19) THEN
+    CALL GET_COMMAND_ARGUMENT(19, ARG); READ(ARG,*) SAVE_FACTORED_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 20) THEN
+    CALL GET_COMMAND_ARGUMENT(20, ARG); READ(ARG,*) SAVE_SOLUTION_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 21) THEN
+    CALL GET_COMMAND_ARGUMENT(21, ARG); READ(ARG,*) LOAD_MATRIX_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 22) THEN
+    CALL GET_COMMAND_ARGUMENT(22, ARG); READ(ARG,*) LOAD_FACTORED_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 23) THEN
+    CALL GET_COMMAND_ARGUMENT(23, ARG); READ(ARG,*) LOAD_RHS_INT
+  END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 24) THEN
+    CALL GET_COMMAND_ARGUMENT(24, CHECKPOINT_DIR)
+  END IF
+  SAVE_MATRIX_FLAG = (SAVE_MATRIX_INT .NE. 0)
+  SAVE_RHS_FLAG = (SAVE_RHS_INT .NE. 0)
+  SAVE_FACTORED_FLAG = (SAVE_FACTORED_INT .NE. 0)
+  SAVE_SOLUTION_FLAG = (SAVE_SOLUTION_INT .NE. 0)
+  LOAD_MATRIX_FLAG = (LOAD_MATRIX_INT .NE. 0)
+  LOAD_FACTORED_FLAG = (LOAD_FACTORED_INT .NE. 0)
+  LOAD_RHS_FLAG = (LOAD_RHS_INT .NE. 0)
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_ERROR_FLAG = (CHECK_ERROR_INT .NE. 0)
   CHECK_RESIDUAL_FLAG = (CHECK_RESIDUAL_INT .NE. 0)
@@ -240,6 +329,16 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
     IF (DUMP_STRUCTURE_FLAG) THEN
       WRITE(6,'(A)') ' Structure BLR (dense/bas-rang) exportee : blr_structure_<etape>_rank<N>.csv par processus'
     END IF
+    IF (LOAD_FACTORED_FLAG) THEN
+      WRITE(6,'(A)') ' Reprise : matrice factorisee relue depuis disque (LOAD_FACTORED=1) -- '// &
+           'assemblage et factorisation ignores'
+      IF (LOAD_MATRIX_FLAG) WRITE(6,'(A)') ' (LOAD_MATRIX=1 ignore : LOAD_FACTORED est prioritaire)'
+    ELSE IF (LOAD_MATRIX_FLAG) THEN
+      WRITE(6,'(A)') ' Reprise : matrice relue depuis disque (LOAD_MATRIX=1) -- assemblage ignore'
+    END IF
+    IF (LOAD_RHS_FLAG) WRITE(6,'(A)') ' Reprise : second membre relu depuis disque (LOAD_RHS=1)'
+    IF (SAVE_MATRIX_FLAG .OR. SAVE_RHS_FLAG .OR. SAVE_FACTORED_FLAG .OR. SAVE_SOLUTION_FLAG) &
+         WRITE(6,'(A,A)') ' Sauvegarde(s) activee(s) dans : ', TRIM(CHECKPOINT_DIR)
   END IF
 
   PROF_T_START = MPI_WTIME()
@@ -249,19 +348,52 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
 
   CALL REPORT_MEMORY_MB(GRID, 'RSS de reference (avant donnees)', GET_RSS_KB()*1024_8)
 
-  ! --- 1) assemblage BLR distribue, out-of-core -> disque ----------------
-  CALL MPI_ASSEMBLE_BLR_MATRIX_OOC(GRID, N, NB, TOL, GET_BLOCK, A_BLR, SCRATCH_DIR, MAX_MB_PER_PROCESS, &
-                                    T_ASM, N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., &
-                                    USE_RSVD=USE_RSVD_FLAG, PROGRESS_CALLBACK=PROFILE_CALLBACK_ASSEMBLY)
-  IF (MYID0.EQ.0) THEN
-    WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
-    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (assemblage) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
-         ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
-    ! Taux de compression REEL, base sur le RANG MOYEN -- voir
-    ! REAL_COMPRESSION_PCT ci-dessous (meme correctif que example_blr_mpi_
-    ! pivot.f90 : un bloc en repli dense compte NB dans RANK_SUM, PAS 2*NB,
-    ! la formule naive donnait a tort 200% quand tout est dense).
-    WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (assemblage) : ', REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
+  ! --- 1) assemblage BLR distribue, out-of-core -> disque (ou reprise) ---
+  IF (LOAD_FACTORED_FLAG) THEN
+    CALL LOAD_BLR_MATRIX_OOC(TRIM(CHECKPOINT_DIR)//'/saved_factored_ooc', .TRUE., OK)
+    IF (.NOT. OK) THEN
+      CALL MPI_FINALIZE(IERR)
+      STOP 1
+    END IF
+    T_ASM = 0.0D0
+    CALL RECOMPUTE_COMPRESSION_STATS_OOC(N_COMPRESSED, N_OFFDIAG, RANK_SUM)
+    IF (MYID0.EQ.0) THEN
+      WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (factorisation, charges) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+           ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+      WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (factorisation, charge) : ', &
+           REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
+    END IF
+  ELSE
+    IF (LOAD_MATRIX_FLAG) THEN
+      CALL LOAD_BLR_MATRIX_OOC(TRIM(CHECKPOINT_DIR)//'/saved_matrix_ooc', .FALSE., OK)
+      IF (.NOT. OK) THEN
+        CALL MPI_FINALIZE(IERR)
+        STOP 1
+      END IF
+      T_ASM = 0.0D0
+      CALL RECOMPUTE_COMPRESSION_STATS_OOC(N_COMPRESSED, N_OFFDIAG, RANK_SUM)
+      IF (MYID0.EQ.0) THEN
+        WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (assemblage, charges) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+             ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+        WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (assemblage, charge) : ', &
+             REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
+      END IF
+    ELSE
+      CALL MPI_ASSEMBLE_BLR_MATRIX_OOC(GRID, N, NB, TOL, GET_BLOCK, A_BLR, SCRATCH_DIR, MAX_MB_PER_PROCESS, &
+                                        T_ASM, N_COMPRESSED, N_OFFDIAG, RANK_SUM, SHOW_PROGRESS=.TRUE., &
+                                        USE_RSVD=USE_RSVD_FLAG, PROGRESS_CALLBACK=PROFILE_CALLBACK_ASSEMBLY)
+      IF (MYID0.EQ.0) THEN
+        WRITE(6,'(A,F8.3,A)') ' Assemblage+compression : ', T_ASM, ' s'
+        WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (assemblage) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+             ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+        ! Taux de compression REEL, base sur le RANG MOYEN -- voir
+        ! REAL_COMPRESSION_PCT ci-dessous (meme correctif que example_blr_mpi_
+        ! pivot.f90 : un bloc en repli dense compte NB dans RANK_SUM, PAS 2*NB,
+        ! la formule naive donnait a tort 200% quand tout est dense).
+        WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (assemblage) : ', REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
+      END IF
+      IF (SAVE_MATRIX_FLAG) CALL SAVE_BLR_MATRIX_OOC(TRIM(CHECKPOINT_DIR)//'/saved_matrix_ooc', .FALSE.)
+    END IF
   END IF
   CALL REPORT_MEMORY_MB(GRID, 'RAM residente (cache, apres assemblage)', MPI_BLR_MATRIX_OOC_RESIDENT_BYTES(A_BLR))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage)', GET_RSS_KB()*1024_8)
@@ -272,9 +404,20 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   ! par L/U en place -- GET_BLOCK n'est plus jamais rappelee ensuite.
   IF (CHECK_RESIDUAL_FLAG) CALL CACHE_A_FOR_CHECK(GRID, N, NB)
 
-  ! --- 2) assemblage du second membre, SEPAREMENT, aussi sur disque ------
+  ! --- 2) assemblage du second membre, SEPAREMENT, aussi sur disque (ou
+  !     reprise) -- INDEPENDANT du choix ci-dessus (assemble/charge/
+  !     factorisee chargee), toujours execute --------------------------
   RSS_MAX_RHS_MB = 0.0D0
-  CALL MPI_ASSEMBLE_RHS_OOC(GRID, A_BLR, NRHS, NRHS_BATCH, FILL_RHS, SCRATCH_DIR, RHS)
+  IF (LOAD_RHS_FLAG) THEN
+    CALL LOAD_RHS_OOC(TRIM(CHECKPOINT_DIR)//'/saved_rhs_ooc', OK)
+    IF (.NOT. OK) THEN
+      CALL MPI_FINALIZE(IERR)
+      STOP 1
+    END IF
+  ELSE
+    CALL MPI_ASSEMBLE_RHS_OOC(GRID, A_BLR, NRHS, NRHS_BATCH, FILL_RHS, SCRATCH_DIR, RHS)
+    IF (SAVE_RHS_FLAG) CALL SAVE_RHS_OOC(TRIM(CHECKPOINT_DIR)//'/saved_rhs_ooc')
+  END IF
   IF (CHECK_ERROR_FLAG .AND. MYID0.EQ.0) &
        WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant B=A*Xexact = ', RSS_MAX_RHS_MB, ' Mo'
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres assemblage B)', GET_RSS_KB()*1024_8)
@@ -285,22 +428,26 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   ! l'assemblage reel du second membre.
   IF (CHECK_RESIDUAL_FLAG) CALL CACHE_B_FOR_CHECK(GRID, N, NB, NRHS)
 
-  ! --- 3) factorisation LU, AVEC pivot, out-of-core -----------------------
-  CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC(GRID, A_BLR, TOL, INFO, &
-                                           N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                           SHOW_PROGRESS=.TRUE., SHOW_RSS_TRACE=.TRUE., &
-                                           PROGRESS_CALLBACK=PROFILE_CALLBACK_FACTOR)
-  IF (INFO .NE. 0) THEN
-    IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC, INFO=', INFO
-    CALL MPI_FINALIZE(IERR)
-    STOP 1
-  END IF
-  IF (MYID0.EQ.0) THEN
-    WRITE(6,'(A,F8.3,A)') ' Factorisation LU : ', T_FACTOR, ' s'
-    WRITE(6,'(A,I0)') ' Nombre de permutations de lignes (pivot) : ', N_SWAPS
-    WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (fin factorisation) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
-         ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
-    WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (fin factorisation) : ', REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
+  ! --- 3) factorisation LU, AVEC pivot, out-of-core (sautee si LOAD_
+  !     FACTORED -- deja disponible, voir ci-dessus) -----------------------
+  IF (.NOT. LOAD_FACTORED_FLAG) THEN
+    CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC(GRID, A_BLR, TOL, INFO, &
+                                             N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
+                                             SHOW_PROGRESS=.TRUE., SHOW_RSS_TRACE=.TRUE., &
+                                             PROGRESS_CALLBACK=PROFILE_CALLBACK_FACTOR)
+    IF (INFO .NE. 0) THEN
+      IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR MPI_BLR_MATRIX_LU_FACTOR_PIVOT_OOC, INFO=', INFO
+      CALL MPI_FINALIZE(IERR)
+      STOP 1
+    END IF
+    IF (MYID0.EQ.0) THEN
+      WRITE(6,'(A,F8.3,A)') ' Factorisation LU : ', T_FACTOR, ' s'
+      WRITE(6,'(A,I0)') ' Nombre de permutations de lignes (pivot) : ', N_SWAPS
+      WRITE(6,'(A,I0,A,I0,A,F6.1,A)') ' Blocs compresses (fin factorisation) : ', N_COMPRESSED, ' / ', N_OFFDIAG, &
+           ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
+      WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (fin factorisation) : ', REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
+    END IF
+    IF (SAVE_FACTORED_FLAG) CALL SAVE_BLR_MATRIX_OOC(TRIM(CHECKPOINT_DIR)//'/saved_factored_ooc', .TRUE.)
   END IF
   CALL REPORT_MEMORY_MB(GRID, 'RAM residente (cache, apres factorisation)', MPI_BLR_MATRIX_OOC_RESIDENT_BYTES(A_BLR))
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres factorisation)', GET_RSS_KB()*1024_8)
@@ -316,8 +463,22 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   IF (WANT_FULL_X) ALLOCATE(X_GLOBAL(N,NRHS))
   NPREVIEW = MIN(5, N)
   PREVIEW_LOCAL = (0.0_WP, 0.0_WP)
+  ! X n'existe nulle part en un seul bloc pour l'OOC (voir CONSUME_X_
+  ! BATCH) -- SAVE_SOLUTION_FLAG ecrit donc chaque paquet resolu au fil de
+  ! l'eau, DANS le callback, des qu'il est disponible (jamais accumule).
+  IF (SAVE_SOLUTION_FLAG) THEN
+    BLOCK
+      CHARACTER(LEN=16) :: RSTR
+      WRITE(RSTR,'(I6.6)') MYID0
+      OPEN(NEWUNIT=SAVE_SOLUTION_UNIT, FILE=TRIM(CHECKPOINT_DIR)//'/saved_solution_ooc_rank'//TRIM(RSTR)//'.dat', &
+           ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+      WRITE(SAVE_SOLUTION_UNIT) N, NRHS, PR, PC, GRID%MYROW, GRID%MYCOL, MYID0, &
+           RHS%MLOC, RHS%NRHS_BATCH, RHS%NBATCHES
+    END BLOCK
+  END IF
   CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_OOC_2D(GRID, A_BLR, RHS, CONSUME_X_BATCH, SHOW_PROGRESS=.TRUE., &
                                              PROGRESS_CALLBACK=PROFILE_CALLBACK_SOLVE)
+  IF (SAVE_SOLUTION_FLAG) CLOSE(SAVE_SOLUTION_UNIT)
   CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres resolution)', GET_RSS_KB()*1024_8)
   CALL PROFILE_SAMPLE('resolution')
 
@@ -380,6 +541,278 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT_OOC
   CALL MPI_FINALIZE(IERR)
 
 CONTAINS
+
+  ! Recalcule N_COMPRESSED/N_OFFDIAG/RANK_SUM depuis l'etat COURANT de
+  ! A_BLR%OFFBLK -- necessaire apres LOAD_MATRIX_OOC/LOAD_FACTORED_OOC
+  ! puisque ces stats ne sont normalement produites QUE par un appel reel
+  ! a l'assemblage/la factorisation, que l'on vient justement de sauter.
+  ! CONTRAIREMENT a la version RAM, AUCUNE lecture disque necessaire ici :
+  ! IS_LOWRANK/M/N/RANK sont des CHAMPS DU DESCRIPTEUR (OOC_BLOCK_DESC_T),
+  ! toujours resident en RAM et valides quel que soit l'etat du cache (voir
+  ! DUMP_BLR_STRUCTURE ci-dessous, meme principe).
+  SUBROUTINE RECOMPUTE_COMPRESSION_STATS_OOC(NC_OUT, NO_OUT, RS_OUT)
+    INTEGER, INTENT(OUT) :: NC_OUT, NO_OUT
+    INTEGER(8), INTENT(OUT) :: RS_OUT
+    INTEGER :: li2, lj2, I2, J2, NC_LOCAL, NO_LOCAL, IERR2
+    INTEGER(8) :: RS_LOCAL
+    NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8
+    DO li2 = 1, A_BLR%NBLKR_LOC
+      I2 = (li2-1)*GRID%PR + GRID%MYROW + 1
+      DO lj2 = 1, A_BLR%NBLKC_LOC
+        J2 = (lj2-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I2 .EQ. J2) CYCLE
+        NO_LOCAL = NO_LOCAL + 1
+        IF (A_BLR%OFFBLK(li2,lj2)%IS_LOWRANK) THEN
+          NC_LOCAL = NC_LOCAL + 1
+          RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(li2,lj2)%RANK
+        ELSE
+          RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(li2,lj2)%M, A_BLR%OFFBLK(li2,lj2)%N)
+        END IF
+      END DO
+    END DO
+    CALL MPI_ALLREDUCE(NC_LOCAL, NC_OUT, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR2)
+    CALL MPI_ALLREDUCE(NO_LOCAL, NO_OUT, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR2)
+    CALL MPI_ALLREDUCE(RS_LOCAL, RS_OUT, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR2)
+  END SUBROUTINE RECOMPUTE_COMPRESSION_STATS_OOC
+
+  ! Ecrit A_BLR (SAVE_MATRIX ou SAVE_FACTORED, voir le commentaire de
+  ! tete) -- vidange D'ABORD les caches (OOC_CACHE_FLUSH_ALL/OOC_DIAG_
+  ! CACHE_FLUSH_ALL) pour garantir un OFFSET valide sur TOUS les blocs
+  ! locaux, y compris ceux jamais encore evinces vers le fichier scratch
+  ! (normalement deja fait en fin d'assemblage/factorisation, voir
+  ! mpi_blr_matrix_mod.f90 -- appel defensif ici, sans effet si deja
+  ! vidangees). Chaque bloc est ensuite RELU depuis le disque UN A LA FOIS
+  ! (OOC_READ_BLOCK_RAW) et ecrit sur le fichier de checkpoint -- jamais
+  ! plus d'un bloc resident a la fois, l'avantage memoire de l'OOC reste
+  ! entier meme pendant la sauvegarde.
+  SUBROUTINE SAVE_BLR_MATRIX_OOC(PREFIX, WITH_IPIV)
+    CHARACTER(LEN=*), INTENT(IN) :: PREFIX
+    LOGICAL, INTENT(IN) :: WITH_IPIV
+    TYPE(BLR_BLOCK_T) :: BLK
+    INTEGER :: U, li2, lj2, I2, J2, ND
+    CHARACTER(LEN=16) :: RSTR
+
+    CALL OOC_CACHE_FLUSH_ALL(A_BLR%CACHE_A, A_BLR%STORE_A, A_BLR%OFFBLK)
+    CALL OOC_DIAG_CACHE_FLUSH_ALL(A_BLR%CACHE_D, A_BLR%STORE_A, A_BLR%DIAGBLK)
+
+    WRITE(RSTR,'(I6.6)') MYID0
+    OPEN(NEWUNIT=U, FILE=TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat', &
+         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U) N, NB, A_BLR%NBLK, PR, PC, GRID%MYROW, GRID%MYCOL, MYID0, &
+         A_BLR%NBLKR_LOC, A_BLR%NBLKC_LOC
+
+    ND = 0
+    DO I2 = 1, A_BLR%NBLK
+      IF (A_BLR%DIAGBLK(I2)%OFFSET .GE. 0_8) ND = ND + 1
+    END DO
+    WRITE(U) ND
+    DO I2 = 1, A_BLR%NBLK
+      IF (A_BLR%DIAGBLK(I2)%OFFSET .GE. 0_8) THEN
+        CALL OOC_READ_BLOCK_RAW(A_BLR%STORE_A, A_BLR%DIAGBLK(I2), BLK)
+        WRITE(U) I2, BLK%M
+        WRITE(U) BLK%DENSE
+      END IF
+    END DO
+
+    DO li2 = 1, A_BLR%NBLKR_LOC
+      I2 = (li2-1)*GRID%PR + GRID%MYROW + 1
+      DO lj2 = 1, A_BLR%NBLKC_LOC
+        J2 = (lj2-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I2 .EQ. J2) CYCLE
+        CALL OOC_READ_BLOCK_RAW(A_BLR%STORE_A, A_BLR%OFFBLK(li2,lj2), BLK)
+        WRITE(U) I2, J2, BLK%IS_LOWRANK, BLK%M, BLK%N, BLK%RANK
+        IF (BLK%IS_LOWRANK) THEN
+          WRITE(U) BLK%UFAC
+          WRITE(U) BLK%VFAC
+        ELSE
+          WRITE(U) BLK%DENSE
+        END IF
+      END DO
+    END DO
+
+    IF (WITH_IPIV) WRITE(U) A_BLR%IPIV
+    CLOSE(U)
+  END SUBROUTINE SAVE_BLR_MATRIX_OOC
+
+  ! Relit A_BLR ecrite par SAVE_BLR_MATRIX_OOC -- reconstruit BSTART/BEND/
+  ! NBLKR_LOC/NBLKC_LOC (BLOCK_PARTITION/BLOCK_NUMROC, comme une
+  ! assemblage neuve), REINITIALISE le stockage OOC (OOC_STORE_INIT/
+  ! OOC_CACHE_INIT/OOC_DIAG_CACHE_INIT -- meme sequence que MPI_ASSEMBLE_
+  ! BLR_MATRIX_OOC, sur un NOUVEAU fichier scratch dans SCRATCH_DIR), puis
+  ! reecrit chaque bloc lu via OOC_WRITE_BLOCK_FIXED -- exactement comme
+  ! s'il venait d'etre compresse pour la premiere fois (OFFSET=-1 par
+  ! defaut sur les descripteurs neufs, meme convention de reservation
+  ! pire-cas-dense qu'un bloc frais). Un seul bloc resident a la fois.
+  ! OK=.FALSE. (et TOUS les rangs s'arretent -- reduction MPI_ALLREDUCE,
+  ! voir le commentaire de tete) si le fichier est absent OU si son
+  ! en-tete ne correspond pas au run COURANT (N/NB/PR/PC/grille).
+  SUBROUTINE LOAD_BLR_MATRIX_OOC(PREFIX, WITH_IPIV, OK)
+    CHARACTER(LEN=*), INTENT(IN) :: PREFIX
+    LOGICAL, INTENT(IN) :: WITH_IPIV
+    LOGICAL, INTENT(OUT) :: OK
+    TYPE(BLR_BLOCK_T) :: BLK
+    INTEGER :: U, li2, lj2, I2, J2, ND, K2, MI, IOS, IERR2
+    INTEGER :: F_N, F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
+    INTEGER :: R_I, R_J, R_M, R_N, R_RANK
+    LOGICAL :: R_LOWRANK, OK_LOCAL
+    CHARACTER(LEN=16) :: RSTR
+    CHARACTER(LEN=160) :: FNAME
+    OK_LOCAL = .TRUE.
+    WRITE(RSTR,'(I6.6)') MYID0
+    FNAME = TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
+         STATUS='OLD', ACTION='READ', IOSTAT=IOS)
+    IF (IOS .NE. 0) THEN
+      WRITE(6,'(A,A,A,I0,A)') ' ERREUR : impossible d''ouvrir ', TRIM(FNAME), &
+           ' (rang ', MYID0, ') -- avez-vous sauvegarde avec SAVE_MATRIX/SAVE_FACTORED=1 auparavant ?'
+      OK_LOCAL = .FALSE.
+    ELSE
+      READ(U) F_N, F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
+      IF (F_N.NE.N .OR. F_NB.NE.NB .OR. F_PR.NE.PR .OR. F_PC.NE.PC .OR. &
+          F_MYROW.NE.GRID%MYROW .OR. F_MYCOL.NE.GRID%MYCOL .OR. F_MYID.NE.MYID0) THEN
+        WRITE(6,'(A,A,A,I0,A)') ' ERREUR : checkpoint ', TRIM(FNAME), &
+             ' incompatible avec le run courant (rang ', MYID0, &
+             ') -- N/NB/PR/PC ou grille different de la sauvegarde.'
+        OK_LOCAL = .FALSE.
+      END IF
+    END IF
+
+    CALL MPI_ALLREDUCE(OK_LOCAL, OK, 1, MPI_LOGICAL, MPI_LAND, GRID%COMM, IERR2)
+    IF (.NOT. OK) THEN
+      IF (OK_LOCAL) CLOSE(U)
+      RETURN
+    END IF
+
+    A_BLR%N = N; A_BLR%NB = NB
+    CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
+    A_BLR%NBLKR_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PR, GRID%MYROW)
+    A_BLR%NBLKC_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PC, GRID%MYCOL)
+    ALLOCATE(A_BLR%DIAGBLK(A_BLR%NBLK))
+    ALLOCATE(A_BLR%OFFBLK(MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1)))
+    CALL OOC_STORE_INIT(A_BLR%STORE_A, TRIM(SCRATCH_DIR), 'a', MYID0)
+    CALL OOC_CACHE_INIT(A_BLR%CACHE_A, MAX_MB_PER_PROCESS, A_BLR%NBLKR_LOC*A_BLR%NBLKC_LOC+4, &
+                         MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1))
+    CALL OOC_DIAG_CACHE_INIT(A_BLR%CACHE_D, MAX_MB_PER_PROCESS, A_BLR%NBLKR_LOC+2, A_BLR%NBLK)
+    A_BLR%MAX_MB_PER_PROCESS = MAX_MB_PER_PROCESS
+
+    READ(U) ND
+    DO K2 = 1, ND
+      READ(U) I2, MI
+      BLK%IS_LOWRANK = .FALSE.; BLK%M = MI; BLK%N = MI; BLK%RANK = MI
+      ALLOCATE(BLK%DENSE(MI,MI))
+      READ(U) BLK%DENSE
+      CALL OOC_WRITE_BLOCK_FIXED(A_BLR%STORE_A, A_BLR%DIAGBLK(I2), BLK)
+      DEALLOCATE(BLK%DENSE)
+    END DO
+
+    DO li2 = 1, A_BLR%NBLKR_LOC
+      I2 = (li2-1)*GRID%PR + GRID%MYROW + 1
+      DO lj2 = 1, A_BLR%NBLKC_LOC
+        J2 = (lj2-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I2 .EQ. J2) CYCLE
+        READ(U) R_I, R_J, R_LOWRANK, R_M, R_N, R_RANK
+        BLK%IS_LOWRANK = R_LOWRANK; BLK%M = R_M; BLK%N = R_N; BLK%RANK = R_RANK
+        IF (R_LOWRANK) THEN
+          ALLOCATE(BLK%UFAC(R_M,R_RANK), BLK%VFAC(R_RANK,R_N))
+          READ(U) BLK%UFAC
+          READ(U) BLK%VFAC
+        ELSE
+          ALLOCATE(BLK%DENSE(R_M,R_N))
+          READ(U) BLK%DENSE
+        END IF
+        CALL OOC_WRITE_BLOCK_FIXED(A_BLR%STORE_A, A_BLR%OFFBLK(li2,lj2), BLK)
+        IF (ALLOCATED(BLK%UFAC)) DEALLOCATE(BLK%UFAC)
+        IF (ALLOCATED(BLK%VFAC)) DEALLOCATE(BLK%VFAC)
+        IF (ALLOCATED(BLK%DENSE)) DEALLOCATE(BLK%DENSE)
+      END DO
+    END DO
+
+    IF (WITH_IPIV) THEN
+      ALLOCATE(A_BLR%IPIV(NB, A_BLR%NBLK))
+      READ(U) A_BLR%IPIV
+    END IF
+    CLOSE(U)
+  END SUBROUTINE LOAD_BLR_MATRIX_OOC
+
+  ! Ecrit RHS (SAVE_RHS) -- pas de cache a vidanger ici (RHS%STORE_B est
+  ! toujours ecrit directement des l'assemblage, voir blr_ooc_mod.f90),
+  ! chaque paquet est simplement RELU (OOC_READ_BLOCK_RAW) puis ecrit sur
+  ! le fichier de checkpoint, un paquet a la fois.
+  SUBROUTINE SAVE_RHS_OOC(PREFIX)
+    CHARACTER(LEN=*), INTENT(IN) :: PREFIX
+    TYPE(BLR_BLOCK_T) :: BLK
+    INTEGER :: U, B
+    CHARACTER(LEN=16) :: RSTR
+    WRITE(RSTR,'(I6.6)') MYID0
+    OPEN(NEWUNIT=U, FILE=TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat', &
+         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+    WRITE(U) N, NRHS, PR, PC, GRID%MYROW, GRID%MYCOL, MYID0, RHS%MLOC, RHS%NRHS_BATCH, RHS%NBATCHES
+    DO B = 1, RHS%NBATCHES
+      CALL OOC_READ_BLOCK_RAW(RHS%STORE_B, RHS%BATCH(B), BLK)
+      WRITE(U) BLK%M, BLK%N
+      WRITE(U) BLK%DENSE
+    END DO
+    CLOSE(U)
+  END SUBROUTINE SAVE_RHS_OOC
+
+  ! Relit RHS ecrit par SAVE_RHS_OOC -- reconstruit OOC_RHS_T a
+  ! l'identique : REINITIALISE STORE_B (OOC_STORE_INIT, nouveau fichier
+  ! scratch dans SCRATCH_DIR) puis reecrit chaque paquet lu via OOC_WRITE_
+  ! BLOCK_RAW, dans le MEME ordre (B=1..NBATCHES) -- la resolution
+  ! retrouve exactement la meme structure qu'un OOC_RHS_T fraichement
+  ! assemble. Meme logique OK/MPI_ALLREDUCE que LOAD_BLR_MATRIX_OOC.
+  SUBROUTINE LOAD_RHS_OOC(PREFIX, OK)
+    CHARACTER(LEN=*), INTENT(IN) :: PREFIX
+    LOGICAL, INTENT(OUT) :: OK
+    TYPE(BLR_BLOCK_T) :: BLK
+    INTEGER :: U, B, BM, BN, IOS, IERR2
+    INTEGER :: F_N, F_NRHS, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_MLOC, F_NRHS_BATCH, F_NBATCHES
+    LOGICAL :: OK_LOCAL
+    CHARACTER(LEN=16) :: RSTR
+    CHARACTER(LEN=160) :: FNAME
+    OK_LOCAL = .TRUE.
+    WRITE(RSTR,'(I6.6)') MYID0
+    FNAME = TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
+         STATUS='OLD', ACTION='READ', IOSTAT=IOS)
+    IF (IOS .NE. 0) THEN
+      WRITE(6,'(A,A,A,I0,A)') ' ERREUR : impossible d''ouvrir ', TRIM(FNAME), &
+           ' (rang ', MYID0, ') -- avez-vous sauvegarde avec SAVE_RHS=1 auparavant ?'
+      OK_LOCAL = .FALSE.
+    ELSE
+      READ(U) F_N, F_NRHS, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_MLOC, F_NRHS_BATCH, F_NBATCHES
+      IF (F_N.NE.N .OR. F_NRHS.NE.NRHS .OR. F_PR.NE.PR .OR. F_PC.NE.PC .OR. &
+          F_MYROW.NE.GRID%MYROW .OR. F_MYCOL.NE.GRID%MYCOL .OR. F_MYID.NE.MYID0) THEN
+        WRITE(6,'(A,A,A,I0,A)') ' ERREUR : checkpoint ', TRIM(FNAME), &
+             ' incompatible avec le run courant (rang ', MYID0, &
+             ') -- N/NRHS/PR/PC ou grille different de la sauvegarde.'
+        OK_LOCAL = .FALSE.
+      END IF
+    END IF
+
+    CALL MPI_ALLREDUCE(OK_LOCAL, OK, 1, MPI_LOGICAL, MPI_LAND, GRID%COMM, IERR2)
+    IF (.NOT. OK) THEN
+      IF (OK_LOCAL) CLOSE(U)
+      RETURN
+    END IF
+
+    RHS%NRHS = NRHS
+    RHS%NRHS_BATCH = F_NRHS_BATCH
+    RHS%NBATCHES = F_NBATCHES
+    RHS%MLOC = F_MLOC
+    CALL OOC_STORE_INIT(RHS%STORE_B, TRIM(SCRATCH_DIR), 'b', MYID0)
+    ALLOCATE(RHS%BATCH(RHS%NBATCHES))
+
+    DO B = 1, RHS%NBATCHES
+      READ(U) BM, BN
+      BLK%IS_LOWRANK = .FALSE.; BLK%M = BM; BLK%N = BN; BLK%RANK = MIN(BM,BN)
+      ALLOCATE(BLK%DENSE(BM,BN))
+      READ(U) BLK%DENSE
+      CALL OOC_WRITE_BLOCK_RAW(RHS%STORE_B, RHS%BATCH(B), BLK)
+      DEALLOCATE(BLK%DENSE)
+    END DO
+    CLOSE(U)
+  END SUBROUTINE LOAD_RHS_OOC
 
   ! Echantillon RSS/CPU pour l'etape STAGE_NAME (PROFILE_USAGE) -- voir
   ! example_blr_mpi_pivot.f90 pour le detail complet de la technique.
@@ -822,6 +1255,10 @@ CONTAINS
     COMPLEX(WP), INTENT(IN)  :: X_LOCAL(LDX,MAX(NRHS_LOC_B,1))
     COMPLEX(WP), ALLOCATABLE :: X_BATCH_GLOBAL(:,:)
     INTEGER :: WIDTH, li, I, PREVIEW_RS, PREVIEW_MI, PREVIEW_GI, LOCAL_COL
+    IF (SAVE_SOLUTION_FLAG) THEN
+      WRITE(SAVE_SOLUTION_UNIT) RHS%MLOC, NRHS_LOC_B
+      IF (RHS%MLOC.GT.0 .AND. NRHS_LOC_B.GT.0) WRITE(SAVE_SOLUTION_UNIT) X_LOCAL(1:RHS%MLOC,1:NRHS_LOC_B)
+    END IF
     IF (WANT_FULL_X) THEN
       WIDTH = BATCH_REND - BATCH_RSTART + 1
       ALLOCATE(X_BATCH_GLOBAL(N,WIDTH))
