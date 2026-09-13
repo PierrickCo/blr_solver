@@ -16,8 +16,21 @@
 ! test/test_mpi_blr_matrix_pivot.f90 pour la version qui verifie aussi la
 ! correction contre une reference independante).
 !
-! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE] [SAVE_MATRIX] [SAVE_RHS] [SAVE_FACTORED] [SAVE_SOLUTION] [LOAD_MATRIX] [LOAD_FACTORED] [LOAD_RHS] [CHECKPOINT_DIR]
-!         (defauts : N=4000 NB=200 NRHS=4 TOL=1e-4 USE_MOVE_ALLOC=0 EPS=0.0 RATIO=1/3 USE_RSVD=0 CHECK_ERROR=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0 SAVE_MATRIX=0 SAVE_RHS=0 SAVE_FACTORED=0 SAVE_SOLUTION=0 LOAD_MATRIX=0 LOAD_FACTORED=0 LOAD_RHS=0 CHECKPOINT_DIR=.)
+! Usage : mpirun -np <PR*PC> ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [OPTIONS...]
+!         (--help/-h affiche la liste complete) -- PR PC obligatoires ;
+!         N/NB/NRHS/TOL positionnels optionnels DANS CET ORDRE (defauts
+!         4000/200/4/1e-4) ; TOUTES les autres options (23 au total avant
+!         cette reecriture -- voir PRINT_USAGE ci-dessous pour la liste)
+!         sont NOMMEES, --cle=valeur ou --cle seul (= --cle=1) pour les
+!         booleennes, DANS N'IMPORTE QUEL ORDRE apres les positionnels :
+!         --use-move-alloc --eps --ratio --use-rsvd --check-error
+!         --check-residual --profile-usage --dump-structure --save-matrix
+!         --save-rhs --save-factored --save-solution --load-matrix
+!         --load-factored --load-rhs --checkpoint-dir --nrhs-batch (N/NB/
+!         NRHS/TOL sont aussi disponibles en --n/--nb/--nrhs/--tol, pour
+!         n'en changer qu'un sans repeter les positionnels precedents).
+!         Exemple : mpirun -np 4 ./example_blr_mpi_pivot 2 2 4000 200 8 1e-4 \
+!                   --check-error --save-factored --checkpoint-dir=ckpt
 !         USE_MOVE_ALLOC=1 : SCHUR_UPDATE_BLR_BLOCK transfere la propriete
 !         des tableaux via MOVE_ALLOC au lieu de "ABLK=NEWBLK" (qui
 !         declenche une reallocation+copie implicite supplementaire) --
@@ -159,6 +172,39 @@
 ! Une INCOMPATIBILITE sur UN SEUL rang arrete TOUS les rangs (reduction
 ! MPI_ALLREDUCE interne) -- jamais un sous-ensemble de rangs qui continue
 ! pendant que les autres se sont deja arretes (source de blocage MPI).
+!
+! NRHS_BATCH (defaut 0 = pas de decoupage, un seul "lot" = NRHS entier,
+! comportement IDENTIQUE a avant l'ajout de ce parametre) : borne le
+! nombre de colonnes GLOBALES de second membre traitees a la fois --
+! assemblage (FILL_B/LOAD_RHS), resolution ET sauvegarde (SAVE_RHS/
+! SAVE_SOLUTION) se font PAR LOT, jamais plus d'un lot de large NRHS_BATCH
+! resident en RAM simultanement (au lieu de NRHS entier) -- utile pour un
+! cas massivement second membre (NRHS tres grand) ou B/X entiers ne
+! tiendraient pas en RAM. Reutilise directement MPI_BLR_MATRIX_LU_SOLVE_
+! PIVOT_2D (deja generique sur la LARGEUR resolue, voir sa signature :
+! NRHS/NRHS_LOC sont ceux DU LOT, pas de NRHS global) -- aucune
+! modification necessaire a la bibliotheque, seul l'enchainement de cet
+! exemple change. Chaque lot est independant (resolution BLR = colonnes
+! de B non couplees entre elles), donc le resultat numerique est
+! MATHEMATIQUEMENT identique, decoupe ou non -- EN PRATIQUE, sur CETTE
+! matrice de demonstration (chaotique, mal conditionnee, voir le
+! commentaire de tete), de LEGERS ecarts (simple precision, derniers
+! chiffres significatifs) sont attendus entre deux decoupages differents :
+! CGEMM/les appels BLAS internes ne sont pas garantis bit-a-bit
+! identiques selon la LARGEUR de l'appel (WIDTH_B du lot), un mauvais
+! conditionnement amplifiant ces ecarts d'arrondi jusqu'a etre visibles
+! sur l'erreur/le residu affiches -- meme phenomene deja documente pour
+! NRHS_BATCH dans example_blr_mpi_pivot_ooc.f90, PAS un signe d'erreur.
+! LOAD_RHS ignore NRHS_BATCH et
+! relit le decoupage utilise A LA SAUVEGARDE (stocke dans l'en-tete du
+! fichier) -- meme principe que LOAD_MATRIX/LOAD_FACTORED qui ignorent
+! les parametres de reconstruction au profit de l'etat sauvegarde.
+! LIMITE ASSUMEE : CHECK_ERROR/CHECK_RESIDUAL continuent de rassembler
+! X_GLOBAL(N,NRHS) EN ENTIER (cout O(N*NRHS) inchange, memes qu'avant
+! NRHS_BATCH) -- outils de VERIFICATION/demonstration, pas le coeur de
+! l'algorithme (assemblage/resolution/sauvegarde, ceux-la restent bornes
+! par NRHS_BATCH) ; a eviter conjointement avec un NRHS massif, comme
+! deja documente pour la variante out-of-core.
 !===============================================================================
 PROGRAM EXAMPLE_BLR_MPI_PIVOT
   USE MPI_BLR_MATRIX_MOD
@@ -170,15 +216,25 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   TYPE(GRID_T) :: GRID
   INTEGER :: PR, PC, N, NB, NRHS, IERR, MYID0
   REAL(WP) :: TOL, EPS, RATIO
-  CHARACTER(LEN=32) :: ARG
+  CHARACTER(LEN=256) :: ARG
+  CHARACTER(LEN=64)  :: KEYSTR
+  CHARACTER(LEN=256) :: VALSTR
+  INTEGER :: IARG, POS_IDX
   TYPE(MPI_BLR_MATRIX_T) :: A_BLR
   COMPLEX(WP), ALLOCATABLE :: B_LOCAL(:,:), X_GLOBAL(:,:)
-  INTEGER :: MLOC, NRHS_LOC, RSTART_MINE, INFO, N_SWAPS
+  INTEGER :: MLOC, INFO, N_SWAPS
   INTEGER :: N_COMPRESSED, N_OFFDIAG, li, I
+  LOGICAL :: WANT_FULL_X
   ! Apercu de X(1:5,1) sans assembler X_GLOBAL en entier -- voir son
   ! utilisation plus bas (CHECK_ERROR=0 et CHECK_RESIDUAL=0).
   INTEGER :: NPREVIEW, PREVIEW_RS, PREVIEW_MI, PREVIEW_GI
   COMPLEX(WP) :: PREVIEW_LOCAL(5), PREVIEW_GLOBAL(5)
+
+  ! Second membre/resolution/sauvegarde PAR LOT (NRHS_BATCH, voir le
+  ! commentaire de tete) -- bornent la RAM a un lot au lieu de NRHS entier.
+  INTEGER :: NRHS_BATCH, NRHS_BATCH_EFF, NBATCHES, BATCH_IDX
+  INTEGER :: RSTART_B, REND_B, WIDTH_B, LOCAL_OFFSET_B, GSTART_B, GEND_B, NRHS_LOC_B
+  INTEGER :: SAVE_RHS_UNIT, SAVE_SOLUTION_UNIT, LOAD_RHS_UNIT
   INTEGER(8) :: RANK_SUM
   DOUBLE PRECISION :: T_ASM, T_FACTOR, T_SOLVE, T0, T1
   INTEGER :: USE_MOVE_ALLOC_INT, USE_RSVD_INT, CHECK_ERROR_INT, CHECK_RESIDUAL_INT, PROFILE_USAGE_INT, DUMP_STRUCTURE_INT
@@ -211,81 +267,104 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   DUMP_STRUCTURE_INT = 0
   SAVE_MATRIX_INT = 0; SAVE_RHS_INT = 0; SAVE_FACTORED_INT = 0; SAVE_SOLUTION_INT = 0
   LOAD_MATRIX_INT = 0; LOAD_FACTORED_INT = 0; LOAD_RHS_INT = 0; CHECKPOINT_DIR = '.'
+  NRHS_BATCH = 0
   PROF_N = 0
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
 
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 1) THEN
+    CALL GET_COMMAND_ARGUMENT(1, ARG)
+    IF (TRIM(ARG).EQ.'--help' .OR. TRIM(ARG).EQ.'-h') THEN
+      IF (MYID0.EQ.0) CALL PRINT_USAGE()
+      CALL MPI_FINALIZE(IERR)
+      STOP 0
+    END IF
+  END IF
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
-    IF (MYID0.EQ.0) WRITE(6,*) &
-         'Usage: mpirun -np PR*PC ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] '// &
-         '[USE_MOVE_ALLOC] [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE] '// &
-         '[SAVE_MATRIX] [SAVE_RHS] [SAVE_FACTORED] [SAVE_SOLUTION] [LOAD_MATRIX] [LOAD_FACTORED] [LOAD_RHS] [CHECKPOINT_DIR]'
+    IF (MYID0.EQ.0) CALL PRINT_USAGE()
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
   CALL GET_COMMAND_ARGUMENT(1, ARG); READ(ARG,*) PR
   CALL GET_COMMAND_ARGUMENT(2, ARG); READ(ARG,*) PC
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 3) THEN
-    CALL GET_COMMAND_ARGUMENT(3, ARG); READ(ARG,*) N
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 4) THEN
-    CALL GET_COMMAND_ARGUMENT(4, ARG); READ(ARG,*) NB
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 5) THEN
-    CALL GET_COMMAND_ARGUMENT(5, ARG); READ(ARG,*) NRHS
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 6) THEN
-    CALL GET_COMMAND_ARGUMENT(6, ARG); READ(ARG,*) TOL
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 7) THEN
-    CALL GET_COMMAND_ARGUMENT(7, ARG); READ(ARG,*) USE_MOVE_ALLOC_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 8) THEN
-    CALL GET_COMMAND_ARGUMENT(8, ARG); READ(ARG,*) EPS
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 9) THEN
-    CALL GET_COMMAND_ARGUMENT(9, ARG); READ(ARG,*) RATIO
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 10) THEN
-    CALL GET_COMMAND_ARGUMENT(10, ARG); READ(ARG,*) USE_RSVD_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 11) THEN
-    CALL GET_COMMAND_ARGUMENT(11, ARG); READ(ARG,*) CHECK_ERROR_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 12) THEN
-    CALL GET_COMMAND_ARGUMENT(12, ARG); READ(ARG,*) CHECK_RESIDUAL_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 13) THEN
-    CALL GET_COMMAND_ARGUMENT(13, ARG); READ(ARG,*) PROFILE_USAGE_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 14) THEN
-    CALL GET_COMMAND_ARGUMENT(14, ARG); READ(ARG,*) DUMP_STRUCTURE_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 15) THEN
-    CALL GET_COMMAND_ARGUMENT(15, ARG); READ(ARG,*) SAVE_MATRIX_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 16) THEN
-    CALL GET_COMMAND_ARGUMENT(16, ARG); READ(ARG,*) SAVE_RHS_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 17) THEN
-    CALL GET_COMMAND_ARGUMENT(17, ARG); READ(ARG,*) SAVE_FACTORED_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 18) THEN
-    CALL GET_COMMAND_ARGUMENT(18, ARG); READ(ARG,*) SAVE_SOLUTION_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 19) THEN
-    CALL GET_COMMAND_ARGUMENT(19, ARG); READ(ARG,*) LOAD_MATRIX_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 20) THEN
-    CALL GET_COMMAND_ARGUMENT(20, ARG); READ(ARG,*) LOAD_FACTORED_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 21) THEN
-    CALL GET_COMMAND_ARGUMENT(21, ARG); READ(ARG,*) LOAD_RHS_INT
-  END IF
-  IF (COMMAND_ARGUMENT_COUNT() .GE. 22) THEN
-    CALL GET_COMMAND_ARGUMENT(22, CHECKPOINT_DIR)
-  END IF
+
+  ! --- positionnels OPTIONNELS N, NB, NRHS, TOL, dans CET ORDRE FIXE
+  !     (comme avant -- compatible avec examples/run_example_blr_mpi_
+  !     pivot.f90 qui ne passe jamais que PR PC N NB NRHS TOL) : s'arretent
+  !     au premier argument commencant par "--" (bascule vers les options
+  !     nommees ci-dessous) ou a la fin de la ligne de commande.
+  POS_IDX = 0
+  IARG = 3
+  DO WHILE (IARG .LE. COMMAND_ARGUMENT_COUNT())
+    CALL GET_COMMAND_ARGUMENT(IARG, ARG)
+    IF (ARG(1:2) .EQ. '--') EXIT
+    POS_IDX = POS_IDX + 1
+    SELECT CASE (POS_IDX)
+    CASE (1); READ(ARG,*) N
+    CASE (2); READ(ARG,*) NB
+    CASE (3); READ(ARG,*) NRHS
+    CASE (4); READ(ARG,*) TOL
+    CASE DEFAULT
+      IF (MYID0.EQ.0) WRITE(6,'(A)') &
+           ' ERREUR : trop d''arguments positionnels -- apres PR PC N NB NRHS TOL, '// &
+           'toute option supplementaire doit utiliser --cle=valeur (voir --help).'
+      CALL MPI_FINALIZE(IERR)
+      STOP 1
+    END SELECT
+    IARG = IARG + 1
+  END DO
+
+  ! --- options NOMMEES --cle=valeur (ou --cle seul, equivalent a --cle=1
+  !     pour les options booleennes), dans N'IMPORTE QUEL ORDRE -- voir
+  !     PRINT_USAGE/--help pour la liste complete. Une option nommee
+  !     l'emporte sur la meme valeur donnee positionnellement (N/NB/NRHS/
+  !     TOL sont aussi disponibles ici, ex. "--nrhs=8" pour ne changer que
+  !     NRHS sans repeter N/NB positionnellement).
+  DO WHILE (IARG .LE. COMMAND_ARGUMENT_COUNT())
+    CALL GET_COMMAND_ARGUMENT(IARG, ARG)
+    IF (TRIM(ARG).EQ.'--help' .OR. TRIM(ARG).EQ.'-h') THEN
+      IF (MYID0.EQ.0) CALL PRINT_USAGE()
+      CALL MPI_FINALIZE(IERR)
+      STOP 0
+    END IF
+    IF (ARG(1:2) .NE. '--') THEN
+      IF (MYID0.EQ.0) WRITE(6,'(A,A,A)') ' ERREUR : argument inattendu "', TRIM(ARG), &
+           '" -- les options apres TOL doivent commencer par -- (voir --help).'
+      CALL MPI_FINALIZE(IERR)
+      STOP 1
+    END IF
+    CALL SPLIT_KV(ARG, KEYSTR, VALSTR)
+    SELECT CASE (TRIM(KEYSTR))
+    CASE ('n');               READ(VALSTR,*) N
+    CASE ('nb');              READ(VALSTR,*) NB
+    CASE ('nrhs');            READ(VALSTR,*) NRHS
+    CASE ('tol');             READ(VALSTR,*) TOL
+    CASE ('use-move-alloc');  READ(VALSTR,*) USE_MOVE_ALLOC_INT
+    CASE ('eps');             READ(VALSTR,*) EPS
+    CASE ('ratio');           READ(VALSTR,*) RATIO
+    CASE ('use-rsvd');        READ(VALSTR,*) USE_RSVD_INT
+    CASE ('check-error');     READ(VALSTR,*) CHECK_ERROR_INT
+    CASE ('check-residual');  READ(VALSTR,*) CHECK_RESIDUAL_INT
+    CASE ('profile-usage');   READ(VALSTR,*) PROFILE_USAGE_INT
+    CASE ('dump-structure');  READ(VALSTR,*) DUMP_STRUCTURE_INT
+    CASE ('save-matrix');     READ(VALSTR,*) SAVE_MATRIX_INT
+    CASE ('save-rhs');        READ(VALSTR,*) SAVE_RHS_INT
+    CASE ('save-factored');   READ(VALSTR,*) SAVE_FACTORED_INT
+    CASE ('save-solution');   READ(VALSTR,*) SAVE_SOLUTION_INT
+    CASE ('load-matrix');     READ(VALSTR,*) LOAD_MATRIX_INT
+    CASE ('load-factored');   READ(VALSTR,*) LOAD_FACTORED_INT
+    CASE ('load-rhs');        READ(VALSTR,*) LOAD_RHS_INT
+    CASE ('checkpoint-dir');  CHECKPOINT_DIR = VALSTR
+    CASE ('nrhs-batch');      READ(VALSTR,*) NRHS_BATCH
+    CASE DEFAULT
+      IF (MYID0.EQ.0) WRITE(6,'(A,A,A)') ' ERREUR : option inconnue "--', TRIM(KEYSTR), '" (voir --help).'
+      CALL MPI_FINALIZE(IERR)
+      STOP 1
+    END SELECT
+    IARG = IARG + 1
+  END DO
+
   USE_MOVE_ALLOC_FLAG = (USE_MOVE_ALLOC_INT .NE. 0)
   USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
   CHECK_ERROR_FLAG = (CHECK_ERROR_INT .NE. 0)
@@ -343,6 +422,8 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
     IF (LOAD_RHS_FLAG) WRITE(6,'(A)') ' Reprise : second membre relu depuis disque (LOAD_RHS=1)'
     IF (SAVE_MATRIX_FLAG .OR. SAVE_RHS_FLAG .OR. SAVE_FACTORED_FLAG .OR. SAVE_SOLUTION_FLAG) &
          WRITE(6,'(A,A)') ' Sauvegarde(s) activee(s) dans : ', TRIM(CHECKPOINT_DIR)
+    IF (NRHS_BATCH.GT.0 .AND. NRHS_BATCH.LT.NRHS .AND. .NOT.LOAD_RHS_FLAG) &
+         WRITE(6,'(A,I0,A)') ' Second membre/resolution/sauvegarde par lots de ', NRHS_BATCH, ' colonnes (NRHS_BATCH)'
   END IF
 
   ! RSS DE REFERENCE : capturee AVANT toute allocation de donnees (A_BLR,
@@ -416,7 +497,13 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
         ! ci-dessus pour juger l'AMPLEUR reelle du gain memoire.
         WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (assemblage) : ', REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
       END IF
-      IF (SAVE_MATRIX_FLAG) CALL SAVE_BLR_MATRIX(TRIM(CHECKPOINT_DIR)//'/saved_matrix', .FALSE.)
+      IF (SAVE_MATRIX_FLAG) THEN
+        CALL SAVE_BLR_MATRIX(TRIM(CHECKPOINT_DIR)//'/saved_matrix', .FALSE., OK)
+        IF (.NOT. OK) THEN
+          CALL MPI_FINALIZE(IERR)
+          STOP 1
+        END IF
+      END IF
     END IF
     ! Empreinte THEORIQUE (blocs BLR_BLOCK_T reellement stockes), PAS
     ! mesuree via l'OS.
@@ -456,7 +543,13 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
            ' (', 100.0_WP*REAL(N_COMPRESSED,WP)/REAL(MAX(N_OFFDIAG,1),WP), ' %)'
       WRITE(6,'(A,F6.2,A)') ' Taux de compression REEL (fin factorisation) : ', REAL_COMPRESSION_PCT(N_COMPRESSED, N_OFFDIAG, RANK_SUM), ' %'
     END IF
-    IF (SAVE_FACTORED_FLAG) CALL SAVE_BLR_MATRIX(TRIM(CHECKPOINT_DIR)//'/saved_factored', .TRUE.)
+    IF (SAVE_FACTORED_FLAG) THEN
+      CALL SAVE_BLR_MATRIX(TRIM(CHECKPOINT_DIR)//'/saved_factored', .TRUE., OK)
+      IF (.NOT. OK) THEN
+        CALL MPI_FINALIZE(IERR)
+        STOP 1
+      END IF
+    END IF
   END IF
   ! A_BLR est factorisee EN PLACE -- cette valeur peut differer de celle
   ! de l'assemblage (fill-in de la mise a jour de Schur).
@@ -465,58 +558,147 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   CALL PROFILE_SAMPLE('factorisation')
   CALL DUMP_BLR_STRUCTURE('factorization')
 
-  ! --- 3) second membre B, distribue par blocs-lignes ET par colonnes sur
-  !     NRHS -- formule deterministe, sans communication ---
+  ! --- 3+4) second membre B, resolution 2D AVEC pivot ET sauvegarde,
+  !     PAR LOT d'au plus NRHS_BATCH colonnes GLOBALES (voir NRHS_BATCH
+  !     dans le commentaire de tete) -- jamais plus d'un lot resident en
+  !     RAM a la fois. NRHS_BATCH_EFF=NRHS (un seul lot, comportement
+  !     inchange) si NRHS_BATCH n'est pas positionne, LOAD_RHS=1, ou
+  !     NRHS_BATCH>=NRHS.
   MLOC = 0
   DO li = 1, A_BLR%NBLKR_LOC
     I = (li-1)*GRID%PR + GRID%MYROW + 1
     MLOC = MLOC + (A_BLR%BEND(I)-A_BLR%BSTART(I)+1)
   END DO
-  CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, GRID%MYCOL, RSTART_MINE, NRHS_LOC)
 
-  ALLOCATE(B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
   IF (LOAD_RHS_FLAG) THEN
-    CALL LOAD_RHS_VECTOR(TRIM(CHECKPOINT_DIR)//'/saved_rhs', OK)
+    ! LOAD_RHS ignore NRHS_BATCH : le decoupage utilise A LA SAUVEGARDE
+    ! (stocke dans l'en-tete) est celui qui fait foi, comme LOAD_MATRIX/
+    ! LOAD_FACTORED ignorent les parametres de reconstruction.
+    CALL OPEN_RHS_CHECKPOINT_READ(TRIM(CHECKPOINT_DIR)//'/saved_rhs', LOAD_RHS_UNIT, NBATCHES, NRHS_BATCH_EFF, OK)
     IF (.NOT. OK) THEN
       CALL MPI_FINALIZE(IERR)
       STOP 1
     END IF
   ELSE
-    RSS_MAX_B_MB = 0.0D0
-    CALL FILL_B(A_BLR, GRID, NRHS_LOC, RSTART_MINE, B_LOCAL, MLOC)
-    IF (CHECK_ERROR_FLAG .AND. MYID0.EQ.0) &
-         WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant B=A*Xexact = ', RSS_MAX_B_MB, ' Mo'
-    IF (SAVE_RHS_FLAG) CALL SAVE_RHS_VECTOR(TRIM(CHECKPOINT_DIR)//'/saved_rhs')
+    NRHS_BATCH_EFF = NRHS_BATCH
+    IF (NRHS_BATCH_EFF .LE. 0 .OR. NRHS_BATCH_EFF .GT. NRHS) NRHS_BATCH_EFF = NRHS
+    NBATCHES = (NRHS + NRHS_BATCH_EFF - 1) / NRHS_BATCH_EFF
+    IF (SAVE_RHS_FLAG) THEN
+      CALL OPEN_RHS_CHECKPOINT_WRITE(TRIM(CHECKPOINT_DIR)//'/saved_rhs', SAVE_RHS_UNIT, &
+                                      NBATCHES, NRHS_BATCH_EFF, MLOC, OK)
+      IF (.NOT. OK) THEN
+        CALL MPI_FINALIZE(IERR)
+        STOP 1
+      END IF
+    END IF
   END IF
-  CALL REPORT_MEMORY_MB(GRID, 'Second membre B', 8_8*INT(MLOC,8)*INT(NRHS_LOC,8))
-  CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres allocation B)', GET_RSS_KB()*1024_8)
-  CALL PROFILE_SAMPLE('second_membre')
+  IF (SAVE_SOLUTION_FLAG) THEN
+    CALL OPEN_RHS_CHECKPOINT_WRITE(TRIM(CHECKPOINT_DIR)//'/saved_solution', SAVE_SOLUTION_UNIT, &
+                                    NBATCHES, NRHS_BATCH_EFF, MLOC, OK)
+    IF (.NOT. OK) THEN
+      CALL MPI_FINALIZE(IERR)
+      STOP 1
+    END IF
+  END IF
 
-  ! --- 4) resolution 2D, AVEC pivot (applique la meme sequence de swaps
-  !     que celle utilisee a la factorisation, deja diffusee a la grille) --
-  ! SHOW_PROGRESS=.TRUE. : une seule barre pour les 2 sous-etapes
-  ! (substitution avant + arriere), pourcentage exact (meme raison que la
-  ! factorisation -- boucle globalement synchronisee).
-  CALL MPI_BARRIER(MPI_COMM_WORLD, IERR)
-  T0 = MPI_WTIME()
-  CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE., &
-                                         PROGRESS_CALLBACK=PROFILE_CALLBACK_SOLVE)
-  T1 = MPI_WTIME()
-  T_SOLVE = T1 - T0
+  WANT_FULL_X = (CHECK_ERROR_FLAG .OR. CHECK_RESIDUAL_FLAG)
+  ! X_GLOBAL(N,NRHS) n'est reellement necessaire que pour CHECK_ERROR/
+  ! CHECK_RESIDUAL (COMPUTE_ERR/COMPUTE_RESIDUAL comparent X a une
+  ! reference sur toute sa largeur) -- rempli lot par lot ci-dessous
+  ! (une tranche de colonnes contigue par lot, GATHER_2D_RHS directement
+  ! dans X_GLOBAL(:,RSTART_B:REND_B), aucun tampon intermediaire). SANS
+  ! verification demandee, l'assembler serait un cout memoire O(N*NRHS)
+  ! pur gaspillage -- voir la branche ELSE plus bas (apercu 5 valeurs).
+  IF (WANT_FULL_X) ALLOCATE(X_GLOBAL(N,NRHS))
+  NPREVIEW = MIN(5, N)
+  PREVIEW_LOCAL = (0.0_WP, 0.0_WP)
+
+  RSS_MAX_B_MB = 0.0D0
+  T_SOLVE = 0.0D0
+  DO BATCH_IDX = 1, NBATCHES
+    RSTART_B = (BATCH_IDX-1)*NRHS_BATCH_EFF + 1
+    REND_B = MIN(BATCH_IDX*NRHS_BATCH_EFF, NRHS)
+    WIDTH_B = REND_B - RSTART_B + 1
+    CALL RHS_LOCAL_RANGE_MBM(WIDTH_B, GRID%PC, GRID%MYCOL, LOCAL_OFFSET_B, NRHS_LOC_B)
+    GSTART_B = RSTART_B + LOCAL_OFFSET_B - 1
+    GEND_B = GSTART_B + NRHS_LOC_B - 1
+
+    ALLOCATE(B_LOCAL(MAX(MLOC,1),MAX(NRHS_LOC_B,1)))
+    IF (LOAD_RHS_FLAG) THEN
+      CALL LOAD_RHS_BATCH(LOAD_RHS_UNIT, NRHS_LOC_B, B_LOCAL, MLOC)
+    ELSE
+      CALL FILL_B(A_BLR, GRID, NRHS_LOC_B, GSTART_B, B_LOCAL, MLOC)
+      IF (SAVE_RHS_FLAG) CALL SAVE_RHS_BATCH(SAVE_RHS_UNIT, NRHS_LOC_B, B_LOCAL, MLOC)
+    END IF
+    IF (NBATCHES.EQ.1) THEN
+      CALL PROFILE_SAMPLE('second_membre')
+    ELSE
+      CALL PROFILE_SAMPLE(PCT_LABEL('second_membre', BATCH_IDX, NBATCHES))
+    END IF
+
+    ! Resolution 2D, AVEC pivot (applique la meme sequence de swaps que
+    ! celle utilisee a la factorisation, deja diffusee a la grille) --
+    ! MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D est deja generique sur la LARGEUR
+    ! resolue (WIDTH_B/NRHS_LOC_B DU LOT, pas NRHS global) : aucune
+    ! modification necessaire a la bibliotheque pour ce decoupage.
+    CALL MPI_BARRIER(MPI_COMM_WORLD, IERR)
+    T0 = MPI_WTIME()
+    CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, WIDTH_B, NRHS_LOC_B, B_LOCAL, MAX(MLOC,1), SHOW_PROGRESS=.TRUE., &
+                                           PROGRESS_CALLBACK=PROFILE_CALLBACK_SOLVE)
+    T1 = MPI_WTIME()
+    T_SOLVE = T_SOLVE + (T1 - T0)
+    ! B_LOCAL contient maintenant X DE CE LOT (ecrase EN PLACE) -- meme
+    ! routine de sauvegarde que le second membre, forme identique.
+    IF (SAVE_SOLUTION_FLAG) CALL SAVE_RHS_BATCH(SAVE_SOLUTION_UNIT, NRHS_LOC_B, B_LOCAL, MLOC)
+    IF (NBATCHES.EQ.1) THEN
+      CALL PROFILE_SAMPLE('resolution')
+    ELSE
+      CALL PROFILE_SAMPLE(PCT_LABEL('resolution', BATCH_IDX, NBATCHES))
+    END IF
+
+    IF (WANT_FULL_X) THEN
+      CALL GATHER_2D_RHS(GRID, N, NB, WIDTH_B, B_LOCAL, MAX(MLOC,1), NRHS_LOC_B, 0, X_GLOBAL(:,RSTART_B:REND_B))
+    ELSE IF (GSTART_B .LE. 1 .AND. 1 .LE. GEND_B) THEN
+      ! Ni CHECK_ERROR ni CHECK_RESIDUAL : X n'est jamais compare a une
+      ! reference, inutile de l'assembler en entier. On recupere quand
+      ! meme les 5 premieres valeurs de la colonne GLOBALE 1 (forcement
+      ! dans le PREMIER lot) pour l'affichage, sans GATHER_2D_RHS --
+      ! chaque rang contribue la valeur reelle s'il possede a la fois
+      ! cette ligne (son A_BLR%BSTART/BEND local) et la colonne RHS 1
+      ! (son propre GSTART_B/NRHS_LOC_B), zero sinon ; une somme reduite
+      ! sur 5 complexes suffit (cout independant de N).
+      PREVIEW_RS = 1
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        PREVIEW_MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+        DO PREVIEW_GI = 1, NPREVIEW
+          IF (PREVIEW_GI.GE.A_BLR%BSTART(I) .AND. PREVIEW_GI.LE.A_BLR%BEND(I)) THEN
+            PREVIEW_LOCAL(PREVIEW_GI) = B_LOCAL(PREVIEW_RS + (PREVIEW_GI-A_BLR%BSTART(I)), 1-GSTART_B+1)
+          END IF
+        END DO
+        PREVIEW_RS = PREVIEW_RS + PREVIEW_MI
+      END DO
+    END IF
+    DEALLOCATE(B_LOCAL)
+  END DO
+
+  IF (LOAD_RHS_FLAG) THEN
+    CLOSE(LOAD_RHS_UNIT)
+  ELSE IF (SAVE_RHS_FLAG) THEN
+    CLOSE(SAVE_RHS_UNIT)
+  END IF
+  IF (SAVE_SOLUTION_FLAG) CLOSE(SAVE_SOLUTION_UNIT)
+
   IF (MYID0.EQ.0) WRITE(6,'(A,F8.3,A)') ' Resolution : ', T_SOLVE, ' s'
-  CALL PROFILE_SAMPLE('resolution')
-  ! B_LOCAL contient maintenant X (ecrase EN PLACE par la resolution) --
-  ! meme routine de sauvegarde que le second membre, forme identique.
-  IF (SAVE_SOLUTION_FLAG) CALL SAVE_RHS_VECTOR(TRIM(CHECKPOINT_DIR)//'/saved_solution')
+  IF (CHECK_ERROR_FLAG .AND. MYID0.EQ.0) &
+       WRITE(6,'(A,F8.1,A)') ' [RSS trace] MAX observe pendant B=A*Xexact = ', RSS_MAX_B_MB, ' Mo'
+  ! Empreinte reelle d'UN LOT (pas NRHS entier -- c'est desormais le pic
+  ! de RAM reellement atteint, borne par NRHS_BATCH).
+  CALL REPORT_MEMORY_MB(GRID, 'Second membre B (par lot)', &
+       8_8*INT(MLOC,8)*INT(RHS_NUMROC_MBM(NRHS_BATCH_EFF,GRID%PC,GRID%MYCOL),8))
+  CALL REPORT_MEMORY_MB(GRID, 'RSS reelle (apres resolution)', GET_RSS_KB()*1024_8)
 
-  IF (CHECK_ERROR_FLAG .OR. CHECK_RESIDUAL_FLAG) THEN
-    ! X_GLOBAL(N,NRHS) n'est reellement necessaire qu'ici : COMPUTE_ERR
-    ! et COMPUTE_RESIDUAL comparent X a une reference sur toute sa
-    ! largeur. Sans verification demandee, l'assembler serait un cout
-    ! memoire O(N*NRHS) pur gaspillage -- voir la branche ELSE plus bas.
-    ALLOCATE(X_GLOBAL(N,NRHS))
-    CALL GATHER_2D_RHS(GRID, N, NB, NRHS, B_LOCAL, MAX(MLOC,1), NRHS_LOC, 0, X_GLOBAL)
-
+  IF (WANT_FULL_X) THEN
     IF (MYID0 .EQ. 0) THEN
       WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
       DO I = 1, MIN(5, N)
@@ -542,28 +724,6 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
       CALL PROFILE_SAMPLE('verif_residu')
     END IF
   ELSE
-    ! Ni CHECK_ERROR ni CHECK_RESIDUAL : X n'est jamais compare a une
-    ! reference, inutile de l'assembler en entier. On recupere quand meme
-    ! les 5 premieres valeurs de la colonne 1 pour l'affichage, sans
-    ! GATHER_2D_RHS -- chaque rang contribue la valeur reelle s'il
-    ! possede a la fois cette ligne (son A_BLR%BSTART/BEND local) et la
-    ! colonne RHS 1 (son propre RSTART_MINE/NRHS_LOC), zero sinon ; une
-    ! somme reduite sur 5 complexes suffit (cout independant de N).
-    NPREVIEW = MIN(5, N)
-    PREVIEW_LOCAL = (0.0_WP, 0.0_WP)
-    IF (RSTART_MINE .LE. 1 .AND. 1 .LE. RSTART_MINE+NRHS_LOC-1) THEN
-      PREVIEW_RS = 1
-      DO li = 1, A_BLR%NBLKR_LOC
-        I = (li-1)*GRID%PR + GRID%MYROW + 1
-        PREVIEW_MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
-        DO PREVIEW_GI = 1, NPREVIEW
-          IF (PREVIEW_GI.GE.A_BLR%BSTART(I) .AND. PREVIEW_GI.LE.A_BLR%BEND(I)) THEN
-            PREVIEW_LOCAL(PREVIEW_GI) = B_LOCAL(PREVIEW_RS + (PREVIEW_GI-A_BLR%BSTART(I)), 1)
-          END IF
-        END DO
-        PREVIEW_RS = PREVIEW_RS + PREVIEW_MI
-      END DO
-    END IF
     CALL MPI_REDUCE(PREVIEW_LOCAL, PREVIEW_GLOBAL, NPREVIEW, MPI_COMPLEX, MPI_SUM, 0, GRID%COMM, IERR)
     IF (MYID0 .EQ. 0) THEN
       WRITE(6,'(A)') ' Resolution terminee. Premieres valeurs de X(:,1) :'
@@ -577,11 +737,68 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   CALL PROFILE_SAMPLE('fin')
   CALL PROFILE_WRITE_CSV()
 
-  DEALLOCATE(B_LOCAL)
   IF (ALLOCATED(X_GLOBAL)) DEALLOCATE(X_GLOBAL)
   CALL MPI_FINALIZE(IERR)
 
 CONTAINS
+
+  ! Coupe un argument "--cle=valeur" en KEYOUT="cle"/VALOUT="valeur" (les 2
+  ! premiers caracteres "--" sont toujours ignores -- verifie par
+  ! l'appelant avant d'appeler cette routine). Sans "=" (option booleenne
+  ! nue, ex. "--check-error"), VALOUT="1" -- equivalent a "--check-error=1",
+  ! pratique pour les options 0/1 les plus frequentes.
+  SUBROUTINE SPLIT_KV(ARGSTR, KEYOUT, VALOUT)
+    CHARACTER(LEN=*), INTENT(IN)  :: ARGSTR
+    CHARACTER(LEN=*), INTENT(OUT) :: KEYOUT, VALOUT
+    INTEGER :: EQPOS
+    EQPOS = INDEX(ARGSTR, '=')
+    IF (EQPOS .EQ. 0) THEN
+      KEYOUT = ARGSTR(3:)
+      VALOUT = '1'
+    ELSE
+      KEYOUT = ARGSTR(3:EQPOS-1)
+      VALOUT = ARGSTR(EQPOS+1:)
+    END IF
+  END SUBROUTINE SPLIT_KV
+
+  ! Message d'aide -- affiche sur --help/-h, ligne de commande invalide
+  ! (moins de 2 arguments), ou option/argument non reconnu (voir les sites
+  ! d'appel du parsing CLI plus haut).
+  SUBROUTINE PRINT_USAGE()
+    WRITE(6,'(A)') 'Usage : mpirun -np PR*PC ./example_blr_mpi_pivot PR PC [N] [NB] [NRHS] [TOL] [OPTIONS...]'
+    WRITE(6,'(A)') ''
+    WRITE(6,'(A)') '  PR PC          grille de processus MPI (obligatoire, PR*PC = nb de processus lances)'
+    WRITE(6,'(A)') '  N NB NRHS TOL  positionnels optionnels, DANS CET ORDRE (defauts 4000 200 4 1e-4)'
+    WRITE(6,'(A)') ''
+    WRITE(6,'(A)') 'Options nommees (apres les positionnels ci-dessus, dans N''IMPORTE QUEL ORDRE ;'
+    WRITE(6,'(A)') '--cle=valeur, ou --cle seul pour une option booleenne, equivalent a --cle=1) :'
+    WRITE(6,'(A)') '  --n=ENTIER              equivalent au positionnel N (utile pour ne changer que NRHS/TOL...)'
+    WRITE(6,'(A)') '  --nb=ENTIER             equivalent au positionnel NB'
+    WRITE(6,'(A)') '  --nrhs=ENTIER           equivalent au positionnel NRHS'
+    WRITE(6,'(A)') '  --tol=REEL              equivalent au positionnel TOL'
+    WRITE(6,'(A)') '  --use-move-alloc=0|1    (defaut 0) transfert MOVE_ALLOC au lieu de copie (Schur)'
+    WRITE(6,'(A)') '  --eps=REEL              (defaut 0.0) bruit plein-rang (compressibilite)'
+    WRITE(6,'(A)') '  --ratio=REEL            (defaut 0.333) COMPRESS_WORTHWHILE_RATIO'
+    WRITE(6,'(A)') '  --use-rsvd=0|1          (defaut 0) SVD randomisee adaptative au lieu de CGESVD'
+    WRITE(6,'(A)') '  --check-error=0|1       (defaut 0) verification B=A*Xexact'
+    WRITE(6,'(A)') '  --check-residual=0|1    (defaut 0) verification ||A*X-B||/||B||'
+    WRITE(6,'(A)') '  --profile-usage=0|1     (defaut 0) trace RSS/CPU par etape (usage_profile_rank<N>.csv)'
+    WRITE(6,'(A)') '  --dump-structure=0|1    (defaut 0) export structure BLR (blr_structure_<etape>_rank<N>.csv)'
+    WRITE(6,'(A)') '  --save-matrix=0|1       (defaut 0) sauvegarde la matrice assemblee'
+    WRITE(6,'(A)') '  --save-rhs=0|1          (defaut 0) sauvegarde le second membre'
+    WRITE(6,'(A)') '  --save-factored=0|1     (defaut 0) sauvegarde la matrice factorisee'
+    WRITE(6,'(A)') '  --save-solution=0|1     (defaut 0) sauvegarde la solution'
+    WRITE(6,'(A)') '  --load-matrix=0|1       (defaut 0) relit la matrice sauvegardee (saute l''assemblage)'
+    WRITE(6,'(A)') '  --load-factored=0|1     (defaut 0) relit la matrice factorisee (saute assemblage+factorisation,'
+    WRITE(6,'(A)') '                          prioritaire sur --load-matrix)'
+    WRITE(6,'(A)') '  --load-rhs=0|1          (defaut 0) relit le second membre sauvegarde'
+    WRITE(6,'(A)') '  --checkpoint-dir=CHEMIN (defaut .) repertoire des fichiers de checkpoint (doit deja exister)'
+    WRITE(6,'(A)') '  --nrhs-batch=ENTIER     (defaut 0 = pas de decoupage) colonnes RHS traitees par lot'
+    WRITE(6,'(A)') ''
+    WRITE(6,'(A)') 'Exemple :'
+    WRITE(6,'(A)') '  mpirun -np 4 ./example_blr_mpi_pivot 2 2 4000 200 8 1e-4 \'
+    WRITE(6,'(A)') '      --check-error --save-factored --checkpoint-dir=ckpt'
+  END SUBROUTINE PRINT_USAGE
 
   ! Recalcule N_COMPRESSED/N_OFFDIAG/RANK_SUM depuis l'etat COURANT de
   ! A_BLR%OFFBLK (meme calcul que celui fait EN INTERNE par MPI_ASSEMBLE_
@@ -623,14 +840,33 @@ CONTAINS
   ! toujours "possedes" par construction du decoupage 2D block-cyclique,
   ! pas besoin de tester une allocation. WITH_IPIV n'ecrit A_BLR%IPIV que
   ! si elle est reellement allouee (apres factorisation seulement).
-  SUBROUTINE SAVE_BLR_MATRIX(PREFIX, WITH_IPIV)
+  SUBROUTINE SAVE_BLR_MATRIX(PREFIX, WITH_IPIV, OK)
     CHARACTER(LEN=*), INTENT(IN) :: PREFIX
     LOGICAL, INTENT(IN) :: WITH_IPIV
-    INTEGER :: U, li2, lj2, I2, J2, ND, MI
+    LOGICAL, INTENT(OUT) :: OK
+    INTEGER :: U, li2, lj2, I2, J2, ND, MI, IOS, IERR2
+    LOGICAL :: OK_LOCAL
     CHARACTER(LEN=16) :: RSTR
+    CHARACTER(LEN=160) :: FNAME
     WRITE(RSTR,'(I6.6)') MYID0
-    OPEN(NEWUNIT=U, FILE=TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat', &
-         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+    FNAME = TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
+         STATUS='REPLACE', ACTION='WRITE', IOSTAT=IOS)
+    OK_LOCAL = (IOS .EQ. 0)
+    IF (.NOT. OK_LOCAL) THEN
+      WRITE(6,'(A,A,A,I0,A)') ' ERREUR : impossible de creer ', TRIM(FNAME), &
+           ' (rang ', MYID0, ') -- le repertoire CHECKPOINT_DIR doit deja exister.'
+    END IF
+    ! Comme LOAD_BLR_MATRIX : un SEUL rang qui ne peut pas ecrire (dossier
+    ! manquant, permissions...) doit arreter TOUS les rangs -- sinon les
+    ! autres continueraient seuls vers la suite (factorisation/resolution,
+    ! appels MPI collectifs) que ce rang n'atteindra jamais.
+    CALL MPI_ALLREDUCE(OK_LOCAL, OK, 1, MPI_LOGICAL, MPI_LAND, GRID%COMM, IERR2)
+    IF (.NOT. OK) THEN
+      IF (OK_LOCAL) CLOSE(U, STATUS='DELETE')
+      RETURN
+    END IF
+
     WRITE(U) N, NB, A_BLR%NBLK, PR, PC, GRID%MYROW, GRID%MYCOL, MYID0, &
          A_BLR%NBLKR_LOC, A_BLR%NBLKC_LOC
 
@@ -763,49 +999,82 @@ CONTAINS
     CLOSE(U)
   END SUBROUTINE LOAD_BLR_MATRIX
 
-  ! Ecrit B_LOCAL (SAVE_RHS avant resolution, ou SAVE_SOLUTION apres --
-  ! meme forme dans les deux cas, B_LOCAL devenant X en place). En-tete
-  ! (N, NRHS, grille, MLOC/NRHS_LOC/RSTART_MINE) verifie par LOAD_RHS_
-  ! VECTOR pour la meme raison que LOAD_BLR_MATRIX.
-  SUBROUTINE SAVE_RHS_VECTOR(PREFIX)
+  ! Ouvre un fichier de checkpoint RHS/solution EN ECRITURE et ecrit son
+  ! en-tete UNE SEULE FOIS (N, NRHS, grille, MLOC, NRHS_BATCH_HDR,
+  ! NBATCHES_HDR) -- reste ouvert pendant TOUTE la boucle de lots
+  ! (SAVE_RHS_BATCH y ecrit ensuite un enregistrement par lot), ferme par
+  ! l'appelant une fois tous les lots traites. NRHS_BATCH_HDR/NBATCHES_HDR
+  ! permettent a LOAD_RHS (OPEN_RHS_CHECKPOINT_READ) de reproduire
+  ! EXACTEMENT le meme decoupage, sans dependre du NRHS_BATCH du run qui
+  ! relit.
+  SUBROUTINE OPEN_RHS_CHECKPOINT_WRITE(PREFIX, UNIT, NBATCHES_HDR, NRHS_BATCH_HDR, MLOC_HDR, OK)
     CHARACTER(LEN=*), INTENT(IN) :: PREFIX
-    INTEGER :: U
-    CHARACTER(LEN=16) :: RSTR
-    WRITE(RSTR,'(I6.6)') MYID0
-    OPEN(NEWUNIT=U, FILE=TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat', &
-         ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
-    WRITE(U) N, NRHS, PR, PC, GRID%MYROW, GRID%MYCOL, MYID0, MLOC, NRHS_LOC, RSTART_MINE
-    IF (MLOC.GT.0 .AND. NRHS_LOC.GT.0) WRITE(U) B_LOCAL(1:MLOC,1:NRHS_LOC)
-    CLOSE(U)
-  END SUBROUTINE SAVE_RHS_VECTOR
-
-  ! Relit B_LOCAL ecrit par SAVE_RHS_VECTOR (utilise pour LOAD_RHS) --
-  ! MLOC/NRHS_LOC/RSTART_MINE doivent deja avoir ete calcules (via
-  ! A_BLR/GRID, avant cet appel, comme pour FILL_B) puisqu'ils
-  ! determinent la forme de B_LOCAL deja alloue par l'appelant. Meme
-  ! logique OK/MPI_ALLREDUCE que LOAD_BLR_MATRIX.
-  SUBROUTINE LOAD_RHS_VECTOR(PREFIX, OK)
-    CHARACTER(LEN=*), INTENT(IN) :: PREFIX
+    INTEGER, INTENT(OUT) :: UNIT
+    INTEGER, INTENT(IN) :: NBATCHES_HDR, NRHS_BATCH_HDR, MLOC_HDR
     LOGICAL, INTENT(OUT) :: OK
-    INTEGER :: U, IOS, IERR2
-    INTEGER :: F_N, F_NRHS, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_MLOC, F_NRHS_LOC, F_RSTART
+    INTEGER :: IOS, IERR2
+    LOGICAL :: OK_LOCAL
+    CHARACTER(LEN=16) :: RSTR
+    CHARACTER(LEN=160) :: FNAME
+    WRITE(RSTR,'(I6.6)') MYID0
+    FNAME = TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat'
+    OPEN(NEWUNIT=UNIT, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
+         STATUS='REPLACE', ACTION='WRITE', IOSTAT=IOS)
+    OK_LOCAL = (IOS .EQ. 0)
+    IF (.NOT. OK_LOCAL) THEN
+      WRITE(6,'(A,A,A,I0,A)') ' ERREUR : impossible de creer ', TRIM(FNAME), &
+           ' (rang ', MYID0, ') -- le repertoire CHECKPOINT_DIR doit deja exister.'
+    END IF
+    CALL MPI_ALLREDUCE(OK_LOCAL, OK, 1, MPI_LOGICAL, MPI_LAND, GRID%COMM, IERR2)
+    IF (.NOT. OK) THEN
+      IF (OK_LOCAL) CLOSE(UNIT, STATUS='DELETE')
+      RETURN
+    END IF
+    WRITE(UNIT) N, NRHS, PR, PC, GRID%MYROW, GRID%MYCOL, MYID0, MLOC_HDR, NRHS_BATCH_HDR, NBATCHES_HDR
+  END SUBROUTINE OPEN_RHS_CHECKPOINT_WRITE
+
+  ! Ecrit UN lot (NLOC_B colonnes locales de BDATA) -- appelee une fois
+  ! par lot, DANS la boucle principale, pour B_LOCAL (SAVE_RHS, juste
+  ! apres FILL_B) ou pour B_LOCAL devenu X en place (SAVE_SOLUTION, juste
+  ! apres la resolution DE CE LOT) -- meme routine, meme forme, deux
+  ! fichiers/unites distincts.
+  SUBROUTINE SAVE_RHS_BATCH(UNIT, NLOC_B, BDATA, ML)
+    INTEGER, INTENT(IN) :: UNIT, NLOC_B, ML
+    COMPLEX(WP), INTENT(IN) :: BDATA(MAX(ML,1),MAX(NLOC_B,1))
+    WRITE(UNIT) NLOC_B
+    IF (ML.GT.0 .AND. NLOC_B.GT.0) WRITE(UNIT) BDATA(1:ML,1:NLOC_B)
+  END SUBROUTINE SAVE_RHS_BATCH
+
+  ! Ouvre un fichier de checkpoint RHS EN LECTURE (LOAD_RHS), verifie son
+  ! en-tete contre le run COURANT (N/NRHS/PR/PC/grille/MLOC) et retourne
+  ! NBATCHES_OUT/NRHS_BATCH_OUT LUS DEPUIS LE FICHIER -- c'est ce
+  ! decoupage, PAS le NRHS_BATCH de ce run, qui pilote la boucle de lots
+  ! (identique au decoupage utilise a la sauvegarde, par construction).
+  ! Meme logique OK/MPI_ALLREDUCE que LOAD_BLR_MATRIX : une incompatibilite
+  ! sur UN SEUL rang arrete TOUS les rangs.
+  SUBROUTINE OPEN_RHS_CHECKPOINT_READ(PREFIX, UNIT, NBATCHES_OUT, NRHS_BATCH_OUT, OK)
+    CHARACTER(LEN=*), INTENT(IN) :: PREFIX
+    INTEGER, INTENT(OUT) :: UNIT, NBATCHES_OUT, NRHS_BATCH_OUT
+    LOGICAL, INTENT(OUT) :: OK
+    INTEGER :: IOS, IERR2
+    INTEGER :: F_N, F_NRHS, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_MLOC
     LOGICAL :: OK_LOCAL
     CHARACTER(LEN=16) :: RSTR
     CHARACTER(LEN=160) :: FNAME
     OK_LOCAL = .TRUE.
+    NBATCHES_OUT = 0; NRHS_BATCH_OUT = 0
     WRITE(RSTR,'(I6.6)') MYID0
     FNAME = TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat'
-    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
+    OPEN(NEWUNIT=UNIT, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
          STATUS='OLD', ACTION='READ', IOSTAT=IOS)
     IF (IOS .NE. 0) THEN
       WRITE(6,'(A,A,A,I0,A)') ' ERREUR : impossible d''ouvrir ', TRIM(FNAME), &
            ' (rang ', MYID0, ') -- avez-vous sauvegarde avec SAVE_RHS=1 auparavant ?'
       OK_LOCAL = .FALSE.
     ELSE
-      READ(U) F_N, F_NRHS, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_MLOC, F_NRHS_LOC, F_RSTART
+      READ(UNIT) F_N, F_NRHS, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_MLOC, NRHS_BATCH_OUT, NBATCHES_OUT
       IF (F_N.NE.N .OR. F_NRHS.NE.NRHS .OR. F_PR.NE.PR .OR. F_PC.NE.PC .OR. &
-          F_MYROW.NE.GRID%MYROW .OR. F_MYCOL.NE.GRID%MYCOL .OR. F_MYID.NE.MYID0 .OR. &
-          F_MLOC.NE.MLOC .OR. F_NRHS_LOC.NE.NRHS_LOC .OR. F_RSTART.NE.RSTART_MINE) THEN
+          F_MYROW.NE.GRID%MYROW .OR. F_MYCOL.NE.GRID%MYCOL .OR. F_MYID.NE.MYID0 .OR. F_MLOC.NE.MLOC) THEN
         WRITE(6,'(A,A,A,I0,A)') ' ERREUR : checkpoint ', TRIM(FNAME), &
              ' incompatible avec le run courant (rang ', MYID0, &
              ') -- N/NRHS/PR/PC/grille different de la sauvegarde.'
@@ -815,13 +1084,22 @@ CONTAINS
 
     CALL MPI_ALLREDUCE(OK_LOCAL, OK, 1, MPI_LOGICAL, MPI_LAND, GRID%COMM, IERR2)
     IF (.NOT. OK) THEN
-      IF (OK_LOCAL) CLOSE(U)
-      RETURN
+      IF (OK_LOCAL) CLOSE(UNIT)
     END IF
+  END SUBROUTINE OPEN_RHS_CHECKPOINT_READ
 
-    IF (MLOC.GT.0 .AND. NRHS_LOC.GT.0) READ(U) B_LOCAL(1:MLOC,1:NRHS_LOC)
-    CLOSE(U)
-  END SUBROUTINE LOAD_RHS_VECTOR
+  ! Relit UN lot (NLOC_B colonnes locales attendues, deja connues de
+  ! l'appelant via le meme RHS_LOCAL_RANGE_MBM que la sauvegarde, puisque
+  ! NRHS_BATCH_OUT/NBATCHES_OUT reproduisent EXACTEMENT le decoupage
+  ! d'origine) dans BDATA -- appelee une fois par lot, DANS la boucle
+  ! principale.
+  SUBROUTINE LOAD_RHS_BATCH(UNIT, NLOC_B, BDATA, ML)
+    INTEGER, INTENT(IN) :: UNIT, NLOC_B, ML
+    COMPLEX(WP), INTENT(OUT) :: BDATA(MAX(ML,1),MAX(NLOC_B,1))
+    INTEGER :: NLOC_B_FILE
+    READ(UNIT) NLOC_B_FILE
+    IF (ML.GT.0 .AND. NLOC_B_FILE.GT.0) READ(UNIT) BDATA(1:ML,1:NLOC_B_FILE)
+  END SUBROUTINE LOAD_RHS_BATCH
 
   ! Taux de compression REEL (stockage bas-rang effectif / stockage dense
   ! equivalent) -- pas juste 2*NB*RANK_SUM/(NB^2*N_OFFDIAG) : RANK_SUM

@@ -38,9 +38,20 @@ Chaque exemple se construit comme binaire dans `blr_solver/bin/`
 ./bin/example_dense_sequentiel [N] [NB]
 mpirun -np 4 ./bin/example_mpi_dense 2 2 [N] [NB] [NRHS]
 mpirun -np 4 ./bin/example_blr_mpi_sans_pivot 2 2 [N] [NB] [NRHS] [TOL]
-mpirun -np 4 ./bin/example_blr_mpi_pivot 2 2 [N] [NB] [NRHS] [TOL]
-mpirun -np 4 ./bin/example_blr_mpi_pivot_ooc 2 2 [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR]
+mpirun -np 4 ./bin/example_blr_mpi_pivot 2 2 [N] [NB] [NRHS] [TOL] [OPTIONS...]
+mpirun -np 4 ./bin/example_blr_mpi_pivot_ooc 2 2 [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] \
+    [EPS] [RATIO] [USE_RSVD] [CHECK_ERROR] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE] \
+    [SAVE_MATRIX] [SAVE_RHS] [SAVE_FACTORED] [SAVE_SOLUTION] [LOAD_MATRIX] [LOAD_FACTORED] [LOAD_RHS] [CHECKPOINT_DIR]
 ```
+
+`example_blr_mpi_pivot` seul : au-dela de `PR PC [N] [NB] [NRHS] [TOL]`
+(positionnels, dans cet ordre), toutes les autres options sont NOMMEES
+(`--cle=valeur`, ou `--cle` seul pour une booleenne = `--cle=1`), dans
+n'importe quel ordre -- `--help`/`-h` affiche la liste complete. Voir
+`## Sauvegarde et reprise (checkpoint/restart)` plus bas pour le detail
+des options de checkpoint (communes aux deux exemples BLR+MPI avec pivot
+-- `example_blr_mpi_pivot_ooc` garde, lui, la forme positionnelle
+d'origine).
 
 Chaque exemple assemble une matrice de demonstration (formule analytique,
 pas de fichier d'entree), factorise, resout un second membre arbitraire,
@@ -283,3 +294,72 @@ perd donc encore en eviction. Sur une matrice tres compressible (blocs
 petits), l'effet est negligeable dans les deux sens -- ce cache n'apporte
 un vrai gain que lorsque NBATCHES>1 ET que les blocs sont assez gros/
 nombreux pour que relire NBATCHES fois coute reellement cher.
+
+## Sauvegarde et reprise (checkpoint/restart)
+
+`example_blr_mpi_pivot.f90` et `example_blr_mpi_pivot_ooc.f90` acceptent
+7 options communes pour sauvegarder un objet a un instant donne et
+reprendre un calcul plus tard sans repasser par les etapes deja faites --
+nommees (`--save-matrix=1`, n'importe quel ordre) pour `example_blr_mpi_
+pivot.f90`, positionnelles (`SAVE_MATRIX=1`, ordre fixe) pour la variante
+out-of-core (voir `## Lancer` plus haut pour le detail des deux styles) :
+
+| Option (nommee / positionnelle OOC) | Effet |
+|---|---|
+| `--save-matrix` / `SAVE_MATRIX=1` | Sauvegarde la matrice assemblee (avant factorisation) |
+| `--save-rhs` / `SAVE_RHS=1` | Sauvegarde le second membre B (avant resolution) |
+| `--save-factored` / `SAVE_FACTORED=1` | Sauvegarde la matrice factorisee (facteurs LU + `IPIV`) |
+| `--save-solution` / `SAVE_SOLUTION=1` | Sauvegarde la solution X (apres resolution) |
+| `--load-matrix` / `LOAD_MATRIX=1` | Relit la matrice sauvegardee, saute l'assemblage |
+| `--load-factored` / `LOAD_FACTORED=1` | Relit la matrice factorisee, saute assemblage ET factorisation (prioritaire sur `--load-matrix`/`LOAD_MATRIX` si les deux sont positionnes) |
+| `--load-rhs` / `LOAD_RHS=1` | Relit le second membre sauvegarde, saute son calcul |
+| `--checkpoint-dir=.` / `CHECKPOINT_DIR=.` | Repertoire des fichiers de checkpoint (defaut `.`, doit deja exister) |
+
+**Format** : UN FICHIER PAR PROCESSUS MPI (`STREAM` non formate,
+`saved_<objet>_rank<N>.dat` pour `example_blr_mpi_pivot.f90`, ou
+`saved_<objet>_ooc_rank<N>.dat` pour la variante out-of-core -- prefixes
+DISTINCTS pour eviter tout chargement croise accidentel entre les deux
+exemples). Chaque fichier commence par un en-tete (N/NB ou NRHS, grille
+PR/PC/MYROW/MYCOL/MYID) verifie AVANT tout chargement : en cas
+d'incoherence (grille differente, N/NB differents...) sur NE SERAIT-CE
+QU'UN SEUL rang, TOUS les rangs s'arretent proprement (reduction
+`MPI_ALLREDUCE`/`MPI_LAND` collective) -- jamais de blocage partiel ni de
+calcul silencieusement corrompu.
+
+**Variante out-of-core** : `SAVE_BLR_MATRIX_OOC`/`LOAD_BLR_MATRIX_OOC`
+vidangent d'abord les caches (`OOC_CACHE_FLUSH_ALL`/`OOC_DIAG_CACHE_
+FLUSH_ALL`) puis relisent/reecrivent chaque bloc UN A LA FOIS via
+`OOC_READ_BLOCK_RAW`/`OOC_WRITE_BLOCK_FIXED` -- jamais plus d'un bloc
+resident en RAM, meme pendant la sauvegarde/le chargement (l'avantage
+memoire de l'OOC reste entier). `SAVE_SOLUTION` n'a pas d'equivalent RAM
+a relire pour cette variante (X n'existe jamais en un seul tenant, voir
+`CONSUME_X_BATCH`) : chaque paquet resolu est ecrit sur disque des qu'il
+est disponible, au fil de l'eau, directement depuis le callback. Ces
+fichiers de checkpoint sont DISTINCTS des fichiers scratch internes
+(`a_rank_*.dat`/`b_rank_*.dat` dans `SCRATCH_DIR`) : ces derniers restent
+du scratch pur, supprimes automatiquement en fin d'execution -- les
+checkpoints, eux, sont PERSISTANTS.
+
+**Exemple** (`example_blr_mpi_pivot.f90` -- assembler+factoriser une
+fois, resoudre plus tard sans refactoriser) :
+
+```bash
+mkdir -p ckpt
+
+# 1) assemble, factorise, sauvegarde la matrice factorisee
+mpirun -np 4 ./bin/example_blr_mpi_pivot 2 2 4000 200 4 1e-4 --save-factored --checkpoint-dir=ckpt
+
+# 2) plus tard : relit directement la matrice factorisee, saute
+#    assemblage ET factorisation
+mpirun -np 4 ./bin/example_blr_mpi_pivot 2 2 4000 200 4 1e-4 --load-factored --checkpoint-dir=ckpt
+```
+
+Meme principe pour la variante out-of-core (deux arguments
+supplementaires avant `EPS`, `MAX_MB_PER_PROCESS` et `NRHS_BATCH`, plus
+`SCRATCH_DIR` -- voir la ligne `Lancer` plus haut pour l'ordre complet) :
+
+```bash
+mkdir -p scratch ckpt
+mpirun -np 4 ./bin/example_blr_mpi_pivot_ooc 2 2 4000 200 4 1e-4 64 2 scratch 0.0 0.333333 0 0 0 0 0 0 0 1 0 0 0 0 ckpt
+mpirun -np 4 ./bin/example_blr_mpi_pivot_ooc 2 2 4000 200 4 1e-4 64 2 scratch 0.0 0.333333 0 0 0 0 0 0 0 0 0 0 1 0 ckpt
+```
