@@ -165,29 +165,34 @@ CONTAINS
   ! de tableaux, PAS mesuree via l'OS -- voir GET_RSS_KB/bench_utils_mod.f90
   ! pour la RSS reelle, qui inclut l'overhead allocateur et les copies
   ! transitoires) d'une quantite donnee (matrice, facteurs LU, second
-  ! membre...), en Mo, sous DEUX formes : le TOTAL agrege sur toute la
-  ! grille (utile pour la capacite globale du cluster) et le MAXIMUM
+  ! membre...), en Mo, sous TROIS formes : le TOTAL agrege sur toute la
+  ! grille (utile pour la capacite globale du cluster), le MAXIMUM
   ! par-processus (utile pour verifier que CHAQUE noeud/processus tient
   ! dans sa RAM disponible -- c'est la contrainte qui bloque reellement un
-  ! job, pas le total). BYTES_LOCAL : empreinte de CE processus SEUL,
-  ! calculee par l'appelant (ex: MLOC*NLOC*8 pour un tableau dense
-  ! COMPLEX(WP), ou MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR) pour du BLR
-  ! compresse) -- reduite ici via MPI_ALLREDUCE (SUM et MAX).
+  ! job, pas le total), et le MINIMUM par-processus (compare au max, permet
+  ! de juger si la charge est bien REPARTIE entre processus -- max proche
+  ! du min = repartition equilibree ; max >> min = desequilibre, un ou
+  ! quelques processus concentrent la memoire pendant que d'autres restent
+  ! sous-charges). BYTES_LOCAL : empreinte de CE processus SEUL, calculee
+  ! par l'appelant (ex: MLOC*NLOC*8 pour un tableau dense COMPLEX(WP), ou
+  ! MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR) pour du BLR compresse) -- reduite
+  ! ici via MPI_ALLREDUCE (SUM, MAX et MIN).
   !-----------------------------------------------------------------------
   SUBROUTINE REPORT_MEMORY_MB(GRID, LABEL, BYTES_LOCAL)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)        :: GRID
     CHARACTER(LEN=*), INTENT(IN)    :: LABEL
     INTEGER(8), INTENT(IN)          :: BYTES_LOCAL
-    DOUBLE PRECISION :: MB_LOCAL, MB_TOTAL, MB_MAX
+    DOUBLE PRECISION :: MB_LOCAL, MB_TOTAL, MB_MAX, MB_MIN
     INTEGER :: IERR
 
     MB_LOCAL = REAL(BYTES_LOCAL,8) / 1024.0D0 / 1024.0D0
     CALL MPI_ALLREDUCE(MB_LOCAL, MB_TOTAL, 1, MPI_DOUBLE_PRECISION, MPI_SUM, GRID%COMM, IERR)
     CALL MPI_ALLREDUCE(MB_LOCAL, MB_MAX,   1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(MB_LOCAL, MB_MIN,   1, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, IERR)
     IF (GRID%MYID .EQ. 0) THEN
-      WRITE(6,'(A,A,A,F10.1,A,F10.1,A)') '   ', LABEL, ' : total = ', MB_TOTAL, &
-           ' Mo , max/processus = ', MB_MAX, ' Mo'
+      WRITE(6,'(A,A,A,F10.1,A,F10.1,A,F10.1,A)') '   ', LABEL, ' : total = ', MB_TOTAL, &
+           ' Mo , min/processus = ', MB_MIN, ' Mo , max/processus = ', MB_MAX, ' Mo'
     END IF
   END SUBROUTINE REPORT_MEMORY_MB
 
