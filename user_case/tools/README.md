@@ -24,9 +24,10 @@ supplementaire tous les 5% de progression a l'interieur de
 l'assemblage/la factorisation/la resolution (etiquettes `etape@NN%`).
 
 ```bash
-# depuis user_case/, apres avoir construit example_blr_mpi_pivot_user (voir ../Makefile)
-mpirun -np 4 ./example_blr_mpi_pivot_user 2 2 4000 200 4 1e-4 --profile-usage
-python3 tools/plot_usage_profile.py . usage_profile.png
+# depuis la racine de blr_solver/, apres `make examples` (voir ../../Makefile) --
+# example_blr_mpi_pivot_user rejoint bin/ comme les autres exemples.
+mpirun -np 4 ./bin/example_blr_mpi_pivot_user 2 2 4000 200 4 1e-4 --profile-usage
+python3 user_case/tools/plot_usage_profile.py . usage_profile.png
 ```
 
 Produit `usage_profile.png` : deux graphiques empiles contre le temps
@@ -43,8 +44,8 @@ factorisation, dans `blr_structure_assembly_rank<N>.csv` et
 `blr_structure_factorization_rank<N>.csv`.
 
 ```bash
-mpirun -np 4 ./example_blr_mpi_pivot_user 2 2 4000 200 4 1e-4 --dump-structure
-python3 tools/plot_blr_structure.py . blr_structure.png
+mpirun -np 4 ./bin/example_blr_mpi_pivot_user 2 2 4000 200 4 1e-4 --dump-structure
+python3 user_case/tools/plot_blr_structure.py . blr_structure.png
 ```
 
 Produit `blr_structure.png` : une figure a deux panneaux (fin
@@ -61,9 +62,9 @@ Les deux options sont independantes et peuvent etre combinees dans le
 meme run :
 
 ```bash
-mpirun -np 4 ./example_blr_mpi_pivot_user 2 2 4000 200 4 1e-4 --profile-usage --dump-structure
-python3 tools/plot_usage_profile.py .
-python3 tools/plot_blr_structure.py .
+mpirun -np 4 ./bin/example_blr_mpi_pivot_user 2 2 4000 200 4 1e-4 --profile-usage --dump-structure
+python3 user_case/tools/plot_usage_profile.py .
+python3 user_case/tools/plot_blr_structure.py .
 ```
 
 ## Notes

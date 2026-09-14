@@ -33,11 +33,11 @@ legacy/test_openmp
 legacy/bench_seq_full
 legacy/bench_mpi_full
 
-# user_case/ n'a pas son propre repertoire bin/lib (Makefile autonome qui
-# reutilise lib/ a la racine) -- ses .o/.mod/executable restent a plat.
+# user_case/ : construit par le Makefile principal comme les exemples de
+# examples/ -- ses modules (.o/.mod) rejoignent lib/ (deja ignore
+# ci-dessus), seul le .o du programme principal reste dans user_case/
+# (meme convention que examples/*.o), l'executable rejoint bin/.
 user_case/*.o
-user_case/*.mod
-user_case/example_blr_mpi_pivot_user
 
 # Sorties de scripts (regenerables, pas versionnees)
 run_all_tests_logs/

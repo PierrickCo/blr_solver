@@ -34,6 +34,7 @@ MPIFC = mpiifx
 SRC  = src
 TEST = test
 EX   = examples
+USERDIR = user_case
 BINDIR = bin
 LIBDIR = lib
 
@@ -256,7 +257,7 @@ $(LIBDIR)/test_blr_workspace.o: $(TEST)/test_blr_workspace.f90 $(LIBDIR)/blr_com
 # construits ci-dessus (dans lib/), comme legacy/Makefile. Les .o propres
 # a chaque exemple restent dans examples/ (deja a l'ecart de la racine) ;
 # seuls leurs executables rejoignent bin/.
-examples: $(BINDIR)/example_blr_sequentiel $(BINDIR)/example_dense_sequentiel $(BINDIR)/example_mpi_dense $(BINDIR)/example_blr_mpi_sans_pivot $(BINDIR)/example_blr_mpi_pivot $(BINDIR)/example_blr_mpi_pivot_arena $(BINDIR)/example_blr_mpi_pivot_fixedcap $(BINDIR)/example_blr_mpi_pivot_ooc $(BINDIR)/example_user_matrix $(BINDIR)/example_user_matrix_ooc
+examples: $(BINDIR)/example_blr_sequentiel $(BINDIR)/example_dense_sequentiel $(BINDIR)/example_mpi_dense $(BINDIR)/example_blr_mpi_sans_pivot $(BINDIR)/example_blr_mpi_pivot $(BINDIR)/example_blr_mpi_pivot_arena $(BINDIR)/example_blr_mpi_pivot_fixedcap $(BINDIR)/example_blr_mpi_pivot_ooc $(BINDIR)/example_user_matrix $(BINDIR)/example_user_matrix_ooc $(BINDIR)/example_blr_mpi_pivot_user
 
 $(BINDIR)/example_blr_sequentiel: $(LIBDIR)/blr_kinds_mod.o $(LIBDIR)/blr_compress_mod.o $(LIBDIR)/blr_arena_mod.o $(LIBDIR)/blr_ooc_mod.o $(LIBDIR)/progress_bar_mod.o $(LIBDIR)/thread_control_mod.o $(LIBDIR)/blr_matrix_mod.o $(EX)/example_blr_sequentiel.o
 	$(FC) -o $@ $(OPTF) $(LIBDIR)/blr_kinds_mod.o $(LIBDIR)/blr_compress_mod.o $(LIBDIR)/blr_arena_mod.o $(LIBDIR)/blr_ooc_mod.o $(LIBDIR)/progress_bar_mod.o $(LIBDIR)/thread_control_mod.o $(LIBDIR)/blr_matrix_mod.o $(EX)/example_blr_sequentiel.o $(LIBS)
@@ -318,6 +319,36 @@ $(BINDIR)/example_user_matrix_ooc: $(LIBDIR)/blr_kinds_mod.o $(LIBDIR)/mpi_grid_
 $(EX)/example_user_matrix_ooc.o: $(EX)/example_user_matrix_ooc.f90 $(LIBDIR)/mpi_blr_matrix_mod.o $(LIBDIR)/mpi_lu_solve_2d_mod.o $(LIBDIR)/bench_utils_mod.o
 	$(MPIFC) $(OPTF) $(INCS) -c $(EX)/example_user_matrix_ooc.f90 -o $(EX)/example_user_matrix_ooc.o
 
+# --- Version utilisateur (user_case/, voir user_case/tools/README.md) :
+# meme structure que les exemples ci-dessus, mais assemblage/second
+# membre decoupes dans des modules dedies (cli_options_mod/checkpoint_
+# io_mod/profiling_mod/residual_mod/user_matrix_mod, ce dernier a
+# personnaliser) plutot qu'un seul fichier -- leurs .o/.mod rejoignent
+# lib/ comme le reste de la bibliotheque, seul le .o du programme
+# principal reste dans user_case/ (meme convention que les EX/*.o
+# ci-dessus).
+$(LIBDIR)/cli_options_mod.o: $(USERDIR)/cli_options_mod.f90
+	$(MPIFC) $(OPTF) -c $(USERDIR)/cli_options_mod.f90 -o $(LIBDIR)/cli_options_mod.o
+
+$(LIBDIR)/checkpoint_io_mod.o: $(USERDIR)/checkpoint_io_mod.f90 $(LIBDIR)/mpi_blr_matrix_mod.o
+	$(MPIFC) $(OPTF) -c $(USERDIR)/checkpoint_io_mod.f90 -o $(LIBDIR)/checkpoint_io_mod.o
+
+$(LIBDIR)/profiling_mod.o: $(USERDIR)/profiling_mod.f90 $(LIBDIR)/mpi_blr_matrix_mod.o $(LIBDIR)/bench_utils_mod.o
+	$(MPIFC) $(OPTF) -c $(USERDIR)/profiling_mod.f90 -o $(LIBDIR)/profiling_mod.o
+
+$(LIBDIR)/residual_mod.o: $(USERDIR)/residual_mod.f90 $(LIBDIR)/mpi_blr_matrix_mod.o $(LIBDIR)/mpi_lu_solve_2d_mod.o $(LIBDIR)/blr_matrix_mod.o
+	$(MPIFC) $(OPTF) -c $(USERDIR)/residual_mod.f90 -o $(LIBDIR)/residual_mod.o
+
+$(LIBDIR)/user_matrix_mod.o: $(USERDIR)/user_matrix_mod.f90 $(LIBDIR)/mpi_blr_matrix_mod.o
+	$(MPIFC) $(OPTF) -c $(USERDIR)/user_matrix_mod.f90 -o $(LIBDIR)/user_matrix_mod.o
+
+$(BINDIR)/example_blr_mpi_pivot_user: $(LIBDIR)/blr_kinds_mod.o $(LIBDIR)/mpi_grid_mod.o $(LIBDIR)/blr_compress_mod.o $(LIBDIR)/blr_arena_mod.o $(LIBDIR)/blr_ooc_mod.o $(LIBDIR)/progress_bar_mod.o $(LIBDIR)/thread_control_mod.o $(LIBDIR)/blr_matrix_mod.o $(LIBDIR)/mpi_blr_lu_pivot_bcast_mod.o $(LIBDIR)/mpi_lu_pivot_mod.o $(LIBDIR)/mpi_lu_solve_2d_mod.o $(LIBDIR)/mpi_blr_matrix_mod.o $(LIBDIR)/bench_utils_mod.o $(LIBDIR)/cli_options_mod.o $(LIBDIR)/checkpoint_io_mod.o $(LIBDIR)/profiling_mod.o $(LIBDIR)/residual_mod.o $(LIBDIR)/user_matrix_mod.o $(USERDIR)/example_blr_mpi_pivot_user.o
+	$(MPIFC) -o $@ $(OPTF) $(LIBDIR)/blr_kinds_mod.o $(LIBDIR)/mpi_grid_mod.o $(LIBDIR)/blr_compress_mod.o $(LIBDIR)/blr_arena_mod.o $(LIBDIR)/blr_ooc_mod.o $(LIBDIR)/progress_bar_mod.o $(LIBDIR)/thread_control_mod.o $(LIBDIR)/blr_matrix_mod.o $(LIBDIR)/mpi_blr_lu_pivot_bcast_mod.o $(LIBDIR)/mpi_lu_pivot_mod.o $(LIBDIR)/mpi_lu_solve_2d_mod.o $(LIBDIR)/mpi_blr_matrix_mod.o $(LIBDIR)/bench_utils_mod.o $(LIBDIR)/cli_options_mod.o $(LIBDIR)/checkpoint_io_mod.o $(LIBDIR)/profiling_mod.o $(LIBDIR)/residual_mod.o $(LIBDIR)/user_matrix_mod.o $(USERDIR)/example_blr_mpi_pivot_user.o $(MPILIBS)
+
+$(USERDIR)/example_blr_mpi_pivot_user.o: $(USERDIR)/example_blr_mpi_pivot_user.f90 $(LIBDIR)/mpi_blr_matrix_mod.o $(LIBDIR)/mpi_lu_solve_2d_mod.o $(LIBDIR)/bench_utils_mod.o $(LIBDIR)/cli_options_mod.o $(LIBDIR)/checkpoint_io_mod.o $(LIBDIR)/profiling_mod.o $(LIBDIR)/residual_mod.o $(LIBDIR)/user_matrix_mod.o
+	$(MPIFC) $(OPTF) $(INCS) -c $(USERDIR)/example_blr_mpi_pivot_user.f90 -o $(USERDIR)/example_blr_mpi_pivot_user.o
+
 clean:
 	$(RM) -r $(LIBDIR) $(BINDIR)
 	$(RM) $(EX)/*.o
+	$(RM) $(USERDIR)/*.o
