@@ -95,6 +95,10 @@ run_test test_mpi_blr_matrix       mpirun -np 4 "$BINDIR/test_mpi_blr_matrix" 2 
 run_test test_mpi_blr_matrix_pivot mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 20 1e-4
 run_test test_mpi_blr_matrix_pivot_arena mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot_arena" 2 2 1000 100 20 1e-4
 run_test test_mpi_blr_matrix_pivot_ooc mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot_ooc" 2 2 1000 100 20 1e-4 8 7 "$BINDIR/blr_ooc_scratch_ci"
+# Compression a l'assemblage par SVD randomisee adaptative (USE_RSVD=1, dernier
+# argument) -- noyau de Helmholtz geometrique, seuls tests couvrant ce chemin.
+run_test rsvd_geometric_classical  mpirun -np 4 "$BINDIR/bench_blr_mpi_pivot_ooc_geometric" 2 2 classical 2000 200 4 1e-4 16 2 "$BINDIR/blr_ooc_scratch_ci" 8.0 1
+run_test rsvd_geometric_ooc        mpirun -np 4 "$BINDIR/bench_blr_mpi_pivot_ooc_geometric" 2 2 ooc 2000 200 4 1e-4 4 2 "$BINDIR/blr_ooc_scratch_ci" 8.0 1
 
 echo "=== Benchmarks (fumee -- petite echelle) ==="
 run_bench bench_seq  "$BINDIR/bench_seq" 1000 20 100 1e-4

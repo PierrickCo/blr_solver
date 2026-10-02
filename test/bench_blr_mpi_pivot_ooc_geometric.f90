@@ -33,10 +33,15 @@
 ! le detail de ces choix, non repete ici.
 !
 ! Usage : mpirun -np <PR*PC> ./bench_blr_mpi_pivot_ooc_geometric PR PC MODE [N] [NB] \
-!         [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [WAVENUMBER]
+!         [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [WAVENUMBER] [USE_RSVD]
 !         MODE = 'classical' ou 'ooc' (obligatoire).
 !         (defauts : N=8000 NB=400 NRHS=6 TOL=1e-4 MAX_MB_PER_PROCESS=16
-!          NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch_bench_geo WAVENUMBER=8.0)
+!          NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch_bench_geo WAVENUMBER=8.0 USE_RSVD=0)
+!         USE_RSVD=1 : compression a l'assemblage par SVD randomisee adaptative
+!         (COMPRESS_BLOCK_RSVD_ADAPTIVE) au lieu de CGESVD -- dans les DEUX modes.
+!         En mode classical, B=A*Xexact reste construit avec CGESVD (A_CL_FOR_B) :
+!         l'erreur inclut donc l'ecart de compression RSVD/CGESVD ; en mode ooc,
+!         B vient du noyau exact (FILL_RHS), l'erreur inclut toute la compression.
 !===============================================================================
 PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
   USE MPI_BLR_MATRIX_MOD
@@ -46,7 +51,9 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
   INCLUDE 'mpif.h'
 
   TYPE(GRID_T) :: GRID
-  INTEGER :: PR, PC, N, NB, NRHS, NRHS_BATCH, IERR, MYID0
+  INTEGER :: PR, PC, N, NB, NRHS, NRHS_BATCH, IERR, MYID0, USE_RSVD_INT
+  LOGICAL :: USE_RSVD_FLAG
+  CHARACTER(LEN=40) :: COMPRESS_LABEL
   REAL(WP) :: TOL, MAX_MB_PER_PROCESS, WAVENUMBER
   CHARACTER(LEN=32) :: ARG
   CHARACTER(LEN=256) :: SCRATCH_DIR
@@ -83,12 +90,12 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
 
   N = 8000; NB = 400; NRHS = 6; TOL = 1.0E-4_WP
   MAX_MB_PER_PROCESS = 16.0_WP; NRHS_BATCH = 2; SCRATCH_DIR = './blr_ooc_scratch_bench_geo'
-  WAVENUMBER = 8.0_WP
+  WAVENUMBER = 8.0_WP; USE_RSVD_INT = 0
 
   IF (COMMAND_ARGUMENT_COUNT() .LT. 3) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &
          'Usage: mpirun -np PR*PC ./bench_blr_mpi_pivot_ooc_geometric PR PC MODE [N] [NB] [NRHS] [TOL] '// &
-         '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [WAVENUMBER]   (MODE = classical|ooc, obligatoire)'
+         '[MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [WAVENUMBER] [USE_RSVD]   (MODE = classical|ooc, obligatoire)'
     CALL MPI_FINALIZE(IERR)
     STOP 1
   END IF
@@ -124,6 +131,15 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
   IF (COMMAND_ARGUMENT_COUNT() .GE. 11) THEN
     CALL GET_COMMAND_ARGUMENT(11, ARG); READ(ARG,*) WAVENUMBER
   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 12) THEN
+    CALL GET_COMMAND_ARGUMENT(12, ARG); READ(ARG,*) USE_RSVD_INT
+  END IF
+  USE_RSVD_FLAG = (USE_RSVD_INT .NE. 0)
+  IF (USE_RSVD_FLAG) THEN
+    COMPRESS_LABEL = 'SVD randomisee adaptative'
+  ELSE
+    COMPRESS_LABEL = 'SVD complete, CGESVD'
+  END IF
 
   CALL GRID_INIT(GRID, MPI_COMM_WORLD, PR, PC, IERR)
   IF (IERR .NE. 0) THEN
@@ -135,6 +151,7 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
   IF (MYID0.EQ.0) WRITE(6,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2,A,F8.1,A,F6.2)') &
        ' Grille ', PR, 'x', PC, ' , N=', N, ' , NB=', NB, ' , NRHS=', NRHS, ' , TOL=', TOL, &
        ' , MAX_MB_PER_PROCESS(OOC)=', MAX_MB_PER_PROCESS, ' , WAVENUMBER=', WAVENUMBER
+  IF (MYID0.EQ.0) WRITE(6,'(A,A)') ' Compression a l''assemblage : ', TRIM(COMPRESS_LABEL)
 
   IF (MODE .EQ. 'classical') THEN
     !===========================================================================
@@ -142,7 +159,7 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
     !===========================================================================
     CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, GET_BLOCK, A_CL, T_ASM_CL, &
                                   N_COMPRESSED_CL, N_OFFDIAG_CL, RANK_SUM_CL, &
-                                  T_GET_BLOCK=T_GETBLK_ASM, T_COMPRESS=T_COMPRESS_ASM)
+                                  T_GET_BLOCK=T_GETBLK_ASM, T_COMPRESS=T_COMPRESS_ASM, USE_RSVD=USE_RSVD_FLAG)
     RSS_ASM_CL = RSS_NOW_MB()
 
     CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_CL, TOL, INFO_CL, &
@@ -195,7 +212,7 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
       WRITE(6,'(A)') ' ================================================================'
       WRITE(6,'(A,F10.3,A,F10.1,A)') '  Assemblage    : temps(MAX) = ', T_ASM_CL,   ' s  , RSS = ', RSS_ASM_CL,   ' Mo'
       WRITE(6,'(A,F10.3,A)') '    dont GET_BLOCK (evaluation du noyau) = ', T_GETBLK_ASM, ' s'
-      WRITE(6,'(A,F10.3,A)') '    dont COMPRESS_BLOCK (SVD complete, CGESVD) = ', T_COMPRESS_ASM, ' s'
+      WRITE(6,'(A,F10.3,A)') '    dont compression (' // TRIM(COMPRESS_LABEL) // ') = ', T_COMPRESS_ASM, ' s'
       WRITE(6,'(A,F10.3,A,F10.1,A)') '  Factorisation : temps(MAX) = ', T_FACTOR_CL,' s  , RSS = ', RSS_FACT_CL,  ' Mo'
       WRITE(6,'(A,F10.3,A,F10.1,A)') '  Resolution    : temps = ', T_SOLVE_CL, ' s  , RSS = ', RSS_SOLVE_CL, ' Mo'
       WRITE(6,'(A,F10.3,A)') '  TOTAL         : temps = ', T_ASM_CL+T_FACTOR_CL+T_SOLVE_CL, ' s'
@@ -223,7 +240,7 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
                                       T_ASM_A_OOC, N_COMPRESSED_OOC, N_OFFDIAG_OOC, RANK_SUM_OOC, &
                                       T_GET_BLOCK=T_GETBLK_ASM, T_COMPRESS=T_COMPRESS_ASM, T_IO=T_IO_ASM, &
                                       T_GET_BLOCK_MIN=T_GETBLK_ASM_MIN, T_COMPRESS_MIN=T_COMPRESS_ASM_MIN, &
-                                      T_IO_MIN=T_IO_ASM_MIN)
+                                      T_IO_MIN=T_IO_ASM_MIN, USE_RSVD=USE_RSVD_FLAG)
     RSS_ASMA_OOC = RSS_NOW_MB()
 
     T0B = MPI_WTIME()
@@ -263,7 +280,7 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
       WRITE(6,'(A,F10.3,A,F10.1,A)') '  Assemblage A  : temps(MAX) = ', T_ASM_A_OOC, ' s  , RSS = ', RSS_ASMA_OOC, ' Mo'
       WRITE(6,'(A,F10.3,A,F10.3,A)') '    dont GET_BLOCK (evaluation du noyau)          : MAX=', T_GETBLK_ASM, &
            ' s , MIN=', T_GETBLK_ASM_MIN, ' s'
-      WRITE(6,'(A,F10.3,A,F10.3,A)') '    dont COMPRESS_BLOCK (SVD complete, CGESVD)    : MAX=', T_COMPRESS_ASM, &
+      WRITE(6,'(A,F10.3,A,F10.3,A)') '    dont compression (' // TRIM(COMPRESS_LABEL) // ') : MAX=', T_COMPRESS_ASM, &
            ' s , MIN=', T_COMPRESS_ASM_MIN, ' s'
       WRITE(6,'(A,F10.3,A,F10.3,A)') '    dont E/S disque (ecriture diag+cache+flush)   : MAX=', T_IO_ASM, &
            ' s , MIN=', T_IO_ASM_MIN, ' s'
