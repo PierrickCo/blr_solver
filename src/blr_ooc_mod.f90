@@ -166,7 +166,10 @@ CONTAINS
 
   SUBROUTINE OOC_STORE_FREE(STORE)
     TYPE(OOC_STORE_T), INTENT(INOUT) :: STORE
-    IF (STORE%UNIT .GE. 0) CLOSE(STORE%UNIT, STATUS='DELETE')
+    ! OPEN(NEWUNIT=...) renvoie une unite NEGATIVE (jamais -1, reserve par
+    ! la norme) : tester .GE. 0 ne fermait/supprimait jamais le fichier
+    ! scratch. -1 = sentinelle "non ouvert" (valeur par defaut de UNIT).
+    IF (STORE%UNIT .NE. -1) CLOSE(STORE%UNIT, STATUS='DELETE')
     STORE%UNIT = -1
   END SUBROUTINE OOC_STORE_FREE
 
@@ -271,12 +274,33 @@ CONTAINS
   END SUBROUTINE OOC_READ_BLOCK_RAW
 
   !-----------------------------------------------------------------------
+  ! Taille memoire (octets) du bloc DECRIT par DESC une fois charge --
+  ! identique a BLR_BLOCK_BYTES (blr_compress_mod.f90) applique au bloc
+  ! apres OOC_READ_BLOCK_RAW, mais calculable AVANT la lecture (necessaire
+  ! pour evincer d'abord). Garder les deux formules synchronisees.
+  !-----------------------------------------------------------------------
+  PURE FUNCTION OOC_DESC_BYTES(DESC) RESULT(NBYTES)
+    TYPE(OOC_BLOCK_DESC_T), INTENT(IN) :: DESC
+    INTEGER(8) :: NBYTES
+    IF (DESC%IS_LOWRANK) THEN
+      NBYTES = OOC_BYTES_PER_ELEM*(INT(DESC%M,8)*INT(DESC%RANK,8) + INT(DESC%RANK,8)*INT(DESC%N,8))
+    ELSE
+      NBYTES = OOC_BYTES_PER_ELEM*INT(DESC%M,8)*INT(DESC%N,8)
+    END IF
+  END FUNCTION OOC_DESC_BYTES
+
+  !-----------------------------------------------------------------------
   ! Cache borne en octets pour les blocs hors-diagonale (OFFBLK) -- NSLOTS
   ! dimensionne genereusement (le budget en octets est la VRAIE limite,
   ! NSLOTS n'est qu'un plafond structurel sur le nombre d'entrees
   ! simultanees, jamais atteint en pratique si BUDGET_MB est realiste face
   ! a la taille des blocs). NROWS/NCOLS : forme de DESCS(:,:) (donc de
   ! A_BLR%OFFBLK), necessaire pour dimensionner SLOT_OF.
+  ! UNITE (voulue) : BUDGET_MB est en Mo BINAIRES (1 Mo = 1024*1024
+  ! octets, i.e. MiB), PAS 1e6 octets -- meme convention que TOUS les "Mo"
+  ! affiches par le projet (RSS = GET_RSS_KB()/1024, memoire BLR/cache =
+  ! octets/1024/1024, voir mpi_blr_matrix_mod.f90 et test/bench_*.f90) :
+  ! budget et RSS rapportes sont donc directement comparables.
   !-----------------------------------------------------------------------
   SUBROUTINE OOC_CACHE_INIT(CACHE, BUDGET_MB, MAX_SLOTS, NROWS, NCOLS)
     TYPE(OOC_CACHE_T), INTENT(OUT) :: CACHE
@@ -372,10 +396,17 @@ CONTAINS
       RETURN
     END IF
 
-    ! non resident -- charge depuis le disque
-    NBYTES = 8_8*(INT(DESCS(LI,LJ)%M,8)*INT(MAX(DESCS(LI,LJ)%RANK,DESCS(LI,LJ)%N),8) + &
-                  INT(DESCS(LI,LJ)%RANK,8)*INT(DESCS(LI,LJ)%N,8))
-    IF (.NOT. DESCS(LI,LJ)%IS_LOWRANK) NBYTES = 8_8*INT(DESCS(LI,LJ)%M,8)*INT(DESCS(LI,LJ)%N,8)
+    ! non resident -- charge depuis le disque. Taille calculee depuis le
+    ! descripteur (AVANT lecture, pour evincer d'abord) avec EXACTEMENT la
+    ! meme formule que BLR_BLOCK_BYTES / OOC_CACHE_PUT_NEW : bas-rang =
+    ! 8*(M*RANK+RANK*N), dense = 8*M*N. (Ancienne formule fautive :
+    ! M*MAX(RANK,N)+RANK*N, soit PLUS que le bloc dense : pas de derive
+    ! cumulative -- l'eviction retire le meme NBYTES -- mais chaque bloc
+    ! recharge occupait ~NB/(2*RANK) fois sa vraie place dans le budget,
+    ! d'ou un cache effectif bien plus petit et des evictions LRU tres
+    ! prematurees. Mesure 2026-10-02, bench geometrique N=8000/20000,
+    ! grille 2x2 : relectures disque divisees par ~4.4, erreur identique.)
+    NBYTES = OOC_DESC_BYTES(DESCS(LI,LJ))
     CALL OOC_CACHE_MAKE_ROOM(CACHE, STORE, DESCS, NBYTES)
 
     IF (CACHE%NFREE .EQ. 0) THEN
@@ -483,7 +514,7 @@ CONTAINS
       CACHE%FREE_STACK(S) = CACHE%NSLOTS - S + 1
     END DO
     CACHE%NFREE = CACHE%NSLOTS
-    CACHE%BUDGET_BYTES = INT(BUDGET_MB*1024.0_WP*1024.0_WP, 8)
+    CACHE%BUDGET_BYTES = INT(BUDGET_MB*1024.0_WP*1024.0_WP, 8)   ! MiB, voir OOC_CACHE_INIT
     CACHE%USED_BYTES = 0_8
     CACHE%CLOCK = 0_8
   END SUBROUTINE OOC_DIAG_CACHE_INIT
@@ -545,7 +576,7 @@ CONTAINS
       RETURN
     END IF
 
-    NBYTES = 8_8*INT(DESCS(K)%M,8)*INT(DESCS(K)%N,8)
+    NBYTES = OOC_DESC_BYTES(DESCS(K))   ! bloc diagonal toujours dense : 8*M*N
     CALL OOC_DIAG_CACHE_MAKE_ROOM(CACHE, STORE, DESCS, NBYTES)
 
     IF (CACHE%NFREE .EQ. 0) THEN
