@@ -30,6 +30,11 @@ PROGRAM BENCH_LDLT_VS_LU
   INTEGER(8) :: MEM_A_MAX(2), MEM_A_SUM(2), MEM_F_MAX(2), MEM_F_SUM(2)
   REAL(WP) :: ERR(2)
   INTEGER :: NSW(2), N2X2
+  DOUBLE PRECISION :: TBK(7,2)
+  INTEGER :: JB
+  CHARACTER(LEN=26), PARAMETER :: TBK_NAMES(7) = (/ 'facto. blocs diagonaux    ', 'echanges (pivot)          ', &
+       'panneau (TRSM, D^-1, ...) ', 'MPI (attentes comprises)  ', 'Schur blocs diagonaux     ', &
+       'Schur hors-diagonale      ', 'boucle complete           ' /)
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
@@ -83,6 +88,10 @@ PROGRAM BENCH_LDLT_VS_LU
     WRITE(6,'(A,ES14.4,A,ES14.4)') '  ||X-Xexact||/||Xexact|| ', ERR(1), '      ', ERR(2)
     WRITE(6,'(A,I14,A,I14)')       '  Echanges de pivot       ', NSW(1), '      ', NSW(2)
     WRITE(6,'(A,I0)')              '  Pivots 2x2 (LDLt)       ', N2X2
+    WRITE(6,'(A)') '  Decoupage de la factorisation (s, MAX sur les processus) :'
+    DO JB = 1, 7
+      WRITE(6,'(A,A,F12.4,A,F12.4)') '    ', TBK_NAMES(JB), TBK(JB,1), '      ', TBK(JB,2)
+    END DO
     IF (ERR(1).LT.1.0E-3_WP .AND. ERR(2).LT.1.0E-3_WP) THEN
       WRITE(6,*) '=== BENCH_LDLT_VS_LU : OK ==='
     ELSE
@@ -165,7 +174,8 @@ CONTAINS
     CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, SYM_GET_BLOCK, AL, T_ASM(1), NC, NO, RS, &
                                  SHOW_PROGRESS=.TRUE., USE_RSVD=(USE_RSVD_INT.NE.0))
     CALL REDUCE_MEM(MPI_BLR_MATRIX_MEMORY_BYTES(AL), MEM_A_MAX(1), MEM_A_SUM(1))
-    CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, AL, TOL, INFO, NC, NO, RS, NSW(1), T_FAC(1), SHOW_PROGRESS=.TRUE.)
+    CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, AL, TOL, INFO, NC, NO, RS, NSW(1), T_FAC(1), SHOW_PROGRESS=.TRUE., &
+                                        T_BREAKDOWN=TBK(:,1))
     IF (INFO .NE. 0 .AND. MYID0.EQ.0) WRITE(6,*) 'ERREUR LU, INFO=', INFO
     CALL REDUCE_MEM(MPI_BLR_MATRIX_MEMORY_BYTES(AL), MEM_F_MAX(1), MEM_F_SUM(1))
     MLOC = 0
@@ -194,7 +204,8 @@ CONTAINS
     CALL MPI_ASSEMBLE_BLR_SYM(GRID, N, NB, TOL, SYM_GET_BLOCK, AS, T_ASM(2), NC, NO, RS, &
                               SHOW_PROGRESS=.TRUE., USE_RSVD=(USE_RSVD_INT.NE.0))
     CALL REDUCE_MEM(MPI_BLR_SYM_MEMORY_BYTES(AS), MEM_A_MAX(2), MEM_A_SUM(2))
-    CALL MPI_BLR_SYM_LDLT_FACTOR(GRID, AS, TOL, INFO, NC, NO, RS, NSW(2), N2X2, T_FAC(2), SHOW_PROGRESS=.TRUE.)
+    CALL MPI_BLR_SYM_LDLT_FACTOR(GRID, AS, TOL, INFO, NC, NO, RS, NSW(2), N2X2, T_FAC(2), SHOW_PROGRESS=.TRUE., &
+                                 T_BREAKDOWN=TBK(:,2))
     IF (INFO .NE. 0 .AND. MYID0.EQ.0) WRITE(6,*) 'ERREUR LDLt, INFO=', INFO
     CALL REDUCE_MEM(MPI_BLR_SYM_MEMORY_BYTES(AS), MEM_F_MAX(2), MEM_F_SUM(2))
     MLOC = MPI_BLR_SYM_MLOC(AS, GRID)

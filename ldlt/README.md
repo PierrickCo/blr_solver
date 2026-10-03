@@ -16,9 +16,12 @@ déjà construits (même principe que `legacy/`).
   (dense ou bas-rang) ; blocs I<J jamais assemblés ni alloués (`GET_BLOCK`
   n'est appelé que pour I≥J). Blocs **diagonaux en stockage compact**
   (triangle inférieur seul, KW·(KW+1)/2 éléments, format LAPACK `'L'`) :
-  dépliés dans un unique espace de travail NB×NB le temps d'une mise à jour
-  de Schur ou de `CSYTRF_RK`, et diffusés compacts (moitié du volume).
-- **Pivot** : Bunch-Kaufman borné (`CSYTRF_RK`, pivots 1×1 et 2×2) **confiné
+  mis à jour **directement dans le stockage compact** (une `CGEMV` par
+  colonne quand l'un des facteurs de Schur est bas-rang), dépliés dans un
+  unique espace de travail NB×NB seulement pour la factorisation du bloc ou
+  une mise à jour dense, et diffusés compacts (moitié du volume).
+- **Pivot** : Bunch-Kaufman (`CSYTRF` puis `CSYCONVF`, qui convertit la
+  sortie au format de `CSYTRF_RK` ; pivots 1×1 et 2×2) **confiné
   au bloc diagonal**, même philosophie que le pivot partiel confiné du LU (et
   que MUMPS/STRUMPACK). Le bloc diagonal K est factorisé *en entier*, une
   fois toutes ses mises à jour de Schur reçues : aucune mise à jour différée
@@ -28,19 +31,25 @@ déjà construits (même principe que `legacy/`).
   lignes des L(K,J<K) déjà calculés → échange de lignes de `UFAC` ; colonnes
   des A(I>K,K) → échange de colonnes de `VFAC`. Factorisation obtenue :
   Q·A·Qᵀ = L·D·Lᵀ, Q = diag(P_Kᵀ).
-- **Étape K** : `CSYTRF_RK` sur (K,K) → IPIV et D_K diffusés à toute la grille ;
+- **Étape K** : Bunch-Kaufman sur (K,K) → IPIV et D_K diffusés à toute la grille ;
   W(I,K) = A(I,K)·P_K·L_KK⁻ᵀ sur la colonne de grille de K, diffusé (déjà
   compressé) le long des lignes ; L(I,K) = W·D_K⁻¹ ; L(J,K)ᵀ diffusé le long
   des colonnes depuis le processus (ligne(J), colonne(J)) — schéma du
   Cholesky ScaLAPACK ; Schur A(I,J) −= W(I,K)·L(J,K)ᵀ sur I≥J seulement.
 - **Résolution** : Q·B → descente L (algorithme du LU) → D (local, aucune
-  communication) → remontée Lᵀ « left-looking » (une réduction le long d'une
-  colonne de grille + une diffusion par étape) → Qᵀ.
+  communication) → remontée Lᵀ « pleine largeur » : chaque processus garde
+  ses lignes du second membre sur toute la largeur ; à chaque étape, une
+  réduction le long d'une colonne de grille vers le propriétaire du bloc
+  diagonal, qui résout et diffuse le résultat sur sa ligne (2 communications
+  par étape, aucune diffusion du bloc diagonal) → Qᵀ.
 
-La convention de `CSYTRF_RK` (Pᵀ·A·P = L·D·Lᵀ, échanges (k,|IPIV(k)|)
-appliqués dans l'ordre k=1..n, bloc 2×2 signalé par IPIV(k)<0, terme
-hors-diagonal dans E(k)) a été **vérifiée numériquement** avant d'écrire la
-propagation, pas supposée d'après la documentation.
+Conventions **vérifiées numériquement**, pas supposées d'après la
+documentation : Pᵀ·A·P = L·D·Lᵀ, échanges (k,|IPIV(k)|) appliqués dans
+l'ordre k=1..n ; bloc 2×2 en (k,k+1) ⇔ terme hors-diagonal E(k) ≠ 0. Ce
+dernier critère est le seul commun aux deux formats : `CSYTRF_RK` marque un
+2×2 par IPIV(k), IPIV(k+1) < 0, alors que `CSYTRF` + `CSYCONVF` donne
+IPIV(k) = k, IPIV(k+1) < 0 (un premier essai fondé sur le signe de IPIV(k)
+faussait toute la factorisation, détecté par le test de reconstruction).
 
 Compression à l'assemblage : **SVD randomisée adaptative par défaut**
 (`USE_RSVD=.TRUE.`, comme tout le projet depuis 2026-10-03) ; `USE_RSVD=.FALSE.`
@@ -65,7 +74,9 @@ Compression à l'assemblage : **SVD randomisée adaptative par défaut**
 | `test/test_mpi_blr_ldlt.f90` | validation : erreur vs Xexact, référence dense `CGESV` indépendante, reconstruction directe ‖Q·A·Qᵀ − L·D·Lᵀ‖ (grille 1×1) |
 | `test/test_mpi_blr_ldlt_arena.f90` | arena vs classique (erreur, écart, mémoire) |
 | `test/test_mpi_blr_ldlt_ooc.f90` | OOC vs classique, second membre exact entrée par entrée, cache résident observé |
-| `test/bench_ldlt_vs_lu.f90` | LDLᵀ vs LU BLR+MPI sur la même matrice (temps, mémoire, erreur, phases de résolution) |
+| `test/bench_ldlt_vs_lu.f90` | LDLᵀ vs LU BLR+MPI sur la même matrice (temps, mémoire, erreur, découpage de la factorisation et phases de résolution) |
+| `test/bench_diag_kernels.f90` | micro-benchmark des noyaux du bloc diagonal (`CGETRF`, variantes Bunch-Kaufman et Aasen, stockage compact, `CGEMM`/`CGEMMT`) — Intel seulement |
+| `test/sweep_driver.f90` | pilote de `tools/sweep_incore.sh` |
 | `examples/example_blr_mpi_ldlt.f90` | exemple avec les options du LU, y compris sauvegarde/reprise |
 
 ## Compiler et lancer
@@ -78,7 +89,7 @@ mpirun -np 4 ldlt/bin/example_blr_mpi_ldlt 2 2 4000 200 8 1e-4 --check-error
 ```
 
 Chaîne gcc : `make -f Makefile.gcc && make -C ldlt -f Makefile.gcc`
-(→ `ldlt/build-gcc/`, LAPACK ≥ 3.7 requis pour `CSYTRF_RK`).
+(→ `ldlt/build-gcc/`, LAPACK ≥ 3.7 requis pour `CSYCONVF`).
 `./run_all_tests.sh [intel|gcc]` compile et teste aussi ce répertoire
 (9 tests LDLᵀ : classique sur 3 régimes de pivots, exemple, benchmark,
 arena, OOC avec évictions réelles, cycle sauvegarde → reprise).
@@ -112,9 +123,38 @@ démo `--wavenumber --strong --diag`. Les CSV de `--profile-usage` /
 - Chaînes Intel (ifx+MKL+Intel MPI) et gcc (gfortran+LAPACK de
   référence+OpenMPI) : mêmes résultats.
 
-## Mesures LDLᵀ vs LU (`bench_ldlt_vs_lu`, grille 2×2, OMP_NUM_THREADS=2, TOL=1e-4 sauf mention, RSVD)
+## Optimisations du 2026-10-03 (mesurées)
 
-Ratios LDLᵀ/LU (< 1 = LDLᵀ meilleur), stockage diagonal compact :
+Micro-benchmark des noyaux du bloc diagonal (1 thread, bloc 800, rang 8) :
+- `CSYTRF_RK` prend 0.65× le temps de `CGETRF` (deux fois moins de calculs,
+  mais 94 contre 121 GF/s) ; `CSYTRF` + `CSYCONVF` 0.61× (0.82× à 2 threads,
+  contre 0.95× pour `_RK`) → adopté. Aasen (`CSYTRF_AA`) n'est pas meilleur.
+- Mise à jour de Schur d'un bloc diagonal compact : dépliage + `CGEMM` +
+  repliage 0.77 ms ; `CGEMV` par colonne directement dans le stockage compact
+  0.21 ms, résultat identique → adopté.
+
+Découpage de la factorisation (N=16000, grille 2×4 × 1 thread, s, MAX sur les
+processus), LDLᵀ avant → après :
+
+| Poste | NB=400 | NB=800 |
+|---|---|---|
+| factorisation des blocs diagonaux | 0.019 → 0.018 | 0.067 → 0.055 |
+| Schur des blocs diagonaux | 0.072 → 0.022 | 0.150 → 0.027 |
+| attentes MPI | 0.232 → 0.176 | 0.508 → 0.364 |
+| **factorisation totale** (LU : 0.39 / 0.56) | **0.310 → 0.251** | **0.552 → 0.400** |
+
+L'attente MPI reste le premier poste (60 à 90 % de la boucle, LU compris) :
+les blocs diagonaux sont traités par une partie seulement des processus
+pendant que les autres attendent — c'est la cible de l'anticipation
+(« lookahead »). La remontée Lᵀ en pleine largeur ramène la résolution
+LDLᵀ au niveau du LU ou en dessous : ×0.93–0.99 (2×4, NB=800, contre ×1.41
+avant), ×0.80–0.86 (1×8, NB=600, contre ×1.9) ; la remontée ne coûte plus
+que 0.016–0.045 s, la descente L domine désormais.
+
+## Mesures LDLᵀ vs LU avant ces optimisations (`bench_ldlt_vs_lu`, grille 2×2, OMP_NUM_THREADS=2, TOL=1e-4 sauf mention, RSVD)
+
+Ratios LDLᵀ/LU (< 1 = LDLᵀ meilleur), stockage diagonal compact (dépliage à
+chaque mise à jour, `CSYTRF_RK`, remontée left-looking) :
 
 | Cas | Assemblage | Factorisation | Résolution | Mémoire facteurs | Erreur LU / LDLᵀ |
 |---|---|---|---|---|---|
@@ -141,22 +181,22 @@ Lecture honnête :
   dominaient).
 - **Assemblage ×0.5** (moitié des blocs à évaluer et compresser).
 - **Factorisation : ×0.45 à NB fixe petit/moyen, mais seulement ×0.90–0.97
-  au meilleur NB de chaque solveur.** À grand NB, le coût est dominé par les
-  blocs diagonaux ; `CSYTRF_RK` (Bunch-Kaufman, moins parallèle que
-  `CGETRF`) et le dépliage/repliage du stockage compact mangent l'essentiel
-  du gain de flops.
-- **Résolution** : proche du LU (×0.73 à ×1.29) ; un premier écart ×2.2
-  mesuré sur un seul run s'est révélé être du bruit (re-mesuré ×1.02–1.07).
+  au meilleur NB de chaque solveur** avant optimisation. L'explication
+  initiale (« `CSYTRF_RK` moins efficace que `CGETRF` ») était fausse en
+  temps absolu : le découpage a montré que le surcoût venait surtout du
+  dépliage du stockage compact à chaque mise à jour de Schur, et des attentes
+  MPI qu'il allongeait (voir la section précédente).
+- **Résolution** : de ×0.73 à ×1.29 avant optimisation, et jusqu'à ×1.7–1.9
+  sur les grilles larges (2×4, 1×8) — corrigé par la remontée pleine largeur.
 
 ## Limites connues, assumées
 
-- **Gain de factorisation modeste au NB optimal** (voir ci-dessus) : le
-  levier serait un `CSYTRF_RK` plus efficace sur gros blocs (variante
-  blocked/parallèle) ou une mise à jour de Schur diagonale limitée au
-  triangle inférieur — non fait.
-- **Remontée Lᵀ** : copie pleine largeur `XFULL` (MLOC × NRHS) des inconnues
-  déjà calculées — mémoire RHS ×PC pendant cette phase, bornée par
-  `--nrhs-batch` (et par paquet en OOC).
+- **Attentes MPI dominantes** (60 à 90 % de la factorisation, LU compris) :
+  le levier restant est l'anticipation (factoriser le bloc diagonal K+1
+  pendant le Schur de l'étape K), non faite.
+- **Remontée Lᵀ** : copie pleine largeur `XFULL` (MLOC × NRHS) du second
+  membre — mémoire RHS ×PC pendant cette phase, bornée par `--nrhs-batch`
+  (et par paquet en OOC).
 - **OOC** : le budget `MAX_MB_PER_PROCESS` s'applique **à chacun des deux
   caches** (diagonal et hors-diagonale), comme dans le LU OOC — le résident
   peut atteindre 2× le budget. Coût fixe d'environ 2.5–3 ms par étape K
@@ -170,7 +210,7 @@ Lecture honnête :
   pour le LU arena), non mesuré ici.
 - **Déséquilibre de charge sur grille carrée** (hérité de la distribution
   bloc-cyclique, aussi présent dans le LU) : les blocs diagonaux et leur
-  `CSYTRF_RK` tombent tous sur les processus (r,r) — mémoire max/processus
+  factorisation tombent tous sur les processus (r,r) — mémoire max/processus
   ×0.55 au lieu de ×0.50 en dense.
 - **Matrices mal conditionnées** : comme pour le LU, l'erreur de compression
   (~TOL) est amplifiée par le conditionnement. Exemple : la variante « pivots

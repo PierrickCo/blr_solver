@@ -210,7 +210,7 @@ CONTAINS
       DEALLOCATE(DK)
       JJ = 1
       DO WHILE (JJ .LE. KW)
-        IF (A%IPIV(JJ,K) .LT. 0 .AND. JJ .LT. KW) THEN
+        IF (A%DSUB(JJ,K) .NE. CZERO .AND. JJ .LT. KW) THEN
           DF(B0+JJ+1,B0+JJ) = A%DSUB(JJ,K); DF(B0+JJ,B0+JJ+1) = A%DSUB(JJ,K)
           LF(B0+JJ+1,B0+JJ) = CZERO
           JJ = JJ + 2

@@ -33,7 +33,8 @@ MODULE MPI_BLR_LDLT_ARENA_MOD
                                 RHS_LOCAL_RANGE_MBM
   USE MPI_BLR_LDLT_MOD, ONLY: PACKED_TRI_T, SYM_PACK_LOWER, SYM_UNPACK_LOWER, BLR_BLOCK_COL_SWAP, &
                               BLR_TRSM_RIGHT_LOWER_TRANS_UNIT, BLR_BLOCK_DINV_RIGHT, BLR_BLOCK_TRANSPOSE, &
-                              APPLY_DINV_LEFT, COUNT_PIVOTS
+                              APPLY_DINV_LEFT, COUNT_PIVOTS, &
+                              SYM_BK_FACTOR, SYM_BK_LWORK, SYM_PACKED_SCHUR_UPDATE
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
@@ -309,8 +310,7 @@ CONTAINS
     A%IPIV = 0; A%DDIAG = (0.0_WP,0.0_WP); A%DSUB = (0.0_WP,0.0_WP)
     CALL BLR_WORKSPACE_ALLOC(WS, A%NB)
     ALLOCATE(E(A%NB))
-    CALL CSYTRF_RK('L', A%NB, WQUERY, A%NB, E, A%IPIV(:,1), WQUERY, -1, IINFO)
-    LWORK = MAX(1, INT(REAL(WQUERY(1))))
+    LWORK = SYM_BK_LWORK(A%NB)
     ALLOCATE(WORK(LWORK), DWORK(A%NB,A%NB))
     DWORK = (0.0_WP,0.0_WP)
 
@@ -329,7 +329,7 @@ CONTAINS
       ! 1) Bunch-Kaufman borne sur le bloc diagonal (deplie le temps du calcul)
       IF (OWNER) THEN
         CALL SYM_UNPACK_LOWER(KW, A%DIAGP(K)%AP, DWORK, A%NB)
-        CALL CSYTRF_RK('L', KW, DWORK, A%NB, E, IPIV_K, WORK, LWORK, IINFO)
+        CALL SYM_BK_FACTOR(KW, DWORK, A%NB, E, IPIV_K, WORK, LWORK, IINFO)
         IF (IINFO .NE. 0) INFO_STEP = A%BSTART(K) - 1 + IINFO
         DO I = 1, KW
           DBUF(I) = DWORK(I,I)
@@ -350,7 +350,7 @@ CONTAINS
       A%DDIAG(1:KW,K) = DBUF(1:KW)
       A%DSUB(1:KW,K)  = DBUF(KW+1:2*KW)
       SWP = ABS(IPIV_K)
-      CALL COUNT_PIVOTS(KW, IPIV_K, NS_K, N2_K)
+      CALL COUNT_PIVOTS(KW, IPIV_K, DBUF(KW+1:2*KW), NS_K, N2_K)
       NS_TOT = NS_TOT + NS_K; N2_TOT = N2_TOT + N2_K
 
       ! 2) lignes des L(K,J<K) : echange en place dans l'arena (UFAC seul)
@@ -419,9 +419,7 @@ CONTAINS
           IF (I .LT. J) CYCLE
           MI = A%BEND(I) - A%BSTART(I) + 1
           IF (I .EQ. J) THEN
-            CALL SYM_UNPACK_LOWER(MI, A%DIAGP(I)%AP, DWORK, A%NB)
-            CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, WRECV(li), LTRECV(lj), DWORK, A%NB)
-            CALL SYM_PACK_LOWER(MI, DWORK, A%NB, A%DIAGP(I)%AP)
+            CALL SYM_PACKED_SCHUR_UPDATE(MI, A%DIAGP(I)%AP, KW, WRECV(li), LTRECV(lj), DWORK, A%NB)
           ELSE
             CALL SCHUR_UPDATE_BLR_BLOCK_ARENA(A%OFFBLK(li,lj), MI, NJ, KW, WRECV(li), LTRECV(lj), TOL, &
                                               A%ARENA, WS)
@@ -469,7 +467,7 @@ CONTAINS
     INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
     INTEGER :: NBLK, K, li, lj, I, KW, MI, MK, RS, RE, NROWTRAIL, C, IERR, P, MLOC
     INTEGER :: PROW_K, PCOL_K, STEP, NSTEPS, PBAR_STATE
-    LOGICAL :: PROGRESS
+    LOGICAL :: PROGRESS, OWNER
 
     PROGRESS = .FALSE.
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
@@ -579,72 +577,74 @@ CONTAINS
       CALL APPLY_DINV_LEFT(B_LOCAL(RS,1), LDB, KW, NRHS_LOC, A%IPIV(1:KW,K), A%DDIAG(1:KW,K), A%DSUB(1:KW,K))
     END DO
 
-    ! 3) remontee L^T (left-looking)
+    ! 3) L^T*Y = W, remontee "pleine largeur" : chaque processus recupere
+    !    une fois ses lignes de W sur TOUTE la largeur NRHS (XFULL, un
+    !    ALLGATHERV par ligne de grille). Etape K : la colonne PCOL_K calcule
+    !    sum_(I>K) L(I,K)^T*Y_I et la reduit sur (PROW_K,PCOL_K), proprietaire
+    !    du bloc diagonal, qui resout L_KK^T et diffuse Y_K sur sa ligne.
+    !    2 communications par etape, aucune diffusion du bloc diagonal.
     ALLOCATE(XFULL(MAX(MLOC,1),NRHS))
     XFULL = CZERO
+    ALLOCATE(XK_LOC(MAX(MLOC,1),MAX(NRHS_LOC,1)))
+    IF (MLOC.GT.0 .AND. NRHS_LOC.GT.0) XK_LOC(1:MLOC,1:NRHS_LOC) = B_LOCAL(1:MLOC,1:NRHS_LOC)
+    DO C = 0, GRID%PC-1
+      RCOUNTS(C) = MLOC*RLOCS(C); RDISPLS(C) = MLOC*(RSTARTS(C)-1)
+    END DO
+    CALL MPI_ALLGATHERV(XK_LOC, MLOC*NRHS_LOC, MPI_COMPLEX, XFULL, RCOUNTS, RDISPLS, MPI_COMPLEX, &
+                        GRID%ROW_COMM, IERR)
+    DEALLOCATE(XK_LOC)
     DO K = NBLK, 1, -1
       KW = A%BEND(K) - A%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
       PCOL_K = MOD(K-1, GRID%PC)
-      IF (K .LT. NBLK) THEN
-        IF (GRID%MYCOL .EQ. PCOL_K) THEN
-          ALLOCATE(S(KW,NRHS))
-          S = CZERO
-          lj = (K-1)/GRID%PC + 1
-          RS = 1
-          DO li = 1, A%NBLKR_LOC
-            I = (li-1)*GRID%PR + GRID%MYROW + 1
-            MK = A%BEND(I) - A%BSTART(I) + 1
-            IF (I .GT. K) CALL BLR_BLOCK_APPLY_T_ARENA(A%OFFBLK(li,lj), NRHS, CONE, XFULL(RS,1), MAX(MLOC,1), &
-                                                       CONE, S, KW)
-            RS = RS + MK
-          END DO
-          IF (GRID%MYROW .EQ. PROW_K) THEN
-            ALLOCATE(SSUM(KW,NRHS))
-          ELSE
-            ALLOCATE(SSUM(1,1))
+      OWNER = (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K)
+      IF (GRID%MYCOL.EQ.PCOL_K .AND. K.LT.NBLK) THEN
+        ALLOCATE(S(KW,NRHS))
+        S = CZERO
+        lj = (K-1)/GRID%PC + 1
+        RS = 1
+        DO li = 1, A%NBLKR_LOC
+          I = (li-1)*GRID%PR + GRID%MYROW + 1
+          MK = A%BEND(I) - A%BSTART(I) + 1
+          IF (I .GT. K) THEN
+            CALL BLR_BLOCK_APPLY_T_ARENA(A%OFFBLK(li,lj), NRHS, CONE, XFULL(RS,1), MAX(MLOC,1), CONE, S, KW)
           END IF
-          CALL MPI_REDUCE(S, SSUM, KW*NRHS, MPI_COMPLEX, MPI_SUM, PROW_K, GRID%COL_COMM, IERR)
-          DEALLOCATE(S)
-        END IF
+          RS = RS + MK
+        END DO
         IF (GRID%MYROW .EQ. PROW_K) THEN
-          IF (.NOT. ALLOCATED(SSUM)) ALLOCATE(SSUM(1,1))
-          ALLOCATE(SLOC(KW,MAX(NRHS_LOC,1)))
-          DO C = 0, GRID%PC-1
-            RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
-          END DO
-          CALL MPI_SCATTERV(SSUM, RCOUNTS, RDISPLS, MPI_COMPLEX, SLOC, KW*NRHS_LOC, MPI_COMPLEX, &
-                            PCOL_K, GRID%ROW_COMM, IERR)
-          IF (NRHS_LOC .GT. 0) THEN
-            RS = LOCAL_ROW_OFFSET_SYM_ARENA(A, GRID, K)
-            B_LOCAL(RS:RS+KW-1,1:NRHS_LOC) = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC) - SLOC(:,1:NRHS_LOC)
-          END IF
-          DEALLOCATE(SLOC)
+          ALLOCATE(SSUM(KW,NRHS))
+        ELSE
+          ALLOCATE(SSUM(1,1))
         END IF
-        IF (ALLOCATED(SSUM)) DEALLOCATE(SSUM)
+        CALL MPI_REDUCE(S, SSUM, KW*NRHS, MPI_COMPLEX, MPI_SUM, PROW_K, GRID%COL_COMM, IERR)
+        DEALLOCATE(S)
       END IF
       IF (GRID%MYROW .EQ. PROW_K) THEN
-        CALL BCAST_DIAG_LOWER_ARENA(A, K, KW, GRID%MYCOL.EQ.PCOL_K, PCOL_K, GRID%ROW_COMM, DKK)
+        ALLOCATE(XK_FULL(KW,NRHS))
         RS = LOCAL_ROW_OFFSET_SYM_ARENA(A, GRID, K)
-        IF (NRHS_LOC .GT. 0) CALL CTRSM('Left', 'Lower', 'Transpose', 'Unit', KW, NRHS_LOC, &
-                                         CONE, DKK, KW, B_LOCAL(RS,1), LDB)
-        DEALLOCATE(DKK)
-        ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)), XK_FULL(KW,NRHS))
-        IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
-        DO C = 0, GRID%PC-1
-          RCOUNTS(C) = KW*RLOCS(C); RDISPLS(C) = KW*(RSTARTS(C)-1)
-        END DO
-        CALL MPI_ALLGATHERV(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, XK_FULL, RCOUNTS, RDISPLS, MPI_COMPLEX, &
-                            GRID%ROW_COMM, IERR)
+        IF (OWNER) THEN
+          XK_FULL = XFULL(RS:RS+KW-1,1:NRHS)
+          IF (K .LT. NBLK) XK_FULL = XK_FULL - SSUM
+          ALLOCATE(DKK(KW,KW))
+          DKK = CZERO
+          CALL SYM_UNPACK_LOWER(KW, A%DIAGP(K)%AP, DKK, KW)
+          CALL CTRSM('Left', 'Lower', 'Transpose', 'Unit', KW, NRHS, CONE, DKK, KW, XK_FULL, KW)
+          DEALLOCATE(DKK)
+        END IF
+        CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
         XFULL(RS:RS+KW-1,1:NRHS) = XK_FULL
-        DEALLOCATE(XK_LOC, XK_FULL)
+        DEALLOCATE(XK_FULL)
       END IF
+      IF (ALLOCATED(SSUM)) DEALLOCATE(SSUM)
       STEP = STEP + 1
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Resolution LDLt arena', STEP, NSTEPS, PBAR_STATE)
       IF (PRESENT(PROGRESS_CALLBACK)) THEN
         IF (STAGE_PROGRESS_SHOULD_FIRE(STEP, NSTEPS)) CALL PROGRESS_CALLBACK(STEP, NSTEPS)
       END IF
     END DO
+    ! part locale (colonnes RSTARTS(MYCOL)...) de la solution pleine largeur
+    IF (MLOC.GT.0 .AND. NRHS_LOC.GT.0) &
+      B_LOCAL(1:MLOC,1:NRHS_LOC) = XFULL(1:MLOC, RSTARTS(GRID%MYCOL):RSTARTS(GRID%MYCOL)+NRHS_LOC-1)
     DEALLOCATE(XFULL)
 
     ! 4) Q^T

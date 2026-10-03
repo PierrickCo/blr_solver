@@ -703,7 +703,8 @@ CONTAINS
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
                                              N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
-                                             SHOW_PROGRESS, SHOW_RSS_TRACE, USE_MOVE_ALLOC, PROGRESS_CALLBACK)
+                                             SHOW_PROGRESS, SHOW_RSS_TRACE, USE_MOVE_ALLOC, PROGRESS_CALLBACK, &
+                                             T_BREAKDOWN)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)          :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(INOUT) :: A_BLR
@@ -729,6 +730,13 @@ CONTAINS
     ! franchissent chaque palier au meme K, pas d'ecart entre eux comme a
     ! l'assemblage. Absent par defaut, aucun surcout si non fourni.
     PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
+    ! T_BREAKDOWN (optionnel, MAX sur la grille, s) : (1) factorisation des
+    ! blocs diagonaux, (2) echanges de lignes/colonnes du pivot, (3) operations
+    ! de panneau (TRSM des panneaux L et U), (4) communications MPI (attentes
+    ! comprises), (5) Schur des blocs diagonaux, (6) Schur hors-diagonale,
+    ! (7) boucle complete. Chaque categorie est un MAX independant : leur
+    ! somme peut differer de (7).
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_BREAKDOWN(7)
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
@@ -737,7 +745,7 @@ CONTAINS
     INTEGER :: NBLK, K, li, lj, I, J, KW, MI, NJ, IINFO, INFO_STEP
     INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, NS_LOCAL, li_K, PBAR_STATE
     INTEGER(8) :: RS_LOCAL
-    DOUBLE PRECISION :: T0, T_FACTOR_L, RSS_MAX_MB
+    DOUBLE PRECISION :: T0, T_FACTOR_L, RSS_MAX_MB, TB(7), TT0, TLOOP0
     LOGICAL :: PROGRESS, RSS_TRACE
 
     ! Boucle K=1..NBLK GLOBALEMENT synchronisee (MPI_BCAST a chaque etape,
@@ -760,6 +768,8 @@ CONTAINS
     ALLOCATE(A_BLR%IPIV(A_BLR%NB, NBLK))
     A_BLR%IPIV = 0
     CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB)
+    TB = 0.0D0
+    TLOOP0 = MPI_WTIME()
 
     DO K = 1, NBLK
       KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
@@ -771,9 +781,12 @@ CONTAINS
 
       ! 1) facteur diagonal AVEC PIVOT (CGETRF), local au proprietaire
       IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) THEN
+        TT0 = MPI_WTIME()
         CALL CGETRF(KW, KW, A_BLR%DIAGBLK(K)%D, KW, IPIV_K, IINFO)
         IF (IINFO .NE. 0) INFO_STEP = A_BLR%BSTART(K) - 1 + IINFO
+        TB(1) = TB(1) + (MPI_WTIME() - TT0)
       END IF
+      TT0 = MPI_WTIME()
       CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
       IF (INFO_STEP .NE. 0) THEN
         INFO = INFO_STEP
@@ -784,11 +797,13 @@ CONTAINS
 
       ! Diffusion GLOBALE (voir commentaire de tete) -- petite (KW entiers)
       CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+      TB(4) = TB(4) + (MPI_WTIME() - TT0)
       A_BLR%IPIV(1:KW,K) = IPIV_K
 
       ! 2) propage le pivot aux AUTRES blocs de la MEME ligne-bloc K, deja
       !    stockes localement (J<K finalises, J>K encore bruts) -- SEUL le
       !    proprietaire de la ligne PROW_K en possede.
+      TT0 = MPI_WTIME()
       IF (GRID%MYROW .EQ. PROW_K) THEN
         li_K = (K-1)/GRID%PR + 1
         DO lj = 1, A_BLR%NBLKC_LOC
@@ -797,6 +812,7 @@ CONTAINS
           CALL BLR_BLOCK_ROW_SWAP(A_BLR%OFFBLK(li_K,lj), KW, IPIV_K)
         END DO
       END IF
+      TB(2) = TB(2) + (MPI_WTIME() - TT0)
       DO I = 1, KW
         IF (IPIV_K(I) .NE. I) NS_LOCAL = NS_LOCAL + 1
       END DO
@@ -808,8 +824,11 @@ CONTAINS
       !    unitaire sous la diagonale, U non-unitaire sur/au-dessus).
       ALLOCATE(DKK(KW,KW))
       IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
+      TT0 = MPI_WTIME()
       IF (GRID%MYROW .EQ. PROW_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
       IF (GRID%MYCOL .EQ. PCOL_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+      TB(4) = TB(4) + (MPI_WTIME() - TT0)
+      TT0 = MPI_WTIME()
 
       ! 4) U12 : la ligne PROW_K applique le TRSM sur SES blocs locaux
       !    (deja pivotes a l'etape 2 ci-dessus si J>K).
@@ -847,6 +866,8 @@ CONTAINS
         END DO
       END IF
       DEALLOCATE(DKK)
+      TB(3) = TB(3) + (MPI_WTIME() - TT0)
+      TT0 = MPI_WTIME()
 
       ! 6) diffusion des panneaux L/U DEJA COMPRESSES -- inchange.
       IF (GRID%MYCOL .EQ. PCOL_K) THEN
@@ -880,6 +901,7 @@ CONTAINS
           CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj))
         END DO
       END IF
+      TB(4) = TB(4) + (MPI_WTIME() - TT0)
 
       ! 7) mise a jour de Schur locale -- inchange.
       DO lj = 1, A_BLR%NBLKC_LOC
@@ -890,11 +912,14 @@ CONTAINS
           I = (li-1)*GRID%PR + GRID%MYROW + 1
           IF (I .LE. K) CYCLE
           MI = A_BLR%BEND(I) - A_BLR%BSTART(I) + 1
+          TT0 = MPI_WTIME()
           IF (I .EQ. J) THEN
             CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, LRECV(li), URECV(lj), A_BLR%DIAGBLK(I)%D, MI)
+            TB(5) = TB(5) + (MPI_WTIME() - TT0)
           ELSE
             CALL SCHUR_UPDATE_BLR_BLOCK(A_BLR%OFFBLK(li,lj), MI, NJ, KW, LRECV(li), URECV(lj), TOL, WS, &
                                          USE_MOVE_ALLOC=USE_MOVE_ALLOC)
+            TB(6) = TB(6) + (MPI_WTIME() - TT0)
           END IF
         END DO
       END DO
@@ -911,6 +936,8 @@ CONTAINS
       IF (RSS_TRACE) RSS_MAX_MB = MAX(RSS_MAX_MB, REAL(GET_RSS_KB(),8)/1024.0D0)
     END DO
     IF (RSS_TRACE) WRITE(6,'(A,F8.1,A)') '     [RSS trace] MAX observe pendant la factorisation = ', RSS_MAX_MB, ' Mo'
+    TB(7) = MPI_WTIME() - TLOOP0
+    IF (PRESENT(T_BREAKDOWN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN, 7, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
 
     DEALLOCATE(LRECV, URECV)
     CALL BLR_WORKSPACE_FREE(WS)

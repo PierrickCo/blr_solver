@@ -37,7 +37,7 @@ MAIN_OBJS = $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_
 
 LDLT_OBJS = $(LIBDIR)/mpi_blr_ldlt_mod.o $(LIBDIR)/mpi_blr_ldlt_arena_mod.o $(LIBDIR)/mpi_blr_ldlt_ooc_mod.o $(LIBDIR)/sym_testmat_mod.o
 
-all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/test_mpi_blr_ldlt_arena $(BINDIR)/test_mpi_blr_ldlt_ooc $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu $(BINDIR)/sweep_driver
+all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/test_mpi_blr_ldlt_arena $(BINDIR)/test_mpi_blr_ldlt_ooc $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu $(BINDIR)/sweep_driver $(BINDIR)/bench_diag_kernels
 
 $(LIBDIR)/mpi_blr_ldlt_mod.o: $(SRC)/mpi_blr_ldlt_mod.f90 $(MAIN)/mpi_blr_matrix_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_mod.f90 -o $@
@@ -65,6 +65,14 @@ $(LIBDIR)/sweep_driver.o: $(TEST)/sweep_driver.f90 $(LDLT_OBJS)
 
 $(BINDIR)/sweep_driver: $(MAIN_OBJS) $(LDLT_OBJS) $(LIBDIR)/sweep_driver.o
 	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
+
+# Micro-benchmark des noyaux diagonaux (sans MPI ; utilise CGEMMT, extension MKL :
+# pas de pendant dans Makefile.gcc).
+$(LIBDIR)/bench_diag_kernels.o: $(TEST)/bench_diag_kernels.f90 $(LIBDIR)/sym_testmat_mod.o
+	$(MPIFC) $(OPTF) -c $(TEST)/bench_diag_kernels.f90 -o $@
+
+$(BINDIR)/bench_diag_kernels: $(MAIN)/blr_kinds_mod.o $(LIBDIR)/sym_testmat_mod.o $(LIBDIR)/bench_diag_kernels.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(LIBS)
 
 $(LIBDIR)/sym_testmat_mod.o: $(SRC)/sym_testmat_mod.f90 $(MAIN)/blr_kinds_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/sym_testmat_mod.f90 -o $@
