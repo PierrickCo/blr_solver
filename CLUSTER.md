@@ -63,37 +63,43 @@ srun --cpu-bind=cores ./bin/test_mpi_blr_matrix 2 2 20000 500 100 1e-4
 complément plus robuste que le seul réglage de `OMP_NUM_THREADS`,
 particulièrement sur un nœud partagé entre plusieurs jobs.
 
-## 3. Scripts de balayage (`bench/`)
+## 3. Recherche des meilleurs paramètres (`tools/sweep_incore.sh`)
 
-Trois scripts réutilisables, avec sortie CSV et timeout de sécurité par
-run (`RUN_TIMEOUT`, défaut 300s) :
+Les anciens scripts `bench/` ont été retirés (commit `29ee771`). Le script
+`tools/sweep_incore.sh` les remplace : il cherche automatiquement les
+meilleurs réglages des solveurs **en mémoire** (LU et LDLᵀ, variantes
+classique et arena, pas d'out-of-core) sur la matrice de démo complexe
+symétrique, via le pilote `ldlt/bin/sweep_driver`, en phases successives :
+
+1. **TOL** : le plus grand TOL dont l'erreur reste ≤ `ERR_MAX` ;
+2. **NB** : la taille de bloc minimisant l'objectif ;
+3. **grille / threads** : PR × PC × `OMP_NUM_THREADS` = `CORES`, plusieurs formes ;
+4. **RATIO** (`COMPRESS_WORTHWHILE_RATIO`) ;
+5. **arena** au meilleur réglage (conseillée seulement si la RSS baisse).
+
+Chaque configuration est lancée `REPEATS` fois (médiane) ; en phase 2, parmi
+les NB à moins de `NEAR` (5 %) du meilleur temps on retient le moins gourmand
+en mémoire ; en phases 3-4 on ne quitte le réglage par défaut que pour un gain
+> `MIN_GAIN` (3 %) — garde-fous contre le bruit de mesure. Sorties dans
+`OUTDIR` : `runs.csv`, `summary.csv`, `decisions.txt`, `best_params.txt`
+(meilleurs paramètres, commandes d'exemple conseillées, et meilleures
+configurations mesurées par critère : factorisation, total, mémoire), `logs/`.
+`./tools/sweep_incore.sh --report OUTDIR` régénère le rapport sans relancer.
 
 ```bash
-# Taille de bloc optimale (voir aussi la section 4 ci-dessous)
-./bench/sweep_blocksize.sh [N] [NRHS] [TOL] [PR] [PC] [NB_LIST]
-#   defauts : 10000 100 1e-4 2 2 "50 100 200 300 500 750 1000 1500 2000"
-
-# Reaction au taux de compression (A et BLR+MPI uniquement -- seuls
-# solveurs ou TOL a un sens)
-./bench/sweep_tolerance.sh [N] [NB] [NRHS] [PR] [PC] [TOL_LIST]
-#   defauts : 10000 500 100 2 2 "1e-1 1e-2 1e-3 1e-4 1e-6 1e-8 1e-10"
-
-# Scalabilite forte : threads OpenMP (A/B/C) + grille MPI (MPI/BLR+MPI)
-./bench/sweep_scaling.sh [N] [NRHS] [NB] [TOL]
-#   defauts : 10000 100 500 1e-4
+make && make -C ldlt
+./tools/sweep_incore.sh                                # poste local : N=20000, CORES=$(nproc)
+N=100000 CORES=300 LAUNCH="srun -n" LAUNCH_THREADS_OPT="--cpus-per-task=" ./tools/sweep_incore.sh
 ```
 
-**Adaptation cluster** : surchargez `CORES_PER_NODE` si le script tourne
-sur un nœud de connexion différent des nœuds de calcul, ou si un
-scheduler restreint les cœurs réellement alloués :
+Toutes les options sont des variables d'environnement documentées en tête du
+script (`NB_LIST`, `TOL_LIST`, `THREADS_LIST`, `OBJECTIVE`, `ERR_MAX`,
+`TIMEOUT`...). Exemple de soumission Slurm : `tools/sweep_incore.slurm`.
 
-```bash
-CORES_PER_NODE=32 ./bench/sweep_blocksize.sh 20000 100 1e-4 4 4
-```
-
-Si le cluster utilise Slurm plutôt que `mpirun` directement, remplacer
-`mpirun -np N` par `srun -n N` dans les trois scripts (un seul type
-d'appel à changer, voir `bench/common.sh`).
+**Coût** : ~20 configurations × `REPEATS` × solveurs (≈120 runs par défaut).
+Chaque run calcule aussi B = A·Xexact par produit brut (non chronométré,
+O(N²/PR) évaluations du noyau par processus). À N=100000, prévoir plusieurs
+heures ; réduire `REPEATS`, `NB_LIST` ou `SOLVERS` si besoin.
 
 ## 4. Taille de bloc (`NB`) : ce qui la détermine
 
@@ -106,7 +112,7 @@ d'un compromis entre deux coûts qui évoluent en sens opposé avec `NB` :
 Ni l'un ni l'autre ne dépend du nombre de threads OpenMP (aucune boucle
 `!$OMP` dans ce module — le calcul est distribué par MPI, pas threadé en
 interne). Le point de croisement mesuré sur la machine de développement
-était `NB≈500` à N=10000-20000 ; **relancez `sweep_blocksize.sh` sur le
+était `NB≈500` à N=10000-20000 ; **relancez `tools/sweep_incore.sh` sur le
 cluster cible** plutôt que de réutiliser cette valeur telle quelle — le
 point de croisement dépend du débit mono-cœur de la machine, qui diffère
 d'un cluster à l'autre.

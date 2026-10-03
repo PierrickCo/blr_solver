@@ -1,0 +1,218 @@
+!===============================================================================
+! Pilote de balayage de parametres (utilise par tools/sweep_incore.sh) :
+! execute UNE configuration d'UN solveur en memoire sur la matrice de demo
+! complexe symetrique (sym_testmat_mod.f90) et imprime UNE ligne lisible par
+! machine :
+!
+!   SWEEP_RESULT solver=.. pr=.. pc=.. threads=.. n=.. nb=.. nrhs=.. tol=..
+!                ratio=.. rsvd=.. info=.. t_asm=.. t_fact=.. t_solve=..
+!                mem_max_mb=.. mem_tot_mb=.. rss_max_mb=.. err=..
+!
+! Solveurs : lu, lu_arena (MPI_BLR_MATRIX_*, pivot partiel confine) et
+! ldlt, ldlt_arena (ldlt/, Bunch-Kaufman confine) -- meme matrice, meme
+! second membre B = A*Xexact (produit brut sur la formule de A, non chrono-
+! metre), donc comparables directement.
+!   t_*        : MAX sur les processus (s)
+!   mem_*_mb   : memoire theorique des facteurs (max par processus / total)
+!   rss_max_mb : RSS reelle max par processus apres factorisation
+!   err        : ||X - Xexact|| / ||Xexact|| (calcule de facon distribuee)
+!
+! Usage : mpirun -np PR*PC ./sweep_driver SOLVER PR PC N NB NRHS TOL [RATIO] [USE_RSVD]
+!===============================================================================
+PROGRAM SWEEP_DRIVER
+  USE MPI_BLR_LDLT_MOD
+  USE MPI_BLR_LDLT_ARENA_MOD
+  USE MPI_BLR_MATRIX_MOD, ONLY: MPI_BLR_MATRIX_T, MPI_ASSEMBLE_BLR_MATRIX, MPI_BLR_MATRIX_LU_FACTOR_PIVOT, &
+                                MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D, MPI_BLR_MATRIX_MEMORY_BYTES, &
+                                MPI_BLR_MATRIX_ARENA_T, MPI_ASSEMBLE_BLR_MATRIX_ARENA, &
+                                MPI_BLR_MATRIX_LU_FACTOR_PIVOT_ARENA, MPI_BLR_MATRIX_LU_SOLVE_PIVOT_ARENA_2D, &
+                                MPI_BLR_MATRIX_ARENA_MEMORY_BYTES
+  USE SYM_TESTMAT_MOD
+  IMPLICIT NONE
+  INCLUDE 'mpif.h'
+
+  TYPE(GRID_T) :: GRID
+  CHARACTER(LEN=32) :: SOLVER, ARG
+  INTEGER :: PR, PC, N, NB, NRHS, USE_RSVD_INT, IERR, MYID0, INFO, MLOC, NRHS_LOC, RSTART_MINE
+  INTEGER :: NC, NO
+  INTEGER(8) :: RS, MEM_L, MEM_MAX, MEM_TOT
+  REAL(WP) :: TOL, RATIO, ERR
+  DOUBLE PRECISION :: T_ASM, T_FACT, T_SOLVE, T0, T_L, RSS_L, RSS_MAX
+  COMPLEX(WP), ALLOCATABLE :: BL(:,:)
+
+  CALL MPI_INIT(IERR)
+  CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
+  IF (COMMAND_ARGUMENT_COUNT() .LT. 7) THEN
+    IF (MYID0.EQ.0) WRITE(6,*) 'Usage: mpirun -np PR*PC ./sweep_driver SOLVER PR PC N NB NRHS TOL [RATIO] [USE_RSVD]'
+    CALL MPI_FINALIZE(IERR)
+    STOP 1
+  END IF
+  CALL GET_COMMAND_ARGUMENT(1, SOLVER)
+  CALL GET_COMMAND_ARGUMENT(2, ARG); READ(ARG,*) PR
+  CALL GET_COMMAND_ARGUMENT(3, ARG); READ(ARG,*) PC
+  CALL GET_COMMAND_ARGUMENT(4, ARG); READ(ARG,*) N
+  CALL GET_COMMAND_ARGUMENT(5, ARG); READ(ARG,*) NB
+  CALL GET_COMMAND_ARGUMENT(6, ARG); READ(ARG,*) NRHS
+  CALL GET_COMMAND_ARGUMENT(7, ARG); READ(ARG,*) TOL
+  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 1
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 8) THEN; CALL GET_COMMAND_ARGUMENT(8, ARG); READ(ARG,*) RATIO; END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 9) THEN; CALL GET_COMMAND_ARGUMENT(9, ARG); READ(ARG,*) USE_RSVD_INT; END IF
+  CALL SET_COMPRESS_WORTHWHILE_RATIO(RATIO)
+  CALL GRID_INIT(GRID, MPI_COMM_WORLD, PR, PC, IERR)
+  IF (IERR .NE. 0) THEN
+    IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR : PR*PC doit egaler le nombre de processus lances'
+    CALL MPI_FINALIZE(IERR)
+    STOP 1
+  END IF
+  CALL SYM_TESTMAT_SETUP(N, NB)
+  CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, GRID%MYCOL, RSTART_MINE, NRHS_LOC)
+  INFO = 0
+
+  SELECT CASE (TRIM(SOLVER))
+  CASE ('lu');         CALL RUN_LU(.FALSE.)
+  CASE ('lu_arena');   CALL RUN_LU(.TRUE.)
+  CASE ('ldlt');       CALL RUN_LDLT()
+  CASE ('ldlt_arena'); CALL RUN_LDLT_ARENA()
+  CASE DEFAULT
+    IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR : SOLVER inconnu (lu|lu_arena|ldlt|ldlt_arena) : ', TRIM(SOLVER)
+    CALL MPI_FINALIZE(IERR)
+    STOP 1
+  END SELECT
+
+  CALL MPI_ALLREDUCE(MEM_L, MEM_MAX, 1, MPI_INTEGER8, MPI_MAX, GRID%COMM, IERR)
+  CALL MPI_ALLREDUCE(MEM_L, MEM_TOT, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+  CALL MPI_ALLREDUCE(RSS_L, RSS_MAX, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+  IF (MYID0 .EQ. 0) THEN
+    WRITE(6,'(A,A,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2,A,F6.3,A,I0,A,I0,A,F0.4,A,F0.4,A,F0.4,A,F0.2,A,F0.2,A,F0.1,A,ES10.3)') &
+         'SWEEP_RESULT solver=', TRIM(SOLVER), ' pr=', PR, ' pc=', PC, ' threads=', OMP_GET_MAX_THREADS(), &
+         ' n=', N, ' nb=', NB, ' nrhs=', NRHS, ' tol=', TOL, ' ratio=', RATIO, ' rsvd=', USE_RSVD_INT, &
+         ' info=', INFO, ' t_asm=', T_ASM, ' t_fact=', T_FACT, ' t_solve=', T_SOLVE, &
+         ' mem_max_mb=', REAL(MEM_MAX,8)/1048576.0D0, ' mem_tot_mb=', REAL(MEM_TOT,8)/1048576.0D0, &
+         ' rss_max_mb=', RSS_MAX, ' err=', ERR
+  END IF
+  CALL MPI_FINALIZE(IERR)
+
+CONTAINS
+
+  ! B_LOCAL = A*Xexact sur les lignes locales (blocs-lignes cycliques de NB).
+  SUBROUTINE FILL_B_EXACT(NBLKR_LOC, BSTART, BEND)
+    INTEGER, INTENT(IN) :: NBLKR_LOC, BSTART(:), BEND(:)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: AROWS(:,:), XEX(:,:)
+    INTEGER :: li, I, BSZ, RSL, GI, R
+    MLOC = 0
+    DO li = 1, NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      MLOC = MLOC + BEND(I) - BSTART(I) + 1
+    END DO
+    ALLOCATE(BL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
+    IF (NRHS_LOC .LE. 0) RETURN
+    ALLOCATE(XEX(N,NRHS_LOC))
+    DO R = 1, NRHS_LOC
+      DO GI = 1, N
+        XEX(GI,R) = SYM_XEX(GI, RSTART_MINE+R-1)
+      END DO
+    END DO
+    RSL = 1
+    DO li = 1, NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      BSZ = BEND(I) - BSTART(I) + 1
+      ALLOCATE(AROWS(BSZ,N))
+      CALL SYM_GET_BLOCK(BSTART(I), BEND(I), 1, N, AROWS)
+      CALL CGEMM('N', 'N', BSZ, NRHS_LOC, N, CONE, AROWS, BSZ, XEX, N, CZERO, BL(RSL,1), MAX(MLOC,1))
+      DEALLOCATE(AROWS)
+      RSL = RSL + BSZ
+    END DO
+    DEALLOCATE(XEX)
+  END SUBROUTINE FILL_B_EXACT
+
+  ! ||X - Xexact|| / ||Xexact|| sans rassembler X (sommes locales + reduction).
+  SUBROUTINE COMPUTE_ERR(NBLKR_LOC, BSTART, BEND)
+    INTEGER, INTENT(IN) :: NBLKR_LOC, BSTART(:), BEND(:)
+    REAL(WP) :: SL(2), SG(2)
+    INTEGER :: li, I, RSL, GI, R, IERR2
+    SL = 0.0_WP
+    RSL = 1
+    DO li = 1, NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO GI = BSTART(I), BEND(I)
+        DO R = 1, NRHS_LOC
+          SL(1) = SL(1) + ABS(BL(RSL+GI-BSTART(I),R) - SYM_XEX(GI, RSTART_MINE+R-1))**2
+          SL(2) = SL(2) + ABS(SYM_XEX(GI, RSTART_MINE+R-1))**2
+        END DO
+      END DO
+      RSL = RSL + BEND(I) - BSTART(I) + 1
+    END DO
+    CALL MPI_ALLREDUCE(SL, SG, 2, MPI_REAL, MPI_SUM, GRID%COMM, IERR2)
+    ERR = SQRT(SG(1)/MAX(SG(2),TINY(1.0_WP)))
+  END SUBROUTINE COMPUTE_ERR
+
+  SUBROUTINE RUN_LU(ARENA)
+    LOGICAL, INTENT(IN) :: ARENA
+    TYPE(MPI_BLR_MATRIX_T) :: AL
+    TYPE(MPI_BLR_MATRIX_ARENA_T) :: AA
+    INTEGER :: IERR2
+    IF (ARENA) THEN
+      CALL MPI_ASSEMBLE_BLR_MATRIX_ARENA(GRID, N, NB, TOL, SYM_GET_BLOCK, AA, T_ASM, NC, NO, RS, &
+                                         USE_RSVD=(USE_RSVD_INT.NE.0))
+      CALL MPI_ALLREDUCE(MPI_IN_PLACE, T_ASM, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR2)
+      CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT_ARENA(GRID, AA, TOL, INFO, NC, NO, RS, T_FACTOR=T_FACT)
+      MEM_L = MPI_BLR_MATRIX_ARENA_MEMORY_BYTES(AA)
+      RSS_L = REAL(GET_RSS_KB(),8)/1024.0D0
+      CALL FILL_B_EXACT(AA%NBLKR_LOC, AA%BSTART, AA%BEND)
+      CALL MPI_BARRIER(GRID%COMM, IERR2)
+      T0 = MPI_WTIME()
+      CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_ARENA_2D(GRID, AA, NRHS, NRHS_LOC, BL, MAX(MLOC,1))
+      T_L = MPI_WTIME() - T0
+      CALL COMPUTE_ERR(AA%NBLKR_LOC, AA%BSTART, AA%BEND)
+    ELSE
+      CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, SYM_GET_BLOCK, AL, T_ASM, NC, NO, RS, &
+                                   USE_RSVD=(USE_RSVD_INT.NE.0))
+      CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, AL, TOL, INFO, NC, NO, RS, T_FACTOR=T_FACT)
+      MEM_L = MPI_BLR_MATRIX_MEMORY_BYTES(AL)
+      RSS_L = REAL(GET_RSS_KB(),8)/1024.0D0
+      CALL FILL_B_EXACT(AL%NBLKR_LOC, AL%BSTART, AL%BEND)
+      CALL MPI_BARRIER(GRID%COMM, IERR2)
+      T0 = MPI_WTIME()
+      CALL MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, AL, NRHS, NRHS_LOC, BL, MAX(MLOC,1))
+      T_L = MPI_WTIME() - T0
+      CALL COMPUTE_ERR(AL%NBLKR_LOC, AL%BSTART, AL%BEND)
+    END IF
+    CALL MPI_ALLREDUCE(T_L, T_SOLVE, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR2)
+  END SUBROUTINE RUN_LU
+
+  SUBROUTINE RUN_LDLT()
+    TYPE(MPI_BLR_SYM_T) :: AS
+    INTEGER :: IERR2
+    CALL MPI_ASSEMBLE_BLR_SYM(GRID, N, NB, TOL, SYM_GET_BLOCK, AS, T_ASM, NC, NO, RS, USE_RSVD=(USE_RSVD_INT.NE.0))
+    CALL MPI_BLR_SYM_LDLT_FACTOR(GRID, AS, TOL, INFO, NC, NO, RS, T_FACTOR=T_FACT)
+    MEM_L = MPI_BLR_SYM_MEMORY_BYTES(AS)
+    RSS_L = REAL(GET_RSS_KB(),8)/1024.0D0
+    CALL FILL_B_EXACT(AS%NBLKR_LOC, AS%BSTART, AS%BEND)
+    CALL MPI_BARRIER(GRID%COMM, IERR2)
+    T0 = MPI_WTIME()
+    CALL MPI_BLR_SYM_LDLT_SOLVE_2D(GRID, AS, NRHS, NRHS_LOC, BL, MAX(MLOC,1))
+    T_L = MPI_WTIME() - T0
+    CALL COMPUTE_ERR(AS%NBLKR_LOC, AS%BSTART, AS%BEND)
+    CALL MPI_ALLREDUCE(T_L, T_SOLVE, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR2)
+    CALL MPI_BLR_SYM_FREE(AS)
+  END SUBROUTINE RUN_LDLT
+
+  SUBROUTINE RUN_LDLT_ARENA()
+    TYPE(MPI_BLR_SYM_ARENA_T) :: AA
+    INTEGER :: IERR2
+    CALL MPI_ASSEMBLE_BLR_SYM_ARENA(GRID, N, NB, TOL, SYM_GET_BLOCK, AA, T_ASM, NC, NO, RS, USE_RSVD=(USE_RSVD_INT.NE.0))
+    CALL MPI_BLR_SYM_LDLT_FACTOR_ARENA(GRID, AA, TOL, INFO, NC, NO, RS, T_FACTOR=T_FACT)
+    MEM_L = MPI_BLR_SYM_ARENA_MEMORY_BYTES(AA)
+    RSS_L = REAL(GET_RSS_KB(),8)/1024.0D0
+    CALL FILL_B_EXACT(AA%NBLKR_LOC, AA%BSTART, AA%BEND)
+    CALL MPI_BARRIER(GRID%COMM, IERR2)
+    T0 = MPI_WTIME()
+    CALL MPI_BLR_SYM_LDLT_SOLVE_ARENA_2D(GRID, AA, NRHS, NRHS_LOC, BL, MAX(MLOC,1))
+    T_L = MPI_WTIME() - T0
+    CALL COMPUTE_ERR(AA%NBLKR_LOC, AA%BSTART, AA%BEND)
+    CALL MPI_ALLREDUCE(T_L, T_SOLVE, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR2)
+    CALL MPI_BLR_SYM_ARENA_FREE(AA)
+  END SUBROUTINE RUN_LDLT_ARENA
+
+END PROGRAM SWEEP_DRIVER

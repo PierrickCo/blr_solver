@@ -65,3 +65,6 @@ blr_structure.png
 # dans build/, executable a la racine du dossier.
 user_case_dev/build/
 user_case_dev/example_blr_mpi_pivot_user
+
+# Resultats de tools/sweep_incore.sh (regenerables)
+sweep_results_*/

@@ -30,7 +30,7 @@ MAIN_OBJS = $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_
 
 LDLT_OBJS = $(BUILDDIR)/mpi_blr_ldlt_mod.o $(BUILDDIR)/mpi_blr_ldlt_arena_mod.o $(BUILDDIR)/mpi_blr_ldlt_ooc_mod.o $(BUILDDIR)/sym_testmat_mod.o
 
-all: $(BUILDDIR)/test_mpi_blr_ldlt $(BUILDDIR)/test_mpi_blr_ldlt_arena $(BUILDDIR)/test_mpi_blr_ldlt_ooc $(BUILDDIR)/example_blr_mpi_ldlt $(BUILDDIR)/bench_ldlt_vs_lu
+all: $(BUILDDIR)/test_mpi_blr_ldlt $(BUILDDIR)/test_mpi_blr_ldlt_arena $(BUILDDIR)/test_mpi_blr_ldlt_ooc $(BUILDDIR)/example_blr_mpi_ldlt $(BUILDDIR)/bench_ldlt_vs_lu $(BUILDDIR)/sweep_driver
 
 $(BUILDDIR)/mpi_blr_ldlt_mod.o: $(SRC)/mpi_blr_ldlt_mod.f90 $(MAIN)/mpi_blr_matrix_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_mod.f90 -o $@
@@ -51,6 +51,12 @@ $(BUILDDIR)/test_mpi_blr_ldlt_ooc.o: $(TEST)/test_mpi_blr_ldlt_ooc.f90 $(LDLT_OB
 	$(MPIFC) $(OPTF) -c $(TEST)/test_mpi_blr_ldlt_ooc.f90 -o $@
 
 $(BUILDDIR)/test_mpi_blr_ldlt_ooc: $(MAIN_OBJS) $(LDLT_OBJS) $(BUILDDIR)/test_mpi_blr_ldlt_ooc.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
+
+$(BUILDDIR)/sweep_driver.o: $(TEST)/sweep_driver.f90 $(LDLT_OBJS)
+	$(MPIFC) $(OPTF) -c $(TEST)/sweep_driver.f90 -o $@
+
+$(BUILDDIR)/sweep_driver: $(MAIN_OBJS) $(LDLT_OBJS) $(BUILDDIR)/sweep_driver.o
 	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
 
 $(BUILDDIR)/sym_testmat_mod.o: $(SRC)/sym_testmat_mod.f90 $(MAIN)/blr_kinds_mod.o

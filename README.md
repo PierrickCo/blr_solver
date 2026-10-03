@@ -118,8 +118,8 @@ blr_solver/
 ├── test/              drivers de validation et de benchmark, un par module
 ├── examples/          programmes courts, un par paradigme -- prise en main
 │                      rapide de l'API (voir examples/README.md)
-├── bench/             scripts de balayage reutilisables (taille de bloc,
-│                      tolerance, scalabilite) -- voir CLUSTER.md
+├── tools/             sweep_incore.sh (recherche des meilleurs parametres,
+│                      voir CLUSTER.md), analyze_deps.py
 ├── ldlt/              LDLt BLR+MPI pour matrices complexes symetriques
 │                      (Bunch-Kaufman confine) -- voir ldlt/README.md
 ├── legacy/            code mis de cote (LDLt, ancienne lignee MPI a
