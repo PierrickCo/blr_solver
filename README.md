@@ -108,7 +108,7 @@ make
 
 Le dépôt est vérifié en continu par une CI GitHub Actions (chaîne
 gcc+BLAS/LAPACK+OpenMPI, voir [`.github/workflows/ci.yml`](.github/workflows/ci.yml))
-à chaque push/pull request sur `main`.
+à chaque push/pull request sur `master` (ou `main`).
 
 ## Structure du dépôt
 
