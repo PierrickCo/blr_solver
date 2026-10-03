@@ -1518,6 +1518,37 @@ CONTAINS
   END SUBROUTINE COMPRESS_BLOCK_ARENA
 
   !-----------------------------------------------------------------------
+  ! Copie un BLR_BLOCK_T ordinaire (ex. issu de COMPRESS_BLOCK_RSVD_
+  ! ADAPTIVE) dans un bloc ARENA, en carvant DENSE ou UFAC/VFAC dans ARENA
+  ! (memes appels ARENA_CARVE_REUSE que COMPRESS_BLOCK_ARENA).
+  !-----------------------------------------------------------------------
+  SUBROUTINE COPY_REGULAR_TO_ARENA(SRC, DST, ARENA)
+    TYPE(BLR_BLOCK_T), INTENT(IN)            :: SRC
+    TYPE(BLR_BLOCK_ARENA_T), INTENT(OUT)     :: DST
+    TYPE(BLR_ARENA_T), INTENT(INOUT), TARGET :: ARENA
+    COMPLEX(WP), POINTER :: FLAT(:)
+    INTEGER :: M, N, R
+    M = SRC%M; N = SRC%N; R = SRC%RANK
+    DST%M = M; DST%N = N
+    DST%IS_LOWRANK = SRC%IS_LOWRANK
+    IF (SRC%IS_LOWRANK) THEN
+      DST%RANK = R
+      FLAT => ARENA_CARVE_REUSE(ARENA, DST%UFAC_FLAT, INT(M,8)*INT(R,8))
+      DST%UFAC(1:M,1:R) => FLAT
+      FLAT => ARENA_CARVE_REUSE(ARENA, DST%VFAC_FLAT, INT(R,8)*INT(N,8))
+      DST%VFAC(1:R,1:N) => FLAT
+      IF (R .GT. 0) THEN
+        DST%UFAC = SRC%UFAC
+        DST%VFAC = SRC%VFAC
+      END IF
+    ELSE
+      FLAT => ARENA_CARVE_REUSE(ARENA, DST%DENSE_FLAT, INT(M,8)*INT(N,8))
+      DST%DENSE(1:M,1:N) => FLAT
+      IF (M.GT.0 .AND. N.GT.0) DST%DENSE = SRC%DENSE
+    END IF
+  END SUBROUTINE COPY_REGULAR_TO_ARENA
+
+  !-----------------------------------------------------------------------
   ! Equivalents EXPAND_BLOCK / BLR_BLOCK_ROW_SWAP / BLR_TRSM_*/
   ! BLR_BLOCK_APPLY, corps STRICTEMENT IDENTIQUE aux versions non-arena --
   ! seule la declaration de type de BLK differe (Fortran l'exige).

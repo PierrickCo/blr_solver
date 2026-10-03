@@ -36,7 +36,7 @@
 !         [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [WAVENUMBER] [USE_RSVD]
 !         MODE = 'classical' ou 'ooc' (obligatoire).
 !         (defauts : N=8000 NB=400 NRHS=6 TOL=1e-4 MAX_MB_PER_PROCESS=16
-!          NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch_bench_geo WAVENUMBER=8.0 USE_RSVD=0)
+!          NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch_bench_geo WAVENUMBER=8.0 USE_RSVD=1)
 !         USE_RSVD=1 : compression a l'assemblage par SVD randomisee adaptative
 !         (COMPRESS_BLOCK_RSVD_ADAPTIVE) au lieu de CGESVD -- dans les DEUX modes.
 !         En mode classical, B=A*Xexact reste construit avec CGESVD (A_CL_FOR_B) :
@@ -90,7 +90,7 @@ PROGRAM BENCH_BLR_MPI_PIVOT_OOC_GEOMETRIC
 
   N = 8000; NB = 400; NRHS = 6; TOL = 1.0E-4_WP
   MAX_MB_PER_PROCESS = 16.0_WP; NRHS_BATCH = 2; SCRATCH_DIR = './blr_ooc_scratch_bench_geo'
-  WAVENUMBER = 8.0_WP; USE_RSVD_INT = 0
+  WAVENUMBER = 8.0_WP; USE_RSVD_INT = 1
 
   IF (COMMAND_ARGUMENT_COUNT() .LT. 3) THEN
     IF (MYID0.EQ.0) WRITE(6,*) &

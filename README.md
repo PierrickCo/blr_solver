@@ -76,6 +76,13 @@ calcul). Il existe en quatre variantes, toutes validées :
   du bloc diagonal courant — plus faible qu'un pivotage global, mais c'est
   exactement le compromis utilisé en production par MUMPS/STRUMPACK
   (pivotage confiné au front).
+- **Compression à l'assemblage par SVD randomisée adaptative, par défaut**
+  (depuis 2026-10-03, `COMPRESS_BLOCK_RSVD_ADAPTIVE`) : mesurée ×9-12 plus
+  rapide que `CGESVD` sur l'assemblage complet à N=20000, même rang et même
+  erreur. Garantie heuristique (pas de preuve formelle), avec une zone
+  morte étroite près du plafond `RATIO` où elle replie en dense là où
+  `CGESVD` aurait compressé (jamais de corruption). `--use-rsvd=0` dans les
+  exemples, ou `USE_RSVD=.FALSE.` dans l'API, rétablit `CGESVD`.
 - **Pas de sparsité générale** : matrices denses uniquement (la compression
   BLR exploite la structure basse-rang, pas la sparsité).
 - **Code mis de côté** : une première tentative LDLt+BLR a été abandonnée

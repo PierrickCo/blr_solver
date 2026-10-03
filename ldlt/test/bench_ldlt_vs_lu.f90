@@ -10,7 +10,7 @@
 ! l'autre dans le meme processus (le premier est libere avant le second).
 !
 ! Usage : mpirun -np PR*PC ./bench_ldlt_vs_lu PR PC [N] [NB] [NRHS] [TOL] [USE_RSVD] [STRONG] [DIAG]
-!         (defauts 8000 400 8 1e-4 0 50 0.01)
+!         (defauts 8000 400 8 1e-4 1 50 0.01)
 !===============================================================================
 PROGRAM BENCH_LDLT_VS_LU
   USE MPI_BLR_LDLT_MOD
@@ -33,7 +33,7 @@ PROGRAM BENCH_LDLT_VS_LU
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
-  N = 8000; NB = 400; NRHS = 8; TOL = 1.0E-4_WP; USE_RSVD_INT = 0; STRONG = 50.0_WP; DIAG = 0.01_WP
+  N = 8000; NB = 400; NRHS = 8; TOL = 1.0E-4_WP; USE_RSVD_INT = 1; STRONG = 50.0_WP; DIAG = 0.01_WP
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'Usage: mpirun -np PR*PC ./bench_ldlt_vs_lu PR PC [N] [NB] [NRHS] [TOL] [USE_RSVD] [STRONG] [DIAG]'
     CALL MPI_FINALIZE(IERR)

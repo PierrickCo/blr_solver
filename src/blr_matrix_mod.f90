@@ -80,7 +80,7 @@ CONTAINS
   !-----------------------------------------------------------------------
   SUBROUTINE ASSEMBLE_BLR_MATRIX(N, NB, TOL, GET_BLOCK, A_BLR, &
                                   T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
-                                  SHOW_PROGRESS)
+                                  SHOW_PROGRESS, USE_RSVD)
     INTEGER, INTENT(IN)          :: N, NB
     REAL(WP), INTENT(IN)         :: TOL
     PROCEDURE(GET_BLOCK_IFACE)   :: GET_BLOCK
@@ -89,8 +89,13 @@ CONTAINS
     INTEGER, INTENT(OUT)         :: N_COMPRESSED, N_OFFDIAG
     INTEGER(8), INTENT(OUT)      :: RANK_SUM
     LOGICAL, INTENT(IN), OPTIONAL :: SHOW_PROGRESS
+    ! USE_RSVD (defaut .TRUE.) : SVD randomisee adaptative ; .FALSE. =
+    ! CGESVD avec workspace par thread. RANDOM_NUMBER est thread-safe
+    ! (ifx/gfortran), suites differentes d'un thread a l'autre.
+    LOGICAL, INTENT(IN), OPTIONAL :: USE_RSVD
 
     DOUBLE PRECISION :: T0
+    LOGICAL :: RSVD_FLAG
     COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
     INTEGER :: I, J, MI, NJ, NDONE, NTOTAL, NTHREADS, TID, PBAR_STATE
     LOGICAL :: PROGRESS
@@ -98,6 +103,8 @@ CONTAINS
 
     PROGRESS = .FALSE.
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS
+    RSVD_FLAG = .TRUE.
+    IF (PRESENT(USE_RSVD)) RSVD_FLAG = USE_RSVD
 
     ! La double boucle I,J est independante (chaque (I,J) ecrit dans une
     ! case disjointe de DIAGBLK/OFFBLK) -- un workspace SVD par thread
@@ -128,7 +135,7 @@ CONTAINS
     ! pas le total reel avant la toute fin -- ici il est incremente et lu
     ! DANS la meme section critique que l'affichage, pour un pourcentage
     ! exact malgre le parallelisme.
-    !$OMP PARALLEL DO PRIVATE(I, J, MI, NJ, TMP) COLLAPSE(2) &
+    !$OMP PARALLEL DO PRIVATE(I, J, MI, NJ, TMP) SHARED(RSVD_FLAG) COLLAPSE(2) &
     !$OMP   REDUCTION(+:N_OFFDIAG, N_COMPRESSED, RANK_SUM) SCHEDULE(DYNAMIC)
     DO I = 1, A_BLR%NBLK
       DO J = 1, A_BLR%NBLK
@@ -140,7 +147,11 @@ CONTAINS
         ELSE
           ALLOCATE(TMP(MI,NJ))
           CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMP)
-          CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(I,J), WSARR(OMP_GET_THREAD_NUM()+1))
+          IF (RSVD_FLAG) THEN
+            CALL COMPRESS_BLOCK_RSVD_ADAPTIVE(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(I,J))
+          ELSE
+            CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(I,J), WSARR(OMP_GET_THREAD_NUM()+1))
+          END IF
           N_OFFDIAG = N_OFFDIAG + 1
           IF (A_BLR%OFFBLK(I,J)%IS_LOWRANK) THEN
             N_COMPRESSED = N_COMPRESSED + 1

@@ -64,7 +64,7 @@ PROGRAM EXAMPLE_BLR_MPI_LDLT
 
   N = 4000; NB = 200; NRHS = 4; TOL = 1.0E-4_WP; EPS = 0.0_WP; RATIO = 1.0_WP/3.0_WP
   WAVENUMBER = 8.0_WP; STRONG = 50.0_WP; DIAG = 0.01_WP
-  USE_MOVE_ALLOC_INT = 0; USE_RSVD_INT = 0; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0
+  USE_MOVE_ALLOC_INT = 0; USE_RSVD_INT = 1; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0
   PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0; NRHS_BATCH = 0; PROF_N = 0
 
   CALL MPI_INIT(IERR)
@@ -338,7 +338,7 @@ CONTAINS
     WRITE(6,'(A)') '  --use-move-alloc=0|1    (defaut 0) transfert MOVE_ALLOC au lieu de copie (Schur)'
     WRITE(6,'(A)') '  --eps=REEL              (defaut 0.0) bruit plein-rang symetrique (compressibilite)'
     WRITE(6,'(A)') '  --ratio=REEL            (defaut 0.333) COMPRESS_WORTHWHILE_RATIO'
-    WRITE(6,'(A)') '  --use-rsvd=0|1          (defaut 0) SVD randomisee adaptative au lieu de CGESVD'
+    WRITE(6,'(A)') '  --use-rsvd=0|1          (defaut 1) SVD randomisee adaptative ; 0 = CGESVD complete'
     WRITE(6,'(A)') '  --check-error=0|1       (defaut 0) verification B=A*Xexact'
     WRITE(6,'(A)') '  --check-residual=0|1    (defaut 0) verification ||A*X-B||/||B||'
     WRITE(6,'(A)') '  --profile-usage=0|1     (defaut 0) trace RSS/CPU par etape (usage_profile_rank<N>.csv)'

@@ -43,7 +43,7 @@
 ! strict. Effet surtout visible pres du plafond (voir
 ! test/bench_blr_mpi_pivot_ratio.f90).
 !
-! USE_RSVD (defaut 0) : 0=SVD complete (CGESVD, rang optimal garanti) ;
+! USE_RSVD (defaut 1) : 0=SVD complete (CGESVD, rang optimal garanti) ;
 ! 1=SVD randomisee adaptative (COMPRESS_BLOCK_RSVD_ADAPTIVE) -- mesuree
 ! x34-54 plus rapide, erreur du meme ordre, mais heuristique (pas de
 ! preuve formelle) avec une zone morte pres du plafond RATIO (replie en
@@ -172,7 +172,7 @@ PROGRAM EXAMPLE_BLR_MPI_PIVOT
   REAL :: PROF_CPU_PREV
 
   N = 4000; NB = 200; NRHS = 4; TOL = 1.0E-4_WP; USE_MOVE_ALLOC_INT = 0; EPS = 0.0_WP
-  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0; PROFILE_USAGE_INT = 0
+  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 1; CHECK_ERROR_INT = 0; CHECK_RESIDUAL_INT = 0; PROFILE_USAGE_INT = 0
   DUMP_STRUCTURE_INT = 0
   SAVE_MATRIX_INT = 0; SAVE_RHS_INT = 0; SAVE_FACTORED_INT = 0; SAVE_SOLUTION_INT = 0
   LOAD_MATRIX_INT = 0; LOAD_FACTORED_INT = 0; LOAD_RHS_INT = 0; CHECKPOINT_DIR = '.'
@@ -685,7 +685,7 @@ CONTAINS
     WRITE(6,'(A)') '  --use-move-alloc=0|1    (defaut 0) transfert MOVE_ALLOC au lieu de copie (Schur)'
     WRITE(6,'(A)') '  --eps=REEL              (defaut 0.0) bruit plein-rang (compressibilite)'
     WRITE(6,'(A)') '  --ratio=REEL            (defaut 0.333) COMPRESS_WORTHWHILE_RATIO'
-    WRITE(6,'(A)') '  --use-rsvd=0|1          (defaut 0) SVD randomisee adaptative au lieu de CGESVD'
+    WRITE(6,'(A)') '  --use-rsvd=0|1          (defaut 1) SVD randomisee adaptative ; 0 = CGESVD complete'
     WRITE(6,'(A)') '  --check-error=0|1       (defaut 0) verification B=A*Xexact'
     WRITE(6,'(A)') '  --check-residual=0|1    (defaut 0) verification ||A*X-B||/||B||'
     WRITE(6,'(A)') '  --profile-usage=0|1     (defaut 0) trace RSS/CPU par etape (usage_profile_rank<N>.csv)'

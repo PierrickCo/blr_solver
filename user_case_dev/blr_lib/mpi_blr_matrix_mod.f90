@@ -292,7 +292,8 @@ CONTAINS
     INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
     INTEGER(8), INTENT(OUT)         :: RANK_SUM
     LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
-    ! USE_RSVD (defaut .FALSE., aucun changement de comportement si absent) :
+    ! USE_RSVD (defaut .TRUE. depuis 2026-10-03 -- passer .FALSE. pour
+    ! revenir a la SVD complete CGESVD, rang optimal garanti) :
     ! remplace la SVD complete (COMPRESS_BLOCK, CGESVD) par la SVD
     ! randomisee ADAPTATIVE (COMPRESS_BLOCK_RSVD_ADAPTIVE, blr_compress_
     ! mod.f90 -- rang decouvert par doublement, TOL seul, sans connaissance
@@ -345,7 +346,7 @@ CONTAINS
     LOGICAL :: PROGRESS, RSVD_FLAG
     INTEGER :: RSVD_OVS, RSVD_NPOW
 
-    RSVD_FLAG = .FALSE.
+    RSVD_FLAG = .TRUE.
     IF (PRESENT(USE_RSVD)) RSVD_FLAG = USE_RSVD
     RSVD_OVS = 10; IF (PRESENT(RSVD_OVERSAMPLE)) RSVD_OVS = RSVD_OVERSAMPLE
     RSVD_NPOW = 1; IF (PRESENT(RSVD_NPOWER)) RSVD_NPOW = RSVD_NPOWER
@@ -1488,7 +1489,7 @@ CONTAINS
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_ARENA(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
                                             T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
-                                            SHOW_PROGRESS)
+                                            SHOW_PROGRESS, USE_RSVD)
     TYPE(GRID_T), INTENT(IN)        :: GRID
     INTEGER, INTENT(IN)             :: N, NB
     REAL(WP), INTENT(IN)            :: TOL
@@ -1498,8 +1499,14 @@ CONTAINS
     INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
     INTEGER(8), INTENT(OUT)         :: RANK_SUM
     LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
+    ! USE_RSVD (defaut .TRUE.) : SVD randomisee adaptative dans un bloc
+    ! ordinaire, puis copie dans l'arena (COPY_REGULAR_TO_ARENA) ; .FALSE. =
+    ! CGESVD directement dans l'arena (COMPRESS_BLOCK_ARENA).
+    LOGICAL, INTENT(IN), OPTIONAL   :: USE_RSVD
 
     COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
+    TYPE(BLR_BLOCK_T) :: TMPBLK
+    LOGICAL :: RSVD_FLAG
     INTEGER :: li, lj, I, J, MI, NJ, NC_LOCAL, NO_LOCAL, IERR, NDONE, NTOTAL, LAST_PCT
     INTEGER(8) :: RS_LOCAL
     DOUBLE PRECISION :: T0
@@ -1509,6 +1516,8 @@ CONTAINS
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
     NDONE = 0
     LAST_PCT = -5
+    RSVD_FLAG = .TRUE.
+    IF (PRESENT(USE_RSVD)) RSVD_FLAG = USE_RSVD
 
     T0 = MPI_WTIME()
     CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
@@ -1534,7 +1543,12 @@ CONTAINS
         ELSE
           ALLOCATE(TMP(MI,NJ))
           CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMP)
-          CALL COMPRESS_BLOCK_ARENA(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(li,lj), A_BLR%ARENA)
+          IF (RSVD_FLAG) THEN
+            CALL COMPRESS_BLOCK_RSVD_ADAPTIVE(MI, NJ, TMP, MI, TOL, TMPBLK)
+            CALL COPY_REGULAR_TO_ARENA(TMPBLK, A_BLR%OFFBLK(li,lj), A_BLR%ARENA)
+          ELSE
+            CALL COMPRESS_BLOCK_ARENA(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(li,lj), A_BLR%ARENA)
+          END IF
           NO_LOCAL = NO_LOCAL + 1
           IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
             NC_LOCAL = NC_LOCAL + 1
@@ -2058,7 +2072,7 @@ CONTAINS
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_ASSEMBLE_BLR_MATRIX_FIXEDCAP(GRID, N, NB, TOL, GET_BLOCK, A_BLR, &
                                                T_ASSEMBLE_COMPRESS, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
-                                               SHOW_PROGRESS)
+                                               SHOW_PROGRESS, USE_RSVD)
     TYPE(GRID_T), INTENT(IN)        :: GRID
     INTEGER, INTENT(IN)             :: N, NB
     REAL(WP), INTENT(IN)            :: TOL
@@ -2068,6 +2082,8 @@ CONTAINS
     INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
     INTEGER(8), INTENT(OUT)         :: RANK_SUM
     LOGICAL, INTENT(IN), OPTIONAL   :: SHOW_PROGRESS
+    LOGICAL, INTENT(IN), OPTIONAL   :: USE_RSVD   ! defaut .TRUE. (SVD randomisee adaptative)
+    LOGICAL :: RSVD_FLAG
 
     COMPLEX(WP), ALLOCATABLE :: TMP(:,:)
     TYPE(BLR_BLOCK_T) :: TMPBLK
@@ -2080,6 +2096,8 @@ CONTAINS
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
     NDONE = 0
     LAST_PCT = -5
+    RSVD_FLAG = .TRUE.
+    IF (PRESENT(USE_RSVD)) RSVD_FLAG = USE_RSVD
 
     T0 = MPI_WTIME()
     CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
@@ -2105,7 +2123,11 @@ CONTAINS
         ELSE
           ALLOCATE(TMP(MI,NJ))
           CALL GET_BLOCK(A_BLR%BSTART(I), A_BLR%BEND(I), A_BLR%BSTART(J), A_BLR%BEND(J), TMP)
-          CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, TMPBLK)
+          IF (RSVD_FLAG) THEN
+            CALL COMPRESS_BLOCK_RSVD_ADAPTIVE(MI, NJ, TMP, MI, TOL, TMPBLK)
+          ELSE
+            CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, TMPBLK)
+          END IF
           CALL COPY_REGULAR_TO_FIXEDCAP(TMPBLK, A_BLR%OFFBLK(li,lj))
           NO_LOCAL = NO_LOCAL + 1
           IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
@@ -2663,7 +2685,7 @@ CONTAINS
     NDONE = 0
     PBAR_STATE = -1
     T_GETBLK_L = 0.0D0; T_COMPRESS_L = 0.0D0; T_IO_L = 0.0D0
-    RSVD_FLAG = .FALSE.
+    RSVD_FLAG = .TRUE.
     IF (PRESENT(USE_RSVD)) RSVD_FLAG = USE_RSVD
     RSVD_OVS = 10; IF (PRESENT(RSVD_OVERSAMPLE)) RSVD_OVS = RSVD_OVERSAMPLE
     RSVD_NPOW = 1; IF (PRESENT(RSVD_NPOWER)) RSVD_NPOW = RSVD_NPOWER

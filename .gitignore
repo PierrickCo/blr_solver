@@ -60,3 +60,8 @@ usage_profile.png
 # le graphe genere -- idem, un fichier par run.
 blr_structure_*.csv
 blr_structure.png
+
+# user_case_dev/ : version detachee avec son propre Makefile -- .o/.mod
+# dans build/, executable a la racine du dossier.
+user_case_dev/build/
+user_case_dev/example_blr_mpi_pivot_user

@@ -63,7 +63,7 @@
 ! d'UN SEUL paquet de X pleinement rassemble, a la fois.
 !
 ! Usage : mpirun -np <PR*PC> ./example_user_matrix_ooc PR PC [N] [NB] [NRHS] [TOL] [MAX_MB_PER_PROCESS] [NRHS_BATCH] [SCRATCH_DIR] [RATIO] [USE_RSVD] [CHECK_RESIDUAL] [PROFILE_USAGE] [DUMP_STRUCTURE]
-!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch RATIO=1/3 USE_RSVD=0 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
+!         (defauts : N=4000 NB=200 NRHS=1 TOL=1e-4 MAX_MB_PER_PROCESS=64 NRHS_BATCH=2 SCRATCH_DIR=./blr_ooc_scratch RATIO=1/3 USE_RSVD=1 CHECK_RESIDUAL=0 PROFILE_USAGE=0 DUMP_STRUCTURE=0)
 !
 ! PROFILE_USAGE / DUMP_STRUCTURE : voir example_blr_mpi_pivot.f90 pour le
 ! detail complet (memes parametres, memes scripts de trace). Comme pour
@@ -107,7 +107,7 @@ PROGRAM EXAMPLE_USER_MATRIX_OOC
 
   N = 4000; NB = 200; NRHS = 1; TOL = 1.0E-4_WP
   MAX_MB_PER_PROCESS = 64.0_WP; NRHS_BATCH = 2; SCRATCH_DIR = './blr_ooc_scratch'
-  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 0; CHECK_RESIDUAL_INT = 0
+  RATIO = 1.0_WP/3.0_WP; USE_RSVD_INT = 1; CHECK_RESIDUAL_INT = 0
   PROFILE_USAGE_INT = 0; DUMP_STRUCTURE_INT = 0
   PROF_N = 0
 

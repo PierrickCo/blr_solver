@@ -42,7 +42,7 @@ CONTAINS
     WRITE(6,'(A)') '  --nrhs=ENTIER           equivalent au positionnel NRHS'
     WRITE(6,'(A)') '  --tol=REEL              equivalent au positionnel TOL'
     WRITE(6,'(A)') '  --ratio=REEL            (defaut 0.333) COMPRESS_WORTHWHILE_RATIO'
-    WRITE(6,'(A)') '  --use-rsvd=0|1          (defaut 0) SVD randomisee adaptative au lieu de CGESVD'
+    WRITE(6,'(A)') '  --use-rsvd=0|1          (defaut 1) SVD randomisee adaptative ; 0 = CGESVD complete'
     WRITE(6,'(A)') '  --check-residual=0|1    (defaut 0) verification ||A*X-B||/||B||'
     WRITE(6,'(A)') '  --profile-usage=0|1     (defaut 0) trace RSS/CPU par etape (usage_profile_rank<N>.csv)'
     WRITE(6,'(A)') '  --dump-structure=0|1    (defaut 0) export structure BLR (blr_structure_<etape>_rank<N>.csv)'
