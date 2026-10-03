@@ -5,7 +5,11 @@
 ! MPI_BLR_MATRIX_LU_FACTOR_PIVOT / MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D).
 !
 ! STOCKAGE : seulement le triangle INFERIEUR par blocs -- blocs diagonaux
-! (denses, DIAGBLK) + blocs hors-diagonale I>J (OFFBLK, dense ou bas-rang).
+! en STOCKAGE COMPACT (triangle inferieur seul, KW*(KW+1)/2 elements,
+! format LAPACK 'L', DIAGP) + blocs hors-diagonale I>J (OFFBLK, dense ou
+! bas-rang). Un bloc diagonal n'est deplie en tableau plein que le temps
+! d'une mise a jour de Schur ou de CSYTRF_RK (un seul espace de travail
+! NB x NB), et il est DIFFUSE compact (moitie du volume d'un bloc plein).
 ! Les blocs I<J ne sont jamais assembles ni alloues : ~2x moins de memoire
 ! que le LU pour la meme matrice. Meme distribution bloc-cyclique 2D que
 ! MPI_BLR_MATRIX_T (BLOCK_NUMROC, bloc-ligne local li <-> global
@@ -58,17 +62,23 @@ MODULE MPI_BLR_LDLT_MOD
   USE MPI_GRID_MOD
   USE BLR_COMPRESS_MOD
   USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
-  USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE, DENSE_PANEL_T
+  USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE
   USE MPI_BLR_MATRIX_MOD, ONLY: BLOCK_NUMROC, STAGE_PROGRESS_CALLBACK_IFACE, STAGE_PROGRESS_SHOULD_FIRE, &
                                 RHS_LOCAL_RANGE_MBM, RHS_NUMROC_MBM
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
   IMPLICIT NONE
 
+  ! Triangle inferieur (diagonale comprise) d'un bloc diagonal KW x KW,
+  ! stocke compact colonne par colonne (CTRTTP/CTPTTR, UPLO='L').
+  TYPE :: PACKED_TRI_T
+    COMPLEX(WP), ALLOCATABLE :: AP(:)
+  END TYPE PACKED_TRI_T
+
   TYPE :: MPI_BLR_SYM_T
     INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
     INTEGER, ALLOCATABLE :: BSTART(:), BEND(:)           ! decoupage GLOBAL, partage
-    TYPE(DENSE_PANEL_T), ALLOCATABLE :: DIAGBLK(:)       ! bloc GLOBAL K -- alloue seulement chez le proprietaire
+    TYPE(PACKED_TRI_T), ALLOCATABLE  :: DIAGP(:)         ! bloc GLOBAL K, compact -- alloue seulement chez le proprietaire
     TYPE(BLR_BLOCK_T), ALLOCATABLE   :: OFFBLK(:,:)      ! (li,lj) LOCAUX -- rempli seulement si I>J
     ! Remplis par MPI_BLR_SYM_LDLT_FACTOR, diffuses a TOUTE la grille :
     INTEGER, ALLOCATABLE     :: IPIV(:,:)                ! (NB,NBLK) IPIV brut de CSYTRF_RK, bloc K
@@ -80,6 +90,45 @@ CONTAINS
   !=======================================================================
   ! Primitives de bloc (dense ou bas-rang) propres au LDL^T
   !=======================================================================
+
+  ! Triangle inferieur de FULL(1:KW,1:KW) -> stockage compact AP.
+  SUBROUTINE SYM_PACK_LOWER(KW, FULL, LDF, AP)
+    INTEGER, INTENT(IN)      :: KW, LDF
+    COMPLEX(WP), INTENT(IN)  :: FULL(LDF,*)
+    COMPLEX(WP), INTENT(OUT) :: AP(*)
+    INTEGER :: INFO
+    IF (KW .GT. 0) CALL CTRTTP('L', KW, FULL, LDF, AP, INFO)
+  END SUBROUTINE SYM_PACK_LOWER
+
+  ! Stockage compact AP -> triangle inferieur de FULL(1:KW,1:KW) (le
+  ! triangle superieur n'est pas touche : jamais lu par CSYTRF_RK('L'),
+  ! CTRSM('Lower'), ni repacke).
+  SUBROUTINE SYM_UNPACK_LOWER(KW, AP, FULL, LDF)
+    INTEGER, INTENT(IN)        :: KW, LDF
+    COMPLEX(WP), INTENT(IN)    :: AP(*)
+    COMPLEX(WP), INTENT(INOUT) :: FULL(LDF,*)
+    INTEGER :: INFO
+    IF (KW .GT. 0) CALL CTPTTR('L', KW, AP, FULL, LDF, INFO)
+  END SUBROUTINE SYM_UNPACK_LOWER
+
+  ! Diffuse le bloc diagonal K COMPACT dans COMM (racine ROOT, OWNER =
+  ! proprietaire) et le deplie dans DKK(KW,KW) chez tous les membres.
+  SUBROUTINE BCAST_DIAG_LOWER(A, K, KW, OWNER, ROOT, COMM, DKK)
+    INCLUDE 'mpif.h'
+    TYPE(MPI_BLR_SYM_T), INTENT(IN) :: A
+    INTEGER, INTENT(IN)             :: K, KW, ROOT, COMM
+    LOGICAL, INTENT(IN)             :: OWNER
+    COMPLEX(WP), ALLOCATABLE, INTENT(OUT) :: DKK(:,:)
+    COMPLEX(WP), ALLOCATABLE :: APK(:)
+    INTEGER :: NP, IERR
+    NP = KW*(KW+1)/2
+    ALLOCATE(APK(NP), DKK(KW,KW))
+    IF (OWNER) APK = A%DIAGP(K)%AP
+    CALL MPI_BCAST(APK, NP, MPI_COMPLEX, ROOT, COMM, IERR)
+    DKK = (0.0_WP,0.0_WP)
+    CALL SYM_UNPACK_LOWER(KW, APK, DKK, KW)
+    DEALLOCATE(APK)
+  END SUBROUTINE BCAST_DIAG_LOWER
 
   ! BLK <- BLK*P, colonnes echangees (i,SWP(i)) dans l'ordre i=1..KW
   ! (BLK%N = KW). Bas-rang : seules les colonnes de VFAC bougent, O(rang).
@@ -315,7 +364,7 @@ CONTAINS
     A%NB = NB
     A%NBLKR_LOC = BLOCK_NUMROC(A%NBLK, GRID%PR, GRID%MYROW)
     A%NBLKC_LOC = BLOCK_NUMROC(A%NBLK, GRID%PC, GRID%MYCOL)
-    ALLOCATE(A%DIAGBLK(A%NBLK))
+    ALLOCATE(A%DIAGP(A%NBLK))
     ALLOCATE(A%OFFBLK(MAX(A%NBLKR_LOC,1), MAX(A%NBLKC_LOC,1)))
 
     ! Barre de progression : part LOCALE du rang 0 (triangle inferieur).
@@ -338,10 +387,12 @@ CONTAINS
         IF (I .LT. J) CYCLE
         NJ = A%BEND(J) - A%BSTART(J) + 1
         IF (I .EQ. J) THEN
-          ALLOCATE(A%DIAGBLK(I)%D(MI,MI))
+          ALLOCATE(TMP(MI,MI), A%DIAGP(I)%AP(MI*(MI+1)/2))
           TT0 = MPI_WTIME()
-          CALL GET_BLOCK(A%BSTART(I), A%BEND(I), A%BSTART(J), A%BEND(J), A%DIAGBLK(I)%D)
+          CALL GET_BLOCK(A%BSTART(I), A%BEND(I), A%BSTART(J), A%BEND(J), TMP)
           T_GETBLK_L = T_GETBLK_L + (MPI_WTIME() - TT0)
+          CALL SYM_PACK_LOWER(MI, TMP, MI, A%DIAGP(I)%AP)
+          DEALLOCATE(TMP)
         ELSE
           ALLOCATE(TMP(MI,NJ))
           TT0 = MPI_WTIME()
@@ -386,7 +437,7 @@ CONTAINS
     INTEGER :: li, lj, K
     NBYTES = 0_8
     DO K = 1, A%NBLK
-      IF (ALLOCATED(A%DIAGBLK(K)%D)) NBYTES = NBYTES + 8_8*INT(SIZE(A%DIAGBLK(K)%D),8)
+      IF (ALLOCATED(A%DIAGP(K)%AP)) NBYTES = NBYTES + 8_8*INT(SIZE(A%DIAGP(K)%AP),8)
     END DO
     DO lj = 1, A%NBLKC_LOC
       DO li = 1, A%NBLKR_LOC
@@ -397,7 +448,7 @@ CONTAINS
 
   SUBROUTINE MPI_BLR_SYM_FREE(A)
     TYPE(MPI_BLR_SYM_T), INTENT(INOUT) :: A
-    IF (ALLOCATED(A%DIAGBLK)) DEALLOCATE(A%DIAGBLK)
+    IF (ALLOCATED(A%DIAGP))   DEALLOCATE(A%DIAGP)
     IF (ALLOCATED(A%OFFBLK))  DEALLOCATE(A%OFFBLK)
     IF (ALLOCATED(A%BSTART))  DEALLOCATE(A%BSTART)
     IF (ALLOCATED(A%BEND))    DEALLOCATE(A%BEND)
@@ -406,6 +457,182 @@ CONTAINS
     IF (ALLOCATED(A%DSUB))    DEALLOCATE(A%DSUB)
     A%N = 0; A%NB = 0; A%NBLK = 0; A%NBLKR_LOC = 0; A%NBLKC_LOC = 0
   END SUBROUTINE MPI_BLR_SYM_FREE
+
+  !=======================================================================
+  ! Sauvegarde / reprise (checkpoint) de A : un fichier par processus
+  ! (PREFIX_rankNNNNNN.dat), STREAM non formate, aucune communication sauf
+  ! le verdict OK reduit sur la grille (un rang qui echoue arrete TOUS les
+  ! rangs, jamais un sous-ensemble qui continuerait seul vers un appel
+  ! collectif). WITH_FACTOR : ecrit/relit aussi IPIV/DDIAG/DSUB (apres
+  ! factorisation). Meme conventions que les checkpoints de l'exemple LU.
+  ! En-tete verifie a la relecture : N, NB, PR, PC, position dans la grille,
+  ! rang, et la nature (matrice / facteur) du fichier.
+  !=======================================================================
+  SUBROUTINE MPI_BLR_SYM_SAVE(GRID, A, PREFIX, WITH_FACTOR, OK)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    TYPE(MPI_BLR_SYM_T), INTENT(IN) :: A
+    CHARACTER(LEN=*), INTENT(IN)    :: PREFIX
+    LOGICAL, INTENT(IN)             :: WITH_FACTOR
+    LOGICAL, INTENT(OUT)            :: OK
+    INTEGER :: U, li, lj, I, J, ND, IOS, IERR, KIND_TAG
+    LOGICAL :: OK_LOCAL
+    CHARACTER(LEN=16)  :: RSTR
+    CHARACTER(LEN=512) :: FNAME
+    WRITE(RSTR,'(I6.6)') GRID%MYID
+    FNAME = TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
+         STATUS='REPLACE', ACTION='WRITE', IOSTAT=IOS)
+    OK_LOCAL = (IOS .EQ. 0)
+    IF (.NOT. OK_LOCAL) WRITE(6,'(A,A,A,I0,A)') ' ERREUR : impossible de creer ', TRIM(FNAME), &
+         ' (rang ', GRID%MYID, ') -- le repertoire de checkpoint doit deja exister.'
+    CALL MPI_ALLREDUCE(OK_LOCAL, OK, 1, MPI_LOGICAL, MPI_LAND, GRID%COMM, IERR)
+    IF (.NOT. OK) THEN
+      IF (OK_LOCAL) CLOSE(U, STATUS='DELETE')
+      RETURN
+    END IF
+    KIND_TAG = MERGE(2, 1, WITH_FACTOR)       ! 1 = matrice assemblee, 2 = facteur LDLt
+    WRITE(U) 7311, KIND_TAG, A%N, A%NB, A%NBLK, GRID%PR, GRID%PC, GRID%MYROW, GRID%MYCOL, GRID%MYID, &
+             A%NBLKR_LOC, A%NBLKC_LOC
+    ND = 0
+    DO I = 1, A%NBLK
+      IF (ALLOCATED(A%DIAGP(I)%AP)) ND = ND + 1
+    END DO
+    WRITE(U) ND
+    DO I = 1, A%NBLK
+      IF (ALLOCATED(A%DIAGP(I)%AP)) THEN
+        WRITE(U) I, SIZE(A%DIAGP(I)%AP)
+        WRITE(U) A%DIAGP(I)%AP
+      END IF
+    END DO
+    DO li = 1, A%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I .LE. J) CYCLE                    ! triangle inferieur strict seulement
+        WRITE(U) I, J, A%OFFBLK(li,lj)%IS_LOWRANK, A%OFFBLK(li,lj)%M, A%OFFBLK(li,lj)%N, A%OFFBLK(li,lj)%RANK
+        IF (A%OFFBLK(li,lj)%IS_LOWRANK) THEN
+          IF (A%OFFBLK(li,lj)%RANK .GT. 0) THEN
+            WRITE(U) A%OFFBLK(li,lj)%UFAC
+            WRITE(U) A%OFFBLK(li,lj)%VFAC
+          END IF
+        ELSE
+          WRITE(U) A%OFFBLK(li,lj)%DENSE
+        END IF
+      END DO
+    END DO
+    IF (WITH_FACTOR) WRITE(U) A%IPIV, A%DDIAG, A%DSUB
+    CLOSE(U)
+  END SUBROUTINE MPI_BLR_SYM_SAVE
+
+  SUBROUTINE MPI_BLR_SYM_LOAD(GRID, A, N, NB, PREFIX, WITH_FACTOR, OK)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)         :: GRID
+    TYPE(MPI_BLR_SYM_T), INTENT(OUT) :: A
+    INTEGER, INTENT(IN)              :: N, NB
+    CHARACTER(LEN=*), INTENT(IN)     :: PREFIX
+    LOGICAL, INTENT(IN)              :: WITH_FACTOR
+    LOGICAL, INTENT(OUT)             :: OK
+    INTEGER :: U, li, lj, I, J, ND, K, NP, IOS, IERR
+    INTEGER :: F_MAGIC, F_KIND, F_N, F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
+    INTEGER :: R_I, R_J, R_M, R_N, R_RANK
+    LOGICAL :: R_LOWRANK, OK_LOCAL
+    CHARACTER(LEN=16)  :: RSTR
+    CHARACTER(LEN=512) :: FNAME
+    OK_LOCAL = .TRUE.
+    WRITE(RSTR,'(I6.6)') GRID%MYID
+    FNAME = TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat'
+    OPEN(NEWUNIT=U, FILE=TRIM(FNAME), ACCESS='STREAM', FORM='UNFORMATTED', &
+         STATUS='OLD', ACTION='READ', IOSTAT=IOS)
+    IF (IOS .NE. 0) THEN
+      WRITE(6,'(A,A,A,I0,A)') ' ERREUR : impossible d''ouvrir ', TRIM(FNAME), ' (rang ', GRID%MYID, &
+           ') -- sauvegarde absente ?'
+      OK_LOCAL = .FALSE.
+    ELSE
+      READ(U, IOSTAT=IOS) F_MAGIC, F_KIND, F_N, F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
+      IF (IOS.NE.0 .OR. F_MAGIC.NE.7311 .OR. F_KIND.NE.MERGE(2,1,WITH_FACTOR) .OR. F_N.NE.N .OR. F_NB.NE.NB .OR. &
+          F_PR.NE.GRID%PR .OR. F_PC.NE.GRID%PC .OR. F_MYROW.NE.GRID%MYROW .OR. F_MYCOL.NE.GRID%MYCOL .OR. &
+          F_MYID.NE.GRID%MYID) THEN
+        WRITE(6,'(A,A,A,I0,A)') ' ERREUR : checkpoint ', TRIM(FNAME), ' incompatible avec le run courant (rang ', &
+             GRID%MYID, ') -- N/NB/grille ou nature (matrice/facteur LDLt) differente.'
+        OK_LOCAL = .FALSE.
+        CLOSE(U)
+      END IF
+    END IF
+    CALL MPI_ALLREDUCE(OK_LOCAL, OK, 1, MPI_LOGICAL, MPI_LAND, GRID%COMM, IERR)
+    IF (.NOT. OK) THEN
+      IF (OK_LOCAL) CLOSE(U)
+      RETURN
+    END IF
+
+    A%N = N; A%NB = NB
+    CALL BLOCK_PARTITION(N, NB, A%NBLK, A%BSTART, A%BEND)
+    A%NBLKR_LOC = BLOCK_NUMROC(A%NBLK, GRID%PR, GRID%MYROW)
+    A%NBLKC_LOC = BLOCK_NUMROC(A%NBLK, GRID%PC, GRID%MYCOL)
+    ALLOCATE(A%DIAGP(A%NBLK))
+    ALLOCATE(A%OFFBLK(MAX(A%NBLKR_LOC,1), MAX(A%NBLKC_LOC,1)))
+    READ(U) ND
+    DO K = 1, ND
+      READ(U) I, NP
+      ALLOCATE(A%DIAGP(I)%AP(NP))
+      READ(U) A%DIAGP(I)%AP
+    END DO
+    DO li = 1, A%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I .LE. J) CYCLE
+        READ(U) R_I, R_J, R_LOWRANK, R_M, R_N, R_RANK
+        A%OFFBLK(li,lj)%IS_LOWRANK = R_LOWRANK
+        A%OFFBLK(li,lj)%M = R_M; A%OFFBLK(li,lj)%N = R_N; A%OFFBLK(li,lj)%RANK = R_RANK
+        IF (R_LOWRANK) THEN
+          ALLOCATE(A%OFFBLK(li,lj)%UFAC(R_M,R_RANK), A%OFFBLK(li,lj)%VFAC(R_RANK,R_N))
+          IF (R_RANK .GT. 0) THEN
+            READ(U) A%OFFBLK(li,lj)%UFAC
+            READ(U) A%OFFBLK(li,lj)%VFAC
+          END IF
+        ELSE
+          ALLOCATE(A%OFFBLK(li,lj)%DENSE(R_M,R_N))
+          READ(U) A%OFFBLK(li,lj)%DENSE
+        END IF
+      END DO
+    END DO
+    IF (WITH_FACTOR) THEN
+      ALLOCATE(A%IPIV(NB,A%NBLK), A%DDIAG(NB,A%NBLK), A%DSUB(NB,A%NBLK))
+      READ(U) A%IPIV, A%DDIAG, A%DSUB
+    END IF
+    CLOSE(U)
+  END SUBROUTINE MPI_BLR_SYM_LOAD
+
+  ! Statistiques de compression du triangle inferieur strict (apres une
+  ! reprise, qui saute l'appel qui les produit normalement).
+  SUBROUTINE MPI_BLR_SYM_COMPRESSION_STATS(GRID, A, N_COMPRESSED, N_OFFDIAG, RANK_SUM)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    TYPE(MPI_BLR_SYM_T), INTENT(IN) :: A
+    INTEGER, INTENT(OUT)            :: N_COMPRESSED, N_OFFDIAG
+    INTEGER(8), INTENT(OUT)         :: RANK_SUM
+    INTEGER :: li, lj, I, J, NC, NO, IERR
+    INTEGER(8) :: RS
+    NC = 0; NO = 0; RS = 0_8
+    DO li = 1, A%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A%NBLKC_LOC
+        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        IF (I .LE. J) CYCLE
+        NO = NO + 1
+        IF (A%OFFBLK(li,lj)%IS_LOWRANK) THEN
+          NC = NC + 1
+          RS = RS + A%OFFBLK(li,lj)%RANK
+        ELSE
+          RS = RS + MIN(A%OFFBLK(li,lj)%M, A%OFFBLK(li,lj)%N)
+        END IF
+      END DO
+    END DO
+    CALL MPI_ALLREDUCE(NC, N_COMPRESSED, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(NO, N_OFFDIAG, 1, MPI_INTEGER, MPI_SUM, GRID%COMM, IERR)
+    CALL MPI_ALLREDUCE(RS, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
+  END SUBROUTINE MPI_BLR_SYM_COMPRESSION_STATS
 
   !=======================================================================
   ! Factorisation LDL^T en place (voir le commentaire de tete pour les 6
@@ -429,7 +656,7 @@ CONTAINS
     LOGICAL, INTENT(IN), OPTIONAL      :: SHOW_PROGRESS, SHOW_RSS_TRACE, USE_MOVE_ALLOC
     PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
 
-    COMPLEX(WP), ALLOCATABLE :: DKK(:,:), DBUF(:), E(:), WORK(:)
+    COMPLEX(WP), ALLOCATABLE :: DKK(:,:), DBUF(:), E(:), WORK(:), DWORK(:,:)
     COMPLEX(WP) :: WQUERY(1)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: WRECV(:), LTRECV(:)
     TYPE(BLR_BLOCK_T) :: TMPB
@@ -467,6 +694,10 @@ CONTAINS
     CALL CSYTRF_RK('L', A%NB, WQUERY, A%NB, E, A%IPIV(:,1), WQUERY, -1, IINFO)
     LWORK = MAX(1, INT(REAL(WQUERY(1))))
     ALLOCATE(WORK(LWORK))
+    ! Espace de travail unique ou un bloc diagonal compact est deplie le
+    ! temps de CSYTRF_RK ou d'une mise a jour de Schur.
+    ALLOCATE(DWORK(A%NB,A%NB))
+    DWORK = (0.0_WP,0.0_WP)
 
     DO K = 1, NBLK
       KW = A%BEND(K) - A%BSTART(K) + 1
@@ -482,17 +713,19 @@ CONTAINS
 
       ! 1) Bunch-Kaufman borne sur le bloc diagonal, chez le proprietaire.
       IF (OWNER) THEN
-        CALL CSYTRF_RK('L', KW, A%DIAGBLK(K)%D, KW, E, IPIV_K, WORK, LWORK, IINFO)
+        CALL SYM_UNPACK_LOWER(KW, A%DIAGP(K)%AP, DWORK, A%NB)
+        CALL CSYTRF_RK('L', KW, DWORK, A%NB, E, IPIV_K, WORK, LWORK, IINFO)
         IF (IINFO .NE. 0) INFO_STEP = A%BSTART(K) - 1 + IINFO
         DO I = 1, KW
-          DBUF(I) = A%DIAGBLK(K)%D(I,I)
+          DBUF(I) = DWORK(I,I)
         END DO
+        CALL SYM_PACK_LOWER(KW, DWORK, A%NB, A%DIAGP(K)%AP)
         DBUF(KW+1:2*KW) = E(1:KW)
       END IF
       CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, ROOT_K, GRID%COMM, IERR)
       IF (INFO_STEP .NE. 0) THEN
         INFO = INFO_STEP
-        DEALLOCATE(WRECV, LTRECV, IPIV_K, SWP, DBUF, E, WORK)
+        DEALLOCATE(WRECV, LTRECV, IPIV_K, SWP, DBUF, E, WORK, DWORK)
         CALL BLR_WORKSPACE_FREE(WS)
         RETURN
       END IF
@@ -514,12 +747,10 @@ CONTAINS
         END DO
       END IF
 
-      ! 3) L_KK diffuse dans la colonne PCOL_K ; permutation des COLONNES
-      !    des A(I>K,K) puis W = A(I,K)*P_K*L_KK^-T.
+      ! 3) L_KK diffuse (compact) dans la colonne PCOL_K ; permutation des
+      !    COLONNES des A(I>K,K) puis W = A(I,K)*P_K*L_KK^-T.
       IF (GRID%MYCOL .EQ. PCOL_K) THEN
-        ALLOCATE(DKK(KW,KW))
-        IF (OWNER) DKK = A%DIAGBLK(K)%D
-        CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+        CALL BCAST_DIAG_LOWER(A, K, KW, OWNER, PROW_K, GRID%COL_COMM, DKK)
         DO li = 1, A%NBLKR_LOC
           I = (li-1)*GRID%PR + GRID%MYROW + 1
           IF (I .LE. K) CYCLE
@@ -582,7 +813,9 @@ CONTAINS
           IF (I .LT. J) CYCLE
           MI = A%BEND(I) - A%BSTART(I) + 1
           IF (I .EQ. J) THEN
-            CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, WRECV(li), LTRECV(lj), A%DIAGBLK(I)%D, MI)
+            CALL SYM_UNPACK_LOWER(MI, A%DIAGP(I)%AP, DWORK, A%NB)
+            CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, WRECV(li), LTRECV(lj), DWORK, A%NB)
+            CALL SYM_PACK_LOWER(MI, DWORK, A%NB, A%DIAGP(I)%AP)
           ELSE
             CALL SCHUR_UPDATE_BLR_BLOCK(A%OFFBLK(li,lj), MI, NJ, KW, WRECV(li), LTRECV(lj), TOL, WS, &
                                         USE_MOVE_ALLOC=USE_MOVE_ALLOC)
@@ -599,7 +832,7 @@ CONTAINS
     END DO
     IF (RSS_TRACE) WRITE(6,'(A,F8.1,A)') '     [RSS trace] MAX observe pendant la factorisation = ', RSS_MAX_MB, ' Mo'
 
-    DEALLOCATE(WRECV, LTRECV, E, WORK)
+    DEALLOCATE(WRECV, LTRECV, E, WORK, DWORK)
     CALL BLR_WORKSPACE_FREE(WS)
     IF (PRESENT(T_FACTOR)) THEN
       T_FACTOR_L = MPI_WTIME() - T0
@@ -618,7 +851,8 @@ CONTAINS
   ! locales x NRHS_LOC colonnes locales, decoupage RHS_LOCAL_RANGE_MBM) est
   ! ecrase par X. Generique sur la largeur NRHS (appelable par lot).
   !=======================================================================
-  SUBROUTINE MPI_BLR_SYM_LDLT_SOLVE_2D(GRID, A, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS, PROGRESS_CALLBACK)
+  SUBROUTINE MPI_BLR_SYM_LDLT_SOLVE_2D(GRID, A, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS, PROGRESS_CALLBACK, &
+                                       T_PHASES)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)         :: GRID
     TYPE(MPI_BLR_SYM_T), INTENT(IN)  :: A
@@ -626,9 +860,13 @@ CONTAINS
     COMPLEX(WP), INTENT(INOUT)       :: B_LOCAL(MAX(LDB,1),MAX(NRHS_LOC,1))
     LOGICAL, INTENT(IN), OPTIONAL    :: SHOW_PROGRESS
     PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
+    ! T_PHASES (optionnel) : temps MAX sur la grille de (1) Q*B + descente L,
+    ! (2) D, (3) remontee L^T + Q^T.
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_PHASES(3)
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
+    DOUBLE PRECISION :: TPH(3), TPH0
     COMPLEX(WP), ALLOCATABLE :: XFULL(:,:), S(:,:), SSUM(:,:), SLOC(:,:)
     INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
     INTEGER :: NBLK, K, li, lj, I, KW, MI, MK, RS, RE, NROWTRAIL, C, IERR, P, MLOC
@@ -647,6 +885,7 @@ CONTAINS
       CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
     END DO
 
+    TPH0 = MPI_WTIME()
     ! === 0) B <- Q*B : echanges de chaque bloc, dans l'ordre, sur le B
     !     ORIGINAL (avant toute soustraction croisee -- meme piege que le LU).
     DO K = 1, NBLK
@@ -665,9 +904,7 @@ CONTAINS
       PROW_K = MOD(K-1, GRID%PR)
       PCOL_K = MOD(K-1, GRID%PC)
       IF (GRID%MYROW .EQ. PROW_K) THEN
-        ALLOCATE(DKK(KW,KW))
-        IF (GRID%MYCOL .EQ. PCOL_K) DKK = A%DIAGBLK(K)%D
-        CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+        CALL BCAST_DIAG_LOWER(A, K, KW, GRID%MYCOL.EQ.PCOL_K, PCOL_K, GRID%ROW_COMM, DKK)
         RS = LOCAL_ROW_OFFSET_SYM(A, GRID, K)
         IF (NRHS_LOC .GT. 0) CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, NRHS_LOC, &
                                          CONE, DKK, KW, B_LOCAL(RS,1), LDB)
@@ -739,6 +976,7 @@ CONTAINS
       END IF
     END DO
 
+    TPH(1) = MPI_WTIME() - TPH0; TPH0 = MPI_WTIME()
     ! === 2) D*W = Z : local a chaque ligne de grille, aucune communication ===
     DO K = 1, NBLK
       KW = A%BEND(K) - A%BSTART(K) + 1
@@ -752,6 +990,7 @@ CONTAINS
     !     dans la colonne de grille PCOL_I : chaque processus de cette
     !     colonne somme ses termes locaux (Y_K pleine largeur depuis XFULL),
     !     MPI_REDUCE vers la ligne PROW_I, puis SCATTERV par colonnes de RHS.
+    TPH(2) = MPI_WTIME() - TPH0; TPH0 = MPI_WTIME()
     ALLOCATE(XFULL(MAX(MLOC,1),NRHS))
     XFULL = CZERO
     DO K = NBLK, 1, -1
@@ -796,9 +1035,7 @@ CONTAINS
       END IF
 
       IF (GRID%MYROW .EQ. PROW_K) THEN
-        ALLOCATE(DKK(KW,KW))
-        IF (GRID%MYCOL .EQ. PCOL_K) DKK = A%DIAGBLK(K)%D
-        CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
+        CALL BCAST_DIAG_LOWER(A, K, KW, GRID%MYCOL.EQ.PCOL_K, PCOL_K, GRID%ROW_COMM, DKK)
         RS = LOCAL_ROW_OFFSET_SYM(A, GRID, K)
         IF (NRHS_LOC .GT. 0) CALL CTRSM('Left', 'Lower', 'Transpose', 'Unit', KW, NRHS_LOC, &
                                          CONE, DKK, KW, B_LOCAL(RS,1), LDB)
@@ -835,6 +1072,8 @@ CONTAINS
     END DO
 
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
+    TPH(3) = MPI_WTIME() - TPH0
+    IF (PRESENT(T_PHASES)) CALL MPI_ALLREDUCE(TPH, T_PHASES, 3, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
   END SUBROUTINE MPI_BLR_SYM_LDLT_SOLVE_2D
 
 END MODULE MPI_BLR_LDLT_MOD

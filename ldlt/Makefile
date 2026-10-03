@@ -35,12 +35,30 @@ MAIN_OBJS = $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_
             $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_lu_solve_2d_mod.o $(MAIN)/mpi_blr_matrix_mod.o \
             $(MAIN)/bench_utils_mod.o
 
-LDLT_OBJS = $(LIBDIR)/mpi_blr_ldlt_mod.o $(LIBDIR)/sym_testmat_mod.o
+LDLT_OBJS = $(LIBDIR)/mpi_blr_ldlt_mod.o $(LIBDIR)/mpi_blr_ldlt_arena_mod.o $(LIBDIR)/mpi_blr_ldlt_ooc_mod.o $(LIBDIR)/sym_testmat_mod.o
 
-all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu
+all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/test_mpi_blr_ldlt_arena $(BINDIR)/test_mpi_blr_ldlt_ooc $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu
 
 $(LIBDIR)/mpi_blr_ldlt_mod.o: $(SRC)/mpi_blr_ldlt_mod.f90 $(MAIN)/mpi_blr_matrix_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_mod.f90 -o $@
+
+$(LIBDIR)/mpi_blr_ldlt_arena_mod.o: $(SRC)/mpi_blr_ldlt_arena_mod.f90 $(LIBDIR)/mpi_blr_ldlt_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_arena_mod.f90 -o $@
+
+$(LIBDIR)/test_mpi_blr_ldlt_arena.o: $(TEST)/test_mpi_blr_ldlt_arena.f90 $(LDLT_OBJS)
+	$(MPIFC) $(OPTF) -c $(TEST)/test_mpi_blr_ldlt_arena.f90 -o $@
+
+$(BINDIR)/test_mpi_blr_ldlt_arena: $(MAIN_OBJS) $(LDLT_OBJS) $(LIBDIR)/test_mpi_blr_ldlt_arena.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
+
+$(LIBDIR)/mpi_blr_ldlt_ooc_mod.o: $(SRC)/mpi_blr_ldlt_ooc_mod.f90 $(LIBDIR)/mpi_blr_ldlt_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_ooc_mod.f90 -o $@
+
+$(LIBDIR)/test_mpi_blr_ldlt_ooc.o: $(TEST)/test_mpi_blr_ldlt_ooc.f90 $(LDLT_OBJS)
+	$(MPIFC) $(OPTF) -c $(TEST)/test_mpi_blr_ldlt_ooc.f90 -o $@
+
+$(BINDIR)/test_mpi_blr_ldlt_ooc: $(MAIN_OBJS) $(LDLT_OBJS) $(LIBDIR)/test_mpi_blr_ldlt_ooc.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
 
 $(LIBDIR)/sym_testmat_mod.o: $(SRC)/sym_testmat_mod.f90 $(MAIN)/blr_kinds_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/sym_testmat_mod.f90 -o $@

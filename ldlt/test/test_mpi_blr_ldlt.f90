@@ -9,7 +9,7 @@
 !   2) (N <= 4000) Reference dense independante : CGESV (LU, autre
 !      algorithme) sur A et B complets au rang 0 -- ||X-X_CGESV||/||X_CGESV||.
 !   3) (grille 1x1 seulement, N <= 3000) Reconstruction directe du facteur :
-!      ||Q*A*Q^T - L*D*L^T|| / ||A|| a partir de IPIV/DIAGBLK/OFFBLK/D --
+!      ||Q*A*Q^T - L*D*L^T|| / ||A|| a partir de IPIV/DIAGP/OFFBLK/D --
 !      isole la factorisation de la resolution.
 !
 ! Usage : mpirun -np PR*PC ./test_mpi_blr_ldlt PR PC [N] [NB] [NRHS] [TOL] [STRONG] [DIAG]
@@ -180,7 +180,7 @@ CONTAINS
   ! ||Q*A*Q^T - L*D*L^T||_F / ||A||_F (A = formule exacte, non compressee).
   REAL(WP) FUNCTION CHECK_FACTOR()
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
-    COMPLEX(WP), ALLOCATABLE :: AQ(:,:), LF(:,:), DF(:,:), T(:,:), R(:,:)
+    COMPLEX(WP), ALLOCATABLE :: AQ(:,:), LF(:,:), DF(:,:), T(:,:), R(:,:), DK(:,:)
     INTEGER :: K, I, KW, P, II, JJ, B0
     ALLOCATE(AQ(N,N), LF(N,N), DF(N,N), T(N,N), R(N,N))
     CALL SYM_GET_BLOCK(1, N, 1, N, AQ)
@@ -197,13 +197,17 @@ CONTAINS
         END IF
       END DO
       ! L_KK unitaire inferieure et D_K
+      ALLOCATE(DK(KW,KW))
+      DK = CZERO
+      CALL SYM_UNPACK_LOWER(KW, A%DIAGP(K)%AP, DK, KW)
       DO JJ = 1, KW
         LF(B0+JJ,B0+JJ) = CONE
         DO II = JJ+1, KW
-          LF(B0+II,B0+JJ) = A%DIAGBLK(K)%D(II,JJ)
+          LF(B0+II,B0+JJ) = DK(II,JJ)
         END DO
         DF(B0+JJ,B0+JJ) = A%DDIAG(JJ,K)
       END DO
+      DEALLOCATE(DK)
       JJ = 1
       DO WHILE (JJ .LE. KW)
         IF (A%IPIV(JJ,K) .LT. 0 .AND. JJ .LT. KW) THEN

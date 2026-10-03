@@ -1,0 +1,157 @@
+!===============================================================================
+! Test de la variante ARENA du LDL^T BLR+MPI : meme matrice, meme second
+! membre (B = A*Xexact, produit brut sur la formule) que la version
+! classique, resolus l'un apres l'autre.
+!
+! Verifie : ||X_arena - Xexact||/||Xexact|| < 1e-3, et l'ecart entre les deux
+! variantes ||X_arena - X_classique||/||X_classique|| < 1e-3. La compression
+! a l'assemblage est la SVD randomisee (defaut) : les deux variantes tirent
+! des vecteurs aleatoires differents, l'ecart attendu est donc de l'ordre de
+! TOL (pas zero). Affiche aussi l'empreinte memoire analytique des deux.
+!
+! Usage : mpirun -np PR*PC ./test_mpi_blr_ldlt_arena PR PC [N] [NB] [NRHS] [TOL]
+!===============================================================================
+PROGRAM TEST_MPI_BLR_LDLT_ARENA
+  USE MPI_BLR_LDLT_MOD
+  USE MPI_BLR_LDLT_ARENA_MOD
+  USE SYM_TESTMAT_MOD
+  USE MPI_LU_SOLVE_2D_MOD, ONLY: GATHER_2D_RHS
+  IMPLICIT NONE
+  INCLUDE 'mpif.h'
+
+  TYPE(GRID_T) :: GRID
+  INTEGER :: PR, PC, N, NB, NRHS, IERR, MYID0, MLOC, NRHS_LOC, RSTART_MINE
+  REAL(WP) :: TOL, ERR_C, ERR_A, DIFF
+  CHARACTER(LEN=32) :: ARG
+  COMPLEX(WP), ALLOCATABLE :: XG_C(:,:), XG_A(:,:)
+  INTEGER(8) :: MEM_C, MEM_A, MEM_C_MAX, MEM_A_MAX
+  DOUBLE PRECISION :: TF_C, TF_A
+
+  CALL MPI_INIT(IERR)
+  CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
+  N = 2000; NB = 200; NRHS = 6; TOL = 1.0E-4_WP
+  IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
+    IF (MYID0.EQ.0) WRITE(6,*) 'Usage: mpirun -np PR*PC ./test_mpi_blr_ldlt_arena PR PC [N] [NB] [NRHS] [TOL]'
+    CALL MPI_FINALIZE(IERR)
+    STOP 1
+  END IF
+  CALL GET_COMMAND_ARGUMENT(1, ARG); READ(ARG,*) PR
+  CALL GET_COMMAND_ARGUMENT(2, ARG); READ(ARG,*) PC
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 3) THEN; CALL GET_COMMAND_ARGUMENT(3, ARG); READ(ARG,*) N;    END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 4) THEN; CALL GET_COMMAND_ARGUMENT(4, ARG); READ(ARG,*) NB;   END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 5) THEN; CALL GET_COMMAND_ARGUMENT(5, ARG); READ(ARG,*) NRHS; END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 6) THEN; CALL GET_COMMAND_ARGUMENT(6, ARG); READ(ARG,*) TOL;  END IF
+  CALL GRID_INIT(GRID, MPI_COMM_WORLD, PR, PC, IERR)
+  IF (IERR .NE. 0) THEN
+    IF (MYID0.EQ.0) WRITE(6,*) 'ERREUR : PR*PC doit egaler le nombre de processus lances'
+    CALL MPI_FINALIZE(IERR)
+    STOP 1
+  END IF
+  CALL SYM_TESTMAT_SETUP(N, NB)
+  CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, GRID%MYCOL, RSTART_MINE, NRHS_LOC)
+  IF (MYID0.EQ.0) WRITE(6,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2)') ' LDLt arena vs classique : grille ', PR, 'x', PC, &
+       ' , N=', N, ' , NB=', NB, ' , NRHS=', NRHS, ' , TOL=', TOL
+  ALLOCATE(XG_C(N,NRHS), XG_A(N,NRHS))
+  CALL RUN_CLASSIC()
+  CALL RUN_ARENA()
+  CALL MPI_ALLREDUCE(MEM_C, MEM_C_MAX, 1, MPI_INTEGER8, MPI_MAX, GRID%COMM, IERR)
+  CALL MPI_ALLREDUCE(MEM_A, MEM_A_MAX, 1, MPI_INTEGER8, MPI_MAX, GRID%COMM, IERR)
+  IF (MYID0 .EQ. 0) THEN
+    ERR_C = REL_ERR_XEX(XG_C)
+    ERR_A = REL_ERR_XEX(XG_A)
+    DIFF = SQRT(SUM(ABS(XG_A-XG_C)**2) / SUM(ABS(XG_C)**2))
+    WRITE(6,'(A,ES12.4,A,F8.3,A,F8.2,A)') '  classique : ||X-Xexact||/||Xexact|| = ', ERR_C, ' , factorisation ', TF_C, &
+         ' s , facteurs max/proc ', REAL(MEM_C_MAX,WP)/1048576.0_WP, ' Mo'
+    WRITE(6,'(A,ES12.4,A,F8.3,A,F8.2,A)') '  arena     : ||X-Xexact||/||Xexact|| = ', ERR_A, ' , factorisation ', TF_A, &
+         ' s , facteurs max/proc ', REAL(MEM_A_MAX,WP)/1048576.0_WP, ' Mo (ARENA_BYTES, inclut le non recupere)'
+    WRITE(6,'(A,ES12.4)') '  ||X_arena - X_classique|| / ||X_classique|| = ', DIFF
+    IF (ERR_A .LT. 1.0E-3_WP .AND. DIFF .LT. 1.0E-3_WP) THEN
+      WRITE(6,*) '=== TEST_MPI_BLR_LDLT_ARENA : OK ==='
+    ELSE
+      WRITE(6,*) '=== TEST_MPI_BLR_LDLT_ARENA : ECHEC ==='
+    END IF
+  END IF
+  DEALLOCATE(XG_C, XG_A)
+  CALL MPI_FINALIZE(IERR)
+
+CONTAINS
+
+  SUBROUTINE FILL_B_EXACT(NBLKR_LOC, BSTART, BEND, BL)
+    INTEGER, INTENT(IN)      :: NBLKR_LOC, BSTART(:), BEND(:)
+    COMPLEX(WP), INTENT(OUT) :: BL(MAX(MLOC,1),MAX(NRHS_LOC,1))
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: AROWS(:,:), XEX(:,:)
+    INTEGER :: li, I, BSZ, RS, GI, R
+    IF (NRHS_LOC .LE. 0) RETURN
+    ALLOCATE(XEX(N,NRHS_LOC))
+    DO R = 1, NRHS_LOC
+      DO GI = 1, N
+        XEX(GI,R) = SYM_XEX(GI, RSTART_MINE+R-1)
+      END DO
+    END DO
+    RS = 1
+    DO li = 1, NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      BSZ = BEND(I) - BSTART(I) + 1
+      ALLOCATE(AROWS(BSZ,N))
+      CALL SYM_GET_BLOCK(BSTART(I), BEND(I), 1, N, AROWS)
+      CALL CGEMM('N', 'N', BSZ, NRHS_LOC, N, CONE, AROWS, BSZ, XEX, N, CZERO, BL(RS,1), MAX(MLOC,1))
+      DEALLOCATE(AROWS)
+      RS = RS + BSZ
+    END DO
+    DEALLOCATE(XEX)
+  END SUBROUTINE FILL_B_EXACT
+
+  REAL(WP) FUNCTION REL_ERR_XEX(X)
+    COMPLEX(WP), INTENT(IN) :: X(N,NRHS)
+    REAL(WP) :: NUM, DEN
+    INTEGER :: GI, R
+    NUM = 0.0_WP; DEN = 0.0_WP
+    DO R = 1, NRHS
+      DO GI = 1, N
+        NUM = NUM + ABS(X(GI,R) - SYM_XEX(GI,R))**2
+        DEN = DEN + ABS(SYM_XEX(GI,R))**2
+      END DO
+    END DO
+    REL_ERR_XEX = SQRT(NUM/DEN)
+  END FUNCTION REL_ERR_XEX
+
+  SUBROUTINE RUN_CLASSIC()
+    TYPE(MPI_BLR_SYM_T) :: AS
+    COMPLEX(WP), ALLOCATABLE :: BL(:,:)
+    INTEGER :: NC, NO, INFO
+    INTEGER(8) :: RS
+    DOUBLE PRECISION :: TA
+    CALL MPI_ASSEMBLE_BLR_SYM(GRID, N, NB, TOL, SYM_GET_BLOCK, AS, TA, NC, NO, RS)
+    CALL MPI_BLR_SYM_LDLT_FACTOR(GRID, AS, TOL, INFO, NC, NO, RS, T_FACTOR=TF_C)
+    IF (INFO .NE. 0 .AND. MYID0.EQ.0) WRITE(6,*) 'ERREUR LDLt classique, INFO=', INFO
+    MEM_C = MPI_BLR_SYM_MEMORY_BYTES(AS)
+    MLOC = MPI_BLR_SYM_MLOC(AS, GRID)
+    ALLOCATE(BL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
+    CALL FILL_B_EXACT(AS%NBLKR_LOC, AS%BSTART, AS%BEND, BL)
+    CALL MPI_BLR_SYM_LDLT_SOLVE_2D(GRID, AS, NRHS, NRHS_LOC, BL, MAX(MLOC,1))
+    CALL GATHER_2D_RHS(GRID, N, NB, NRHS, BL, MAX(MLOC,1), NRHS_LOC, 0, XG_C)
+    DEALLOCATE(BL)
+    CALL MPI_BLR_SYM_FREE(AS)
+  END SUBROUTINE RUN_CLASSIC
+
+  SUBROUTINE RUN_ARENA()
+    TYPE(MPI_BLR_SYM_ARENA_T) :: AA
+    COMPLEX(WP), ALLOCATABLE :: BL(:,:)
+    INTEGER :: NC, NO, INFO
+    INTEGER(8) :: RS
+    DOUBLE PRECISION :: TA
+    CALL MPI_ASSEMBLE_BLR_SYM_ARENA(GRID, N, NB, TOL, SYM_GET_BLOCK, AA, TA, NC, NO, RS)
+    CALL MPI_BLR_SYM_LDLT_FACTOR_ARENA(GRID, AA, TOL, INFO, NC, NO, RS, T_FACTOR=TF_A)
+    IF (INFO .NE. 0 .AND. MYID0.EQ.0) WRITE(6,*) 'ERREUR LDLt arena, INFO=', INFO
+    MEM_A = MPI_BLR_SYM_ARENA_MEMORY_BYTES(AA)
+    MLOC = MPI_BLR_SYM_ARENA_MLOC(AA, GRID)
+    ALLOCATE(BL(MAX(MLOC,1),MAX(NRHS_LOC,1)))
+    CALL FILL_B_EXACT(AA%NBLKR_LOC, AA%BSTART, AA%BEND, BL)
+    CALL MPI_BLR_SYM_LDLT_SOLVE_ARENA_2D(GRID, AA, NRHS, NRHS_LOC, BL, MAX(MLOC,1))
+    CALL GATHER_2D_RHS(GRID, N, NB, NRHS, BL, MAX(MLOC,1), NRHS_LOC, 0, XG_A)
+    DEALLOCATE(BL)
+    CALL MPI_BLR_SYM_ARENA_FREE(AA)
+  END SUBROUTINE RUN_ARENA
+
+END PROGRAM TEST_MPI_BLR_LDLT_ARENA
