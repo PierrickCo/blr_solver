@@ -1,0 +1,62 @@
+# LDL^T BLR+MPI -- chaine gcc (gfortran + BLAS/LAPACK + OpenMPI), pendant
+# de ldlt/Makefile. PREREQUIS : `make -f Makefile.gcc` depuis blr_solver/
+# (reutilise ../build-gcc/*.o/.mod). Artefacts dans ldlt/build-gcc/.
+# Necessite LAPACK >= 3.7 (CSYTRF_RK).
+
+MPIFC    = mpif90
+BUILDDIR = build-gcc
+MAIN     = ../build-gcc
+SRC      = src
+TEST     = test
+EX       = examples
+
+OPTF = -O2 -fopenmp -Wall -fcheck=bounds -ffree-line-length-none -J$(BUILDDIR) -I$(MAIN)
+
+$(shell mkdir -p $(BUILDDIR))
+
+THREAD_IMPL ?= noop
+ifeq ($(THREAD_IMPL),openblas)
+  BLASLIBS = -lopenblas
+else
+  BLASLIBS = -lblas -llapack
+endif
+MPILIBS = $(BLASLIBS) -lpthread -lm -ldl
+
+MAIN_OBJS = $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_mod.o \
+            $(MAIN)/blr_arena_mod.o $(MAIN)/blr_ooc_mod.o $(MAIN)/progress_bar_mod.o \
+            $(MAIN)/thread_control_mod.o $(MAIN)/blr_matrix_mod.o $(MAIN)/mpi_blr_lu_pivot_bcast_mod.o \
+            $(MAIN)/mpi_lu_pivot_mod.o $(MAIN)/mpi_lu_solve_2d_mod.o $(MAIN)/mpi_blr_matrix_mod.o \
+            $(MAIN)/bench_utils_mod.o
+
+LDLT_OBJS = $(BUILDDIR)/mpi_blr_ldlt_mod.o $(BUILDDIR)/sym_testmat_mod.o
+
+all: $(BUILDDIR)/test_mpi_blr_ldlt $(BUILDDIR)/example_blr_mpi_ldlt $(BUILDDIR)/bench_ldlt_vs_lu
+
+$(BUILDDIR)/mpi_blr_ldlt_mod.o: $(SRC)/mpi_blr_ldlt_mod.f90 $(MAIN)/mpi_blr_matrix_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_mod.f90 -o $@
+
+$(BUILDDIR)/sym_testmat_mod.o: $(SRC)/sym_testmat_mod.f90 $(MAIN)/blr_kinds_mod.o
+	$(MPIFC) $(OPTF) -c $(SRC)/sym_testmat_mod.f90 -o $@
+
+$(BUILDDIR)/test_mpi_blr_ldlt.o: $(TEST)/test_mpi_blr_ldlt.f90 $(LDLT_OBJS)
+	$(MPIFC) $(OPTF) -c $(TEST)/test_mpi_blr_ldlt.f90 -o $@
+
+$(BUILDDIR)/test_mpi_blr_ldlt: $(MAIN_OBJS) $(LDLT_OBJS) $(BUILDDIR)/test_mpi_blr_ldlt.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
+
+$(BUILDDIR)/example_blr_mpi_ldlt.o: $(EX)/example_blr_mpi_ldlt.f90 $(LDLT_OBJS)
+	$(MPIFC) $(OPTF) -c $(EX)/example_blr_mpi_ldlt.f90 -o $@
+
+$(BUILDDIR)/example_blr_mpi_ldlt: $(MAIN_OBJS) $(LDLT_OBJS) $(BUILDDIR)/example_blr_mpi_ldlt.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
+
+$(BUILDDIR)/bench_ldlt_vs_lu.o: $(TEST)/bench_ldlt_vs_lu.f90 $(LDLT_OBJS)
+	$(MPIFC) $(OPTF) -c $(TEST)/bench_ldlt_vs_lu.f90 -o $@
+
+$(BUILDDIR)/bench_ldlt_vs_lu: $(MAIN_OBJS) $(LDLT_OBJS) $(BUILDDIR)/bench_ldlt_vs_lu.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
+
+clean:
+	rm -rf $(BUILDDIR)
+
+.PHONY: all clean

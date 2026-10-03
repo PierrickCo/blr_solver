@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # Compile puis lance le jeu de tests de correction CURE de la ligne vivante
-# (13 binaires -- voir INSTALL.md pour le detail individuel de chacun),
+# (binaires de la racine + LDLt de ldlt/ -- voir INSTALL.md et ldlt/README.md),
 # avec un resume PASS/FAIL clair a la fin -- pour ne pas avoir a connaitre
 # chaque nom de binaire/syntaxe pour verifier qu'une installation marche.
 #
@@ -33,6 +33,12 @@ if ! make -f "$MAKEFILE" -j4; then
   echo "ECHEC DE COMPILATION -- voir la sortie ci-dessus."
   exit 1
 fi
+# LDL^T (ldlt/, reutilise les .o/.mod ci-dessus -- doit venir apres).
+if ! make -C ldlt -f "$MAKEFILE" -j4; then
+  echo "ECHEC DE COMPILATION (ldlt/) -- voir la sortie ci-dessus."
+  exit 1
+fi
+LDLT_BINDIR="ldlt/$BINDIR"
 echo
 
 LOGDIR="run_all_tests_logs"
@@ -99,6 +105,20 @@ run_test test_mpi_blr_matrix_pivot_ooc mpirun -np 4 "$BINDIR/test_mpi_blr_matrix
 # argument) -- noyau de Helmholtz geometrique, seuls tests couvrant ce chemin.
 run_test rsvd_geometric_classical  mpirun -np 4 "$BINDIR/bench_blr_mpi_pivot_ooc_geometric" 2 2 classical 2000 200 4 1e-4 16 2 "$BINDIR/blr_ooc_scratch_ci" 8.0 1
 run_test rsvd_geometric_ooc        mpirun -np 4 "$BINDIR/bench_blr_mpi_pivot_ooc_geometric" 2 2 ooc 2000 200 4 1e-4 4 2 "$BINDIR/blr_ooc_scratch_ci" 8.0 1
+
+echo "=== LDLt BLR+MPI, matrices complexes symetriques (ldlt/) ==="
+# 1x1 : inclut la reconstruction directe Q*A*Q^T = L*D*L^T ; pivots 2x2.
+run_test ldlt_1x1_pivots2x2      mpirun -np 1 "$LDLT_BINDIR/test_mpi_blr_ldlt" 1 1 1000 128 5 1e-4
+# Melange de pivots 1x1/2x2 (STRONG=1, DIAG=0.1), grille rectangulaire.
+# Matrice nettement plus mal conditionnee (CGESV dense seul ~6e-4) : TOL
+# resserre a 1e-6, sinon l'erreur de compression amplifiee depasse 1e-3.
+run_test ldlt_2x3_pivots_mixtes  mpirun -np 6 "$LDLT_BINDIR/test_mpi_blr_ldlt" 2 3 1500 125 7 1e-6 1 0.1
+# Sans compression, grille 2x2.
+run_test ldlt_2x2_tol0           mpirun -np 4 "$LDLT_BINDIR/test_mpi_blr_ldlt" 2 2 1200 100 6 0
+# Exemple : RSVD + lots de second membre + verifications (seuil sur l'erreur).
+run_bench ldlt_example           mpirun -np 4 "$LDLT_BINDIR/example_blr_mpi_ldlt" 2 2 1500 125 6 1e-4 \
+                                   --check-error --check-residual --use-rsvd --nrhs-batch=4
+run_test ldlt_bench_vs_lu        mpirun -np 4 "$LDLT_BINDIR/bench_ldlt_vs_lu" 2 2 1500 125 4 1e-4
 
 echo "=== Benchmarks (fumee -- petite echelle) ==="
 run_bench bench_seq  "$BINDIR/bench_seq" 1000 20 100 1e-4

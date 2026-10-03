@@ -78,10 +78,12 @@ calcul). Il existe en quatre variantes, toutes validées :
   (pivotage confiné au front).
 - **Pas de sparsité générale** : matrices denses uniquement (la compression
   BLR exploite la structure basse-rang, pas la sparsité).
-- **Code mis de côté** : une tentative LDLt+BLR a été abandonnée (voir
-  `legacy/README.md`) — `CLASYF` utilise un schéma de mise à jour différée
-  incompatible avec l'approche « factoriser dense, compresser après » qui a
-  fonctionné pour LU.
+- **Code mis de côté** : une première tentative LDLt+BLR a été abandonnée
+  (voir `legacy/README.md`) — `CLASYF` utilise un schéma de mise à jour
+  différée incompatible avec l'approche « factoriser dense, compresser
+  après ». Un LDLᵀ BLR+MPI fonctionnel existe désormais dans
+  [`ldlt/`](ldlt/README.md) (matrices complexes symétriques, Bunch-Kaufman
+  borné confiné au bloc diagonal, qui contourne ce problème).
 
 ## Démarrer
 
@@ -111,6 +113,8 @@ blr_solver/
 │                      rapide de l'API (voir examples/README.md)
 ├── bench/             scripts de balayage reutilisables (taille de bloc,
 │                      tolerance, scalabilite) -- voir CLUSTER.md
+├── ldlt/              LDLt BLR+MPI pour matrices complexes symetriques
+│                      (Bunch-Kaufman confine) -- voir ldlt/README.md
 ├── legacy/            code mis de cote (LDLt, ancienne lignee MPI a
 │                      stockage dense) -- voir legacy/README.md
 ├── .github/workflows/ CI (chaine gcc, build + run_all_tests.sh a chaque push)
