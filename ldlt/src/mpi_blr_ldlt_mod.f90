@@ -742,7 +742,7 @@ CONTAINS
   !=======================================================================
   SUBROUTINE MPI_BLR_SYM_LDLT_FACTOR(GRID, A, TOL, INFO, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
                                      N_SWAPS, N_2X2, T_FACTOR, SHOW_PROGRESS, SHOW_RSS_TRACE, &
-                                     USE_MOVE_ALLOC, PROGRESS_CALLBACK, T_BREAKDOWN)
+                                     USE_MOVE_ALLOC, PROGRESS_CALLBACK, T_BREAKDOWN, LOOKAHEAD)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)           :: GRID
     TYPE(MPI_BLR_SYM_T), INTENT(INOUT) :: A
@@ -761,8 +761,21 @@ CONTAINS
     ! (7) boucle complete. Chaque categorie est un MAX independant : leur
     ! somme peut differer de (7).
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_BREAKDOWN(7)
+    ! LOOKAHEAD (defaut .TRUE.) : anticipation de profondeur 1. A l'etape K,
+    ! des que la colonne K+1 a recu sa mise a jour de Schur, le proprietaire
+    ! du bloc (K+1,K+1) le factorise et lance des diffusions NON BLOQUANTES
+    ! (MPI_IBCAST) de IPIV/D a toute la grille et du bloc compact a la
+    ! colonne de grille ; le reste du Schur de l'etape K recouvre ces
+    ! diffusions, et l'etape K+1 commence par un simple MPI_WAITALL. Resultat
+    ! numerique identique (memes operations, seul l'ordre change).
+    LOGICAL, INTENT(IN), OPTIONAL      :: LOOKAHEAD
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), DBUF(:), E(:), WORK(:), DWORK(:,:)
+    ! tampons des diffusions anticipees (en vol entre deux etapes)
+    INTEGER, ALLOCATABLE, ASYNCHRONOUS :: IBUF_N(:)
+    COMPLEX(WP), ALLOCATABLE, ASYNCHRONOUS :: DBUF_N(:), APK_N(:)
+    INTEGER :: REQ(3), NREQ
+    LOGICAL :: LA, PENDING
     DOUBLE PRECISION :: TB(7), TT0, TLOOP0
     COMPLEX(WP) :: WQUERY(1)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: WRECV(:), LTRECV(:)
@@ -804,6 +817,13 @@ CONTAINS
     ! temps de CSYTRF_RK ou d'une mise a jour de Schur.
     ALLOCATE(DWORK(A%NB,A%NB))
     DWORK = (0.0_WP,0.0_WP)
+    LA = .TRUE.
+    IF (PRESENT(LOOKAHEAD)) LA = LOOKAHEAD
+    PENDING = .FALSE.
+    NREQ = 0
+    IF (LA) THEN
+      ALLOCATE(IBUF_N(0:A%NB), DBUF_N(2*A%NB), APK_N(A%NB*(A%NB+1)/2))
+    END IF
     TB = 0.0D0
     TLOOP0 = MPI_WTIME()
 
@@ -819,30 +839,38 @@ CONTAINS
       ALLOCATE(IPIV_K(KW), SWP(KW), DBUF(2*KW))
       IPIV_K = 0; DBUF = (0.0_WP,0.0_WP)
 
-      ! 1) Bunch-Kaufman borne sur le bloc diagonal, chez le proprietaire.
-      IF (OWNER) THEN
+      ! 1) Bunch-Kaufman borne sur le bloc diagonal, chez le proprietaire --
+      !    ou, en anticipation, deja fait a l'etape K-1 : on attend alors
+      !    seulement la fin des diffusions non bloquantes.
+      IF (PENDING) THEN
         TT0 = MPI_WTIME()
-        CALL SYM_UNPACK_LOWER(KW, A%DIAGP(K)%AP, DWORK, A%NB)
-        CALL SYM_BK_FACTOR(KW, DWORK, A%NB, E, IPIV_K, WORK, LWORK, IINFO)
-        IF (IINFO .NE. 0) INFO_STEP = A%BSTART(K) - 1 + IINFO
-        DO I = 1, KW
-          DBUF(I) = DWORK(I,I)
-        END DO
-        CALL SYM_PACK_LOWER(KW, DWORK, A%NB, A%DIAGP(K)%AP)
-        DBUF(KW+1:2*KW) = E(1:KW)
-        TB(1) = TB(1) + (MPI_WTIME() - TT0)
+        CALL MPI_WAITALL(NREQ, REQ, MPI_STATUSES_IGNORE, IERR)
+        TB(4) = TB(4) + (MPI_WTIME() - TT0)
+        PENDING = .FALSE.
+        INFO_STEP = IBUF_N(0)
+        IPIV_K = IBUF_N(1:KW)
+        DBUF = DBUF_N(1:2*KW)
+      ELSE
+        IF (OWNER) THEN
+          TT0 = MPI_WTIME()
+          CALL SYM_DIAG_FACTOR(K, KW, IPIV_K, DBUF, INFO_STEP)
+          TB(1) = TB(1) + (MPI_WTIME() - TT0)
+        END IF
+        TT0 = MPI_WTIME()
+        CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, ROOT_K, GRID%COMM, IERR)
+        IF (INFO_STEP .EQ. 0) THEN
+          CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, ROOT_K, GRID%COMM, IERR)
+          CALL MPI_BCAST(DBUF, 2*KW, MPI_COMPLEX, ROOT_K, GRID%COMM, IERR)
+        END IF
+        TB(4) = TB(4) + (MPI_WTIME() - TT0)
       END IF
-      TT0 = MPI_WTIME()
-      CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, ROOT_K, GRID%COMM, IERR)
       IF (INFO_STEP .NE. 0) THEN
         INFO = INFO_STEP
         DEALLOCATE(WRECV, LTRECV, IPIV_K, SWP, DBUF, E, WORK, DWORK)
+        IF (ALLOCATED(IBUF_N)) DEALLOCATE(IBUF_N, DBUF_N, APK_N)
         CALL BLR_WORKSPACE_FREE(WS)
         RETURN
       END IF
-      CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, ROOT_K, GRID%COMM, IERR)
-      CALL MPI_BCAST(DBUF, 2*KW, MPI_COMPLEX, ROOT_K, GRID%COMM, IERR)
-      TB(4) = TB(4) + (MPI_WTIME() - TT0)
       A%IPIV(1:KW,K)  = IPIV_K
       A%DDIAG(1:KW,K) = DBUF(1:KW)
       A%DSUB(1:KW,K)  = DBUF(KW+1:2*KW)
@@ -862,8 +890,9 @@ CONTAINS
       TB(2) = TB(2) + (MPI_WTIME() - TT0)
 
       ! 3) L_KK diffuse (compact) dans la colonne PCOL_K ; permutation des
-      !    COLONNES des A(I>K,K) puis W = A(I,K)*P_K*L_KK^-T.
-      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+      !    COLONNES des A(I>K,K) puis W = A(I,K)*P_K*L_KK^-T. Deja fait a
+      !    l'etape K-1 en anticipation (POST_NEXT_DIAG).
+      IF (GRID%MYCOL .EQ. PCOL_K .AND. .NOT. (LA .AND. K .GT. 1)) THEN
         TT0 = MPI_WTIME()
         CALL BCAST_DIAG_LOWER(A, K, KW, OWNER, PROW_K, GRID%COL_COMM, DKK)
         TB(4) = TB(4) + (MPI_WTIME() - TT0)
@@ -934,6 +963,13 @@ CONTAINS
       END DO
 
       ! 6) Schur, triangle inferieur : A(I,J) -= W(I,K)*L(J,K)^T, I>=J>K.
+      !    En anticipation, la colonne K+1 (premier lj traite par la colonne
+      !    de grille PCOL_(K+1)) est mise a jour d'abord, puis le bloc
+      !    (K+1,K+1) est factorise et diffuse sans bloquer ; les autres
+      !    colonnes de grille postent leur reception avant leur Schur.
+      IF (LA .AND. K .LT. NBLK) THEN
+        IF (GRID%MYCOL .NE. MOD(K, GRID%PC)) CALL POST_NEXT_DIAG(K+1)
+      END IF
       DO lj = 1, A%NBLKC_LOC
         J = (lj-1)*GRID%PC + GRID%MYCOL + 1
         IF (J .LE. K) CYCLE
@@ -952,6 +988,7 @@ CONTAINS
             TB(6) = TB(6) + (MPI_WTIME() - TT0)
           END IF
         END DO
+        IF (LA .AND. J .EQ. K+1) CALL POST_NEXT_DIAG(K+1)
       END DO
 
       DEALLOCATE(IPIV_K, SWP, DBUF)
@@ -966,6 +1003,7 @@ CONTAINS
     IF (PRESENT(T_BREAKDOWN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN, 7, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
 
     DEALLOCATE(WRECV, LTRECV, E, WORK, DWORK)
+    IF (ALLOCATED(IBUF_N)) DEALLOCATE(IBUF_N, DBUF_N, APK_N)
     CALL BLR_WORKSPACE_FREE(WS)
     IF (PRESENT(T_FACTOR)) THEN
       T_FACTOR_L = MPI_WTIME() - T0
@@ -977,6 +1015,84 @@ CONTAINS
     ! NS_TOT/N2_TOT deja identiques partout (IPIV_K diffuse a toute la grille).
     IF (PRESENT(N_SWAPS)) N_SWAPS = NS_TOT
     IF (PRESENT(N_2X2))   N_2X2 = N2_TOT
+
+  CONTAINS
+
+    ! Bunch-Kaufman sur le bloc diagonal compact KD (proprietaire seulement) :
+    ! IP = IPIV, DB = (D, E), INFO_D = indice global du premier pivot nul.
+    SUBROUTINE SYM_DIAG_FACTOR(KD, KWD, IP, DB, INFO_D)
+      INTEGER, INTENT(IN)        :: KD, KWD
+      INTEGER, INTENT(OUT)       :: IP(KWD), INFO_D
+      COMPLEX(WP), INTENT(OUT)   :: DB(2*KWD)
+      INTEGER :: II, IINFO_D
+      INFO_D = 0
+      CALL SYM_UNPACK_LOWER(KWD, A%DIAGP(KD)%AP, DWORK, A%NB)
+      CALL SYM_BK_FACTOR(KWD, DWORK, A%NB, E, IP, WORK, LWORK, IINFO_D)
+      IF (IINFO_D .NE. 0) INFO_D = A%BSTART(KD) - 1 + IINFO_D
+      DO II = 1, KWD
+        DB(II) = DWORK(II,II)
+      END DO
+      CALL SYM_PACK_LOWER(KWD, DWORK, A%NB, A%DIAGP(KD)%AP)
+      DB(KWD+1:2*KWD) = E(1:KWD)
+    END SUBROUTINE SYM_DIAG_FACTOR
+
+    ! Anticipation : factorise (proprietaire) le bloc KN deja a jour et
+    ! lance les diffusions non bloquantes de (INFO, IPIV), (D, E) sur la
+    ! grille et du bloc compact sur la colonne de grille PCOL_KN. La colonne
+    ! de grille PCOL_KN attend ensuite le bloc et traite tout de suite son
+    ! panneau (sous-etape 3 de l'etape KN : echange de colonnes + TRSM), qui
+    ! sort ainsi du chemin critique. Appelee une fois par etape par CHAQUE
+    ! processus, dans le meme ordre relatif aux autres collectives de chaque
+    ! communicateur. N'utilise que des variables locales (appelee dans les
+    ! boucles de l'appelant).
+    SUBROUTINE POST_NEXT_DIAG(KN)
+      INTEGER, INTENT(IN) :: KN
+      INTEGER :: KWN, PRN, PCN, NPN, IERRN, LIN, IN, LJN, NSN, N2N
+      INTEGER, ALLOCATABLE :: SWPN(:)
+      COMPLEX(WP), ALLOCATABLE :: DKN(:,:)
+      DOUBLE PRECISION :: TF0
+      KWN = A%BEND(KN) - A%BSTART(KN) + 1
+      PRN = MOD(KN-1, GRID%PR)
+      PCN = MOD(KN-1, GRID%PC)
+      NPN = KWN*(KWN+1)/2
+      IF (GRID%MYROW.EQ.PRN .AND. GRID%MYCOL.EQ.PCN) THEN
+        TF0 = MPI_WTIME()
+        CALL SYM_DIAG_FACTOR(KN, KWN, IBUF_N(1:KWN), DBUF_N(1:2*KWN), IBUF_N(0))
+        APK_N(1:NPN) = A%DIAGP(KN)%AP(1:NPN)
+        TB(1) = TB(1) + (MPI_WTIME() - TF0)
+      END IF
+      CALL MPI_IBCAST(IBUF_N, KWN+1, MPI_INTEGER, PRN*GRID%PC + PCN, GRID%COMM, REQ(1), IERRN)
+      CALL MPI_IBCAST(DBUF_N, 2*KWN, MPI_COMPLEX, PRN*GRID%PC + PCN, GRID%COMM, REQ(2), IERRN)
+      NREQ = 2
+      IF (GRID%MYCOL .EQ. PCN) THEN
+        CALL MPI_IBCAST(APK_N, NPN, MPI_COMPLEX, PRN, GRID%COL_COMM, REQ(3), IERRN)
+        NREQ = 3
+        TF0 = MPI_WTIME()
+        CALL MPI_WAITALL(NREQ, REQ, MPI_STATUSES_IGNORE, IERRN)
+        TB(4) = TB(4) + (MPI_WTIME() - TF0)
+        IF (IBUF_N(0) .EQ. 0) THEN
+          ALLOCATE(SWPN(KWN), DKN(KWN,KWN))
+          SWPN = ABS(IBUF_N(1:KWN))
+          CALL COUNT_PIVOTS(KWN, IBUF_N(1:KWN), DBUF_N(KWN+1:2*KWN), NSN, N2N)
+          DKN = (0.0_WP,0.0_WP)
+          CALL SYM_UNPACK_LOWER(KWN, APK_N, DKN, KWN)
+          LJN = (KN-1)/GRID%PC + 1
+          DO LIN = 1, A%NBLKR_LOC
+            IN = (LIN-1)*GRID%PR + GRID%MYROW + 1
+            IF (IN .LE. KN) CYCLE
+            TF0 = MPI_WTIME()
+            IF (NSN .GT. 0) CALL BLR_BLOCK_COL_SWAP(A%OFFBLK(LIN,LJN), KWN, SWPN)
+            TB(2) = TB(2) + (MPI_WTIME() - TF0)
+            TF0 = MPI_WTIME()
+            CALL BLR_TRSM_RIGHT_LOWER_TRANS_UNIT(A%OFFBLK(LIN,LJN), DKN, KWN)
+            TB(3) = TB(3) + (MPI_WTIME() - TF0)
+          END DO
+          DEALLOCATE(SWPN, DKN)
+        END IF
+      END IF
+      PENDING = .TRUE.
+    END SUBROUTINE POST_NEXT_DIAG
+
   END SUBROUTINE MPI_BLR_SYM_LDLT_FACTOR
 
   !=======================================================================

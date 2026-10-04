@@ -9,8 +9,8 @@
 ! erreur ||X-Xexact||/||Xexact||. Les deux solveurs tournent l'un apres
 ! l'autre dans le meme processus (le premier est libere avant le second).
 !
-! Usage : mpirun -np PR*PC ./bench_ldlt_vs_lu PR PC [N] [NB] [NRHS] [TOL] [USE_RSVD] [STRONG] [DIAG]
-!         (defauts 8000 400 8 1e-4 1 50 0.01)
+! Usage : mpirun -np PR*PC ./bench_ldlt_vs_lu PR PC [N] [NB] [NRHS] [TOL] [USE_RSVD] [STRONG] [DIAG] [LOOKAHEAD]
+!         (defauts 8000 400 8 1e-4 1 50 0.01 1)
 !===============================================================================
 PROGRAM BENCH_LDLT_VS_LU
   USE MPI_BLR_LDLT_MOD
@@ -22,7 +22,7 @@ PROGRAM BENCH_LDLT_VS_LU
   INCLUDE 'mpif.h'
 
   TYPE(GRID_T) :: GRID
-  INTEGER :: PR, PC, N, NB, NRHS, IERR, MYID0, USE_RSVD_INT, MLOC, NRHS_LOC, RSTART_MINE
+  INTEGER :: PR, PC, N, NB, NRHS, IERR, MYID0, USE_RSVD_INT, LA_INT, MLOC, NRHS_LOC, RSTART_MINE
   REAL(WP) :: TOL, STRONG, DIAG
   CHARACTER(LEN=32) :: ARG
   ! resultats : 1 = LU, 2 = LDLt
@@ -38,7 +38,7 @@ PROGRAM BENCH_LDLT_VS_LU
 
   CALL MPI_INIT(IERR)
   CALL MPI_COMM_RANK(MPI_COMM_WORLD, MYID0, IERR)
-  N = 8000; NB = 400; NRHS = 8; TOL = 1.0E-4_WP; USE_RSVD_INT = 1; STRONG = 50.0_WP; DIAG = 0.01_WP
+  N = 8000; NB = 400; NRHS = 8; TOL = 1.0E-4_WP; USE_RSVD_INT = 1; STRONG = 50.0_WP; DIAG = 0.01_WP; LA_INT = 1
   IF (COMMAND_ARGUMENT_COUNT() .LT. 2) THEN
     IF (MYID0.EQ.0) WRITE(6,*) 'Usage: mpirun -np PR*PC ./bench_ldlt_vs_lu PR PC [N] [NB] [NRHS] [TOL] [USE_RSVD] [STRONG] [DIAG]'
     CALL MPI_FINALIZE(IERR)
@@ -53,6 +53,7 @@ PROGRAM BENCH_LDLT_VS_LU
   IF (COMMAND_ARGUMENT_COUNT() .GE. 7) THEN; CALL GET_COMMAND_ARGUMENT(7, ARG); READ(ARG,*) USE_RSVD_INT; END IF
   IF (COMMAND_ARGUMENT_COUNT() .GE. 8) THEN; CALL GET_COMMAND_ARGUMENT(8, ARG); READ(ARG,*) STRONG; END IF
   IF (COMMAND_ARGUMENT_COUNT() .GE. 9) THEN; CALL GET_COMMAND_ARGUMENT(9, ARG); READ(ARG,*) DIAG; END IF
+  IF (COMMAND_ARGUMENT_COUNT() .GE. 10) THEN; CALL GET_COMMAND_ARGUMENT(10, ARG); READ(ARG,*) LA_INT; END IF
 
   CALL GRID_INIT(GRID, MPI_COMM_WORLD, PR, PC, IERR)
   IF (IERR .NE. 0) THEN
@@ -65,6 +66,7 @@ PROGRAM BENCH_LDLT_VS_LU
   IF (MYID0.EQ.0) WRITE(6,'(A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2,A,I0,A,F6.1,A,F7.3)') ' Grille ', PR, 'x', PC, &
        ' , N=', N, ' , NB=', NB, ' , NRHS=', NRHS, ' , TOL=', TOL, ' , USE_RSVD=', USE_RSVD_INT, &
        ' , STRONG=', STRONG, ' , DIAG=', DIAG
+  IF (MYID0.EQ.0) WRITE(6,'(A,I0)') ' LOOKAHEAD=', LA_INT
 
   CALL RUN_LU()
   CALL RUN_LDLT()
@@ -205,7 +207,7 @@ CONTAINS
                               SHOW_PROGRESS=.TRUE., USE_RSVD=(USE_RSVD_INT.NE.0))
     CALL REDUCE_MEM(MPI_BLR_SYM_MEMORY_BYTES(AS), MEM_A_MAX(2), MEM_A_SUM(2))
     CALL MPI_BLR_SYM_LDLT_FACTOR(GRID, AS, TOL, INFO, NC, NO, RS, NSW(2), N2X2, T_FAC(2), SHOW_PROGRESS=.TRUE., &
-                                 T_BREAKDOWN=TBK(:,2))
+                                 T_BREAKDOWN=TBK(:,2), LOOKAHEAD=(LA_INT.NE.0))
     IF (INFO .NE. 0 .AND. MYID0.EQ.0) WRITE(6,*) 'ERREUR LDLt, INFO=', INFO
     CALL REDUCE_MEM(MPI_BLR_SYM_MEMORY_BYTES(AS), MEM_F_MAX(2), MEM_F_SUM(2))
     MLOC = MPI_BLR_SYM_MLOC(AS, GRID)

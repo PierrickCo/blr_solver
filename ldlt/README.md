@@ -36,6 +36,14 @@ déjà construits (même principe que `legacy/`).
   compressé) le long des lignes ; L(I,K) = W·D_K⁻¹ ; L(J,K)ᵀ diffusé le long
   des colonnes depuis le processus (ligne(J), colonne(J)) — schéma du
   Cholesky ScaLAPACK ; Schur A(I,J) −= W(I,K)·L(J,K)ᵀ sur I≥J seulement.
+- **Anticipation** (`LOOKAHEAD=.TRUE.` par défaut, version classique) : à
+  l'étape K, la colonne K+1 reçoit sa mise à jour de Schur en premier ; le
+  propriétaire de (K+1,K+1) le factorise aussitôt et lance des diffusions
+  **non bloquantes** (`MPI_IBCAST`) de IPIV/D à la grille et du bloc compact
+  à sa colonne de grille, qui traite tout de suite son panneau (échanges de
+  colonnes + TRSM) ; le reste du Schur de l'étape K recouvre le tout, et
+  l'étape K+1 commence par un `MPI_WAITALL`. Résultat numérique identique
+  (mêmes opérations, seul l'ordre change).
 - **Résolution** : Q·B → descente L (algorithme du LU) → D (local, aucune
   communication) → remontée Lᵀ « pleine largeur » : chaque processus garde
   ses lignes du second membre sur toute la largeur ; à chaque étape, une
@@ -151,6 +159,33 @@ LDLᵀ au niveau du LU ou en dessous : ×0.93–0.99 (2×4, NB=800, contre ×1.4
 avant), ×0.80–0.86 (1×8, NB=600, contre ×1.9) ; la remontée ne coûte plus
 que 0.016–0.045 s, la descente L domine désormais.
 
+## Anticipation (2026-10-04, mesurée)
+
+Factorisation LDLᵀ (s, N=16000, TOL=1e-4, RSVD, 1 thread, 3 runs
+alternés ; erreurs **identiques au chiffre près** avec et sans) :
+
+| Grille, NB | sans | avec |
+|---|---|---|
+| 2×2, NB=400 | 0.351–0.402 | 0.336–0.364 |
+| 2×2, NB=800 | 0.372–0.462 | 0.375–0.466 |
+| 2×4, NB=400 | 0.409–0.430 | 0.401–0.437 |
+| 2×4, NB=800 | 0.490–0.516 | 0.496–0.506 |
+
+Gain de 0 à 7 % seulement sur cette machine (4 cœurs physiques, 8 avec
+hyperthreading : la grille 2×4 y est sursouscrite et les rangs en attente
+active volent des cycles aux rangs qui calculent). Un découpage fin des
+attentes, par processus (instrumentation temporaire, grille 2×2), montre
+pourquoi : les diffusions elles-mêmes (W le long des lignes, Lᵀ le long des
+colonnes) ne coûtent que 0.05–0.09 s ; l'essentiel de l'attente vient du
+**déséquilibre de charge** — les processus (0,0) et (1,1), qui possèdent
+tous les blocs diagonaux (factorisation de Bunch-Kaufman + Schur dense),
+calculent 0.20–0.25 s contre 0.06–0.17 s pour (0,1) et (1,0) — combiné à la
+synchronisation de chaque étape par les diffusions bloquantes du panneau.
+L'anticipation de profondeur 1 retire la factorisation du bloc diagonal du
+chemin critique mais ne rééquilibre rien. Sur un vrai réseau (latence
+inter-nœuds), le recouvrement des diffusions devrait davantage compter ;
+l'option est conservée par défaut (jamais mesurablement plus lente).
+
 ## Mesures LDLᵀ vs LU avant ces optimisations (`bench_ldlt_vs_lu`, grille 2×2, OMP_NUM_THREADS=2, TOL=1e-4 sauf mention, RSVD)
 
 Ratios LDLᵀ/LU (< 1 = LDLᵀ meilleur), stockage diagonal compact (dépliage à
@@ -191,9 +226,12 @@ Lecture honnête :
 
 ## Limites connues, assumées
 
-- **Attentes MPI dominantes** (60 à 90 % de la factorisation, LU compris) :
-  le levier restant est l'anticipation (factoriser le bloc diagonal K+1
-  pendant le Schur de l'étape K), non faite.
+- **Attentes MPI dominantes** (60 à 90 % de la factorisation, LU compris),
+  dues surtout au déséquilibre de charge des blocs diagonaux (voir
+  « Anticipation ») : l'anticipation de profondeur 1 (version classique
+  seulement, pas encore arena/OOC ni LU) n'y gagne que 0 à 7 %. Leviers
+  restants : répartition des blocs diagonaux sur tous les processus,
+  diffusions du panneau non bloquantes (anticipation plus profonde).
 - **Remontée Lᵀ** : copie pleine largeur `XFULL` (MLOC × NRHS) du second
   membre — mémoire RHS ×PC pendant cette phase, bornée par `--nrhs-batch`
   (et par paquet en OOC).
