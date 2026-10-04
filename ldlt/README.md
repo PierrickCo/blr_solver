@@ -36,6 +36,17 @@ déjà construits (même principe que `legacy/`).
   compressé) le long des lignes ; L(I,K) = W·D_K⁻¹ ; L(J,K)ᵀ diffusé le long
   des colonnes depuis le processus (ligne(J), colonne(J)) — schéma du
   Cholesky ScaLAPACK ; Schur A(I,J) −= W(I,K)·L(J,K)ᵀ sur I≥J seulement.
+- **Distribution** : blocs-lignes cycliques (ligne de grille MOD(I−1,PR)) ;
+  blocs-colonnes en cyclique **décalé** par défaut (`DIAG_SPREAD=.TRUE.` à
+  l'assemblage, les trois variantes) : J → MOD(J−1 + ⌊(J−1)/L⌋, PC), avec
+  L = PPCM(PR,PC). Avec le cyclique pur, le bloc diagonal K tombe sur
+  (MOD(K−1,PR), MOD(K−1,PC)) : si PGCD(PR,PC) = g > 1, seuls PR·PC/g
+  processus possèdent des blocs diagonaux (2 sur 4 en 2×2, 4 sur 8 en
+  2×4). Le décalage d'une colonne à chaque période les fait passer par les
+  PR·PC processus (vérifié jusqu'à 16×18), sans changer le nombre de
+  blocs-colonnes par colonne de grille. Identique au cyclique pur si g = 1
+  (dont PR=1 ou PC=1). Le checkpoint enregistre la distribution (numéro
+  magique 7311 + CMAP).
 - **Anticipation** (`LOOKAHEAD=.TRUE.` par défaut, version classique) : à
   l'étape K, la colonne K+1 reçoit sa mise à jour de Schur en premier ; le
   propriétaire de (K+1,K+1) le factorise aussitôt et lance des diffusions
@@ -184,7 +195,9 @@ synchronisation de chaque étape par les diffusions bloquantes du panneau.
 L'anticipation de profondeur 1 retire la factorisation du bloc diagonal du
 chemin critique mais ne rééquilibre rien. Sur un vrai réseau (latence
 inter-nœuds), le recouvrement des diffusions devrait davantage compter ;
-l'option est conservée par défaut (jamais mesurablement plus lente).
+l'option est conservée par défaut (jamais mesurablement plus lente). La
+section suivante corrige ce diagnostic : une fois la charge rééquilibrée, le
+temps ne baisse toujours pas.
 
 ## Mesures LDLᵀ vs LU avant ces optimisations (`bench_ldlt_vs_lu`, grille 2×2, OMP_NUM_THREADS=2, TOL=1e-4 sauf mention, RSVD)
 
@@ -224,14 +237,40 @@ Lecture honnête :
 - **Résolution** : de ×0.73 à ×1.29 avant optimisation, et jusqu'à ×1.7–1.9
   sur les grilles larges (2×4, 1×8) — corrigé par la remontée pleine largeur.
 
+## Répartition des blocs diagonaux (2026-10-04, mesurée)
+
+N=16000, TOL=1e-4, RSVD, 1 thread, anticipation active ; facteurs, max par
+processus (Mo), cyclique pur → décalé (identique au chiffre près d'un run
+à l'autre) :
+
+| Grille, NB | mémoire max/processus | factorisation (s, 3 runs) |
+|---|---|---|
+| 2×2, NB=400 | 14.8 → **8.9** | 0.263–0.268 → 0.263–0.278 |
+| 2×2, NB=800 | 26.1 → **14.0** | 0.353–0.419 → 0.382–0.430 |
+| 2×4, NB=400 | 7.5 → **4.4** | 0.269–0.351 → 0.296–0.366 |
+| 2×4, NB=800 | 13.1 → **8.2** | 0.471–0.504 → 0.482–0.517 |
+| 2×2, N=40000, NB=1000 | 82.9 → **45.1** | 1.49–1.71 → 1.40–1.61 |
+
+La mémoire maximale par processus baisse de 37 à 46 %, et le calcul est
+rééquilibré (instrumentation temporaire, 2×2, NB=800 : 0.20 / 0.06 / 0.06 /
+0.20 s → 0.11 / 0.11 / 0.12 / 0.12 s). Le temps de factorisation, lui, ne
+change pas au bruit près : il est borné par la **chaîne séquentielle des
+factorisations de blocs diagonaux** (chaque bloc K+1 attend le Schur de
+l'étape K, qui attend la factorisation de K) — leur somme vaut à elle seule
+≈ 0.23 s sur une boucle de 0.35 s, et le Schur hors-diagonale, compressé,
+est trop léger (≈ 0.05 s en tout) pour la recouvrir. Ce plancher croît comme
+N·NB² : c'est ce qui fait préférer NB=400–600 au balayage de paramètres.
+
 ## Limites connues, assumées
 
-- **Attentes MPI dominantes** (60 à 90 % de la factorisation, LU compris),
-  dues surtout au déséquilibre de charge des blocs diagonaux (voir
-  « Anticipation ») : l'anticipation de profondeur 1 (version classique
-  seulement, pas encore arena/OOC ni LU) n'y gagne que 0 à 7 %. Leviers
-  restants : répartition des blocs diagonaux sur tous les processus,
-  diffusions du panneau non bloquantes (anticipation plus profonde).
+- **Attentes MPI dominantes** (60 à 90 % de la factorisation, LU compris) :
+  ni l'anticipation de profondeur 1 (0 à 7 %, version classique seulement)
+  ni la répartition des blocs diagonaux (calcul rééquilibré, temps inchangé)
+  ne les font baisser, car elles reflètent la chaîne séquentielle des
+  factorisations denses de blocs diagonaux (voir « Répartition des blocs
+  diagonaux »). Leviers restants : factorisation diagonale plus rapide
+  (multithreadée chez le propriétaire, ou NB plus petit), ou découpage du
+  bloc diagonal en sous-blocs pour raccourcir la chaîne.
 - **Remontée Lᵀ** : copie pleine largeur `XFULL` (MLOC × NRHS) du second
   membre — mémoire RHS ×PC pendant cette phase, bornée par `--nrhs-batch`
   (et par paquet en OOC).
@@ -246,10 +285,9 @@ Lecture honnête :
   au minimum par processus dans les tests), pas seulement les données
   utiles ; le gain attendu porte sur la RSS réelle à grande échelle (comme
   pour le LU arena), non mesuré ici.
-- **Déséquilibre de charge sur grille carrée** (hérité de la distribution
-  bloc-cyclique, aussi présent dans le LU) : les blocs diagonaux et leur
-  factorisation tombent tous sur les processus (r,r) — mémoire max/processus
-  ×0.55 au lieu de ×0.50 en dense.
+- **Déséquilibre de charge sur grille carrée** : corrigé par la
+  distribution décalée des colonnes (voir « Répartition des blocs
+  diagonaux ») ; reste présent dans le LU.
 - **Matrices mal conditionnées** : comme pour le LU, l'erreur de compression
   (~TOL) est amplifiée par le conditionnement. Exemple : la variante « pivots
   mixtes » du test (`STRONG=1 DIAG=0.1`, `CGESV` dense seul ~6e-4) dépasse
