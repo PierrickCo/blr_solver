@@ -21,7 +21,25 @@ FC   = ifx
 # -module $(LIBDIR) : sortie ET recherche des .mod dans lib/ (equivalent
 # du -J de gfortran) -- inclus dans OPTF (reutilise pour compiler ET
 # lier) pour s'appliquer a TOUS les appels sans dupliquer le flag partout.
-OPTF = -O2 -qopenmp -warn all -check bounds -module $(LIBDIR)
+# OPENMP=0 (`make OPENMP=0`) : compile SANS OpenMP et lie MKL SEQUENTIEL
+# (pas de libiomp5). Recommande pour les runs MPI purs (1 thread par
+# processus) : avec ifx, des que libiomp5 est lie, tous les ALLOCATE passent
+# par l'allocateur du runtime OpenMP d'Intel, qui ne rend jamais la memoire
+# liberee -- mesure : RSS de factorisation -45 % sur une matrice peu
+# compressible, meme temps (voir CLUSTER.md). Sorties dans des repertoires
+# separes (suffixe _noomp) pour ne jamais melanger les deux variantes.
+OPENMP ?= 1
+ifeq ($(OPENMP),0)
+  OMPF   =
+  MKLTHR = -lmkl_sequential
+  SUFFIX = _noomp
+else
+  OMPF   = -qopenmp
+  MKLTHR = -lmkl_intel_thread
+  SUFFIX =
+endif
+
+OPTF = -O2 $(OMPF) -warn all -check bounds -module $(LIBDIR)
 
 # -L$(IMPI_LIBDIR) EN PREMIER dans MPILIBS : sans ca, le linker peut
 # resoudre "-lmpi" vers un OpenMPI systeme non lie (/usr/lib/x86_64-
@@ -35,8 +53,8 @@ SRC  = src
 TEST = test
 EX   = examples
 USERDIR = user_case
-BINDIR = bin
-LIBDIR = lib
+BINDIR = bin$(SUFFIX)
+LIBDIR = lib$(SUFFIX)
 
 # Cree les deux repertoires de sortie AU MOMENT DU PARSING (avant que la
 # moindre regle ne s'execute) -- evite d'ajouter un prerequis d'ordre
@@ -45,11 +63,18 @@ $(shell mkdir -p $(BINDIR) $(LIBDIR))
 
 INCS = -I$(SRC)
 
-LIBMKL = -L$(MKLROOT)/lib -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core
+LIBMKL = -L$(MKLROOT)/lib -lmkl_intel_lp64 $(MKLTHR) -lmkl_core
 LIBS   = $(LIBMKL) -lpthread -lm -ldl
 MPILIBS = -L$(IMPI_LIBDIR) $(LIBS)
 
-all: $(BINDIR)/test_block_lu $(BINDIR)/test_blr_compress $(BINDIR)/test_mpi_grid $(BINDIR)/test_mpi_lu_pivot $(BINDIR)/test_openmp_dense $(BINDIR)/test_mpi_lu_solve_2d $(BINDIR)/test_blr_matrix_progress $(BINDIR)/test_blr_workspace $(BINDIR)/test_mpi_blr_matrix $(BINDIR)/test_mpi_blr_matrix_pivot $(BINDIR)/test_mpi_blr_matrix_pivot_arena $(BINDIR)/test_mpi_blr_matrix_pivot_ooc $(BINDIR)/bench_seq $(BINDIR)/bench_mpi $(BINDIR)/bench_blr_pipeline $(BINDIR)/bench_blr_mpi_pivot_compressibility $(BINDIR)/bench_blr_mpi_pivot_ratio $(BINDIR)/bench_blr_mpi_pivot_arena $(BINDIR)/bench_blr_mpi_pivot_ooc_compare $(BINDIR)/bench_blr_mpi_pivot_ooc_massive_rhs $(BINDIR)/bench_blr_mpi_pivot_ooc_geometric
+# test_openmp_dense teste OpenMP lui-meme : exclu en OPENMP=0.
+ifeq ($(OPENMP),0)
+  OMP_TESTS =
+else
+  OMP_TESTS = $(BINDIR)/test_openmp_dense
+endif
+
+all: $(BINDIR)/test_block_lu $(BINDIR)/test_blr_compress $(BINDIR)/test_mpi_grid $(BINDIR)/test_mpi_lu_pivot $(OMP_TESTS) $(BINDIR)/test_mpi_lu_solve_2d $(BINDIR)/test_blr_matrix_progress $(BINDIR)/test_blr_workspace $(BINDIR)/test_mpi_blr_matrix $(BINDIR)/test_mpi_blr_matrix_pivot $(BINDIR)/test_mpi_blr_matrix_pivot_arena $(BINDIR)/test_mpi_blr_matrix_pivot_ooc $(BINDIR)/bench_seq $(BINDIR)/bench_mpi $(BINDIR)/bench_blr_pipeline $(BINDIR)/bench_blr_mpi_pivot_compressibility $(BINDIR)/bench_blr_mpi_pivot_ratio $(BINDIR)/bench_blr_mpi_pivot_arena $(BINDIR)/bench_blr_mpi_pivot_ooc_compare $(BINDIR)/bench_blr_mpi_pivot_ooc_massive_rhs $(BINDIR)/bench_blr_mpi_pivot_ooc_geometric
 
 $(LIBDIR)/blr_kinds_mod.o: $(SRC)/blr_kinds_mod.f90
 	$(FC) $(OPTF) -c $(SRC)/blr_kinds_mod.f90 -o $(LIBDIR)/blr_kinds_mod.o

@@ -55,7 +55,7 @@ MODULE MPI_BLR_MATRIX_MOD
   USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE, DENSE_PANEL_T
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE, PRINT_PROGRESS_BAR
-  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
+  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB, BLR_TRIM_HEAP
   IMPLICIT NONE
 
   ! Hook optionnel pour un suivi fin (ex: RSS/CPU) de l'avancement DANS
@@ -742,6 +742,7 @@ CONTAINS
         END DO
       END DO
 
+      CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('Factorisation LU (sans pivot)', K, NBLK, LAST_PCT)
     END DO
 
@@ -1022,6 +1023,7 @@ CONTAINS
         END DO
       END DO
 
+      CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('2) Factorisation LU (pivot)', K, NBLK, PBAR_STATE)
       IF (PRESENT(PROGRESS_CALLBACK)) THEN
         IF (STAGE_PROGRESS_SHOULD_FIRE(K, NBLK)) CALL PROGRESS_CALLBACK(K, NBLK)
@@ -1943,6 +1945,7 @@ CONTAINS
         END DO
       END DO
 
+      CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('3) Factorisation LU arena (pivot)', K, NBLK, LAST_PCT)
       IF (RSS_TRACE) WRITE(6,'(A,I4,A,F8.1,A)') '     [RSS trace arena] K=', K, ' : RSS = ', &
            REAL(GET_RSS_KB(),8)/1024.0D0, ' Mo'
@@ -2517,6 +2520,7 @@ CONTAINS
         END DO
       END DO
 
+      CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('3) Factorisation LU fixedcap (pivot)', K, NBLK, LAST_PCT)
       IF (RSS_TRACE) WRITE(6,'(A,I4,A,F8.1,A)') '     [RSS trace fixedcap] K=', K, ' : RSS = ', &
            REAL(GET_RSS_KB(),8)/1024.0D0, ' Mo'
@@ -3347,6 +3351,7 @@ CONTAINS
         END DO
       END DO
 
+      CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Factorisation LU ooc (pivot)', K, NBLK, PBAR_STATE)
       IF (PRESENT(PROGRESS_CALLBACK)) THEN
         IF (STAGE_PROGRESS_SHOULD_FIRE(K, NBLK)) CALL PROGRESS_CALLBACK(K, NBLK)

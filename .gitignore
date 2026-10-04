@@ -6,6 +6,11 @@ bin/
 lib/
 build-gcc/
 build-ifort2019/
+# Variante sans OpenMP (make OPENMP=0) : memes regles, suffixe _noomp.
+bin_noomp/
+lib_noomp/
+build_noomp/
+user_case_dev/example_blr_mpi_pivot_user_noomp
 examples/*.o
 
 # Binaire du micro-benchmark de diagnostic (pas dans le Makefile,

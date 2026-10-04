@@ -84,7 +84,7 @@ PROGRAM SWEEP_DRIVER
   CALL MPI_ALLREDUCE(RSS_L, RSS_MAX, 1, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
   IF (MYID0 .EQ. 0) THEN
     WRITE(6,'(A,A,A,I0,A,I0,A,I0,A,I0,A,I0,A,I0,A,ES9.2,A,F6.3,A,I0,A,I0,A,F0.4,A,F0.4,A,F0.4,A,F0.2,A,F0.2,A,F0.1,A,ES10.3)') &
-         'SWEEP_RESULT solver=', TRIM(SOLVER), ' pr=', PR, ' pc=', PC, ' threads=', OMP_GET_MAX_THREADS(), &
+         'SWEEP_RESULT solver=', TRIM(SOLVER), ' pr=', PR, ' pc=', PC, ' threads=', BLR_MAX_THREADS(), &
          ' n=', N, ' nb=', NB, ' nrhs=', NRHS, ' tol=', TOL, ' ratio=', RATIO, ' rsvd=', USE_RSVD_INT, &
          ' info=', INFO, ' t_asm=', T_ASM, ' t_fact=', T_FACT, ' t_solve=', T_SOLVE, &
          ' mem_max_mb=', REAL(MEM_MAX,8)/1048576.0D0, ' mem_tot_mb=', REAL(MEM_TOT,8)/1048576.0D0, &

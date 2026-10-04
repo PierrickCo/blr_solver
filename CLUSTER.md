@@ -116,3 +116,59 @@ interne). Le point de croisement mesuré sur la machine de développement
 cluster cible** plutôt que de réutiliser cette valeur telle quelle — le
 point de croisement dépend du débit mono-cœur de la machine, qui diffère
 d'un cluster à l'autre.
+
+## 5. Compilation pour les vrais calculs : OpenMP, mémoire et vérifications
+
+**Runs MPI purs (1 thread par processus) : compiler avec `OPENMP=0`.**
+
+```bash
+make OPENMP=0 && make -C ldlt OPENMP=0        # -> bin_noomp/, ldlt/bin_noomp/
+make -C user_case_dev OPENMP=0                # -> example_blr_mpi_pivot_user_noomp
+./run_all_tests.sh intel-noomp                # meme suite de tests, sans OpenMP
+```
+
+Pourquoi : avec ifx, dès que `libiomp5` (le runtime OpenMP d'Intel, amené
+par MKL threadée) est lié, **tous les `ALLOCATE` passent par l'allocateur
+interne de ce runtime, qui ne rend jamais la mémoire libérée au système**.
+Or la factorisation réalloue sans cesse les facteurs U/V des blocs
+bas-rang à des rangs croissants. `OPENMP=0` compile sans OpenMP et lie MKL
+séquentielle : les `ALLOCATE` passent par glibc, et chaque étape de
+factorisation rend la mémoire libérée par `malloc_trim(0)`
+(`BLR_TRIM_HEAP`, désactivable par `BLR_MALLOC_TRIM=0`).
+
+Mesuré (N=40000, NB=500, grille 2×2, matrice peu compressible K=5000 dont
+le rang moyen passe de 8 à 53 pendant la factorisation ; RSS max par
+processus en fin de factorisation) :
+
+| | défaut (OpenMP, MKL threadée) | `OPENMP=0` | `OPENMP=0`, `BLR_MALLOC_TRIM=0` |
+|---|---|---|---|
+| LDLᵀ | 816 Mo | **449 Mo** (−45 %) | 516 Mo |
+| LU | 1332 Mo | **721 Mo** (−46 %) | 832 Mo |
+| facteurs seuls (théorique) + RSS de départ | LDLᵀ 344 Mo, LU 618 Mo | | |
+
+Temps de factorisation LU : 178 / 177 / 177 s (identiques). LDLᵀ : 67 à
+91 s selon les runs dans les trois configurations (variabilité de la
+machine de test, pas d'écart systématique mesuré).
+
+Non concernés : la chaîne gcc (`Makefile.gcc`, libgomp n'intercepte pas
+les allocations ; `BLR_TRIM_HEAP` y agit directement : 460 → 300 Mo en fin
+de factorisation sur le même cas) et `Makefile.ifort2019` (non modifié).
+**Mode hybride MPI + threads** : `OPENMP=0` ne s'applique pas tel quel ;
+garder la compilation par défaut (les couches de threads GNU ou TBB de MKL,
+qui éviteraient `libiomp5`, n'ont pas été testées).
+
+**Vérifications de bornes.** Tous les Makefiles compilent avec
+`-check bounds` (`-fcheck=bounds` en gcc), utile au développement mais
+coûteux : mesuré sur le même cas (K=8), assemblage ×2,4 (LDLᵀ) à ×3,5 (LU),
+factorisation LU ×1,7, résolution ×1,1 à ×1,4. Pour les calculs de
+production, retirer `-check bounds` de `OPTF` (et idéalement passer en
+`-O3 -xHost`), dans le Makefile racine, `ldlt/Makefile` et
+`user_case_dev/Makefile`.
+
+**Mesurer soi-même** : `ldlt/bin*/bench_steps` (temps, RSS de fin et pic
+par étape, taux de compression, décomposition de la RSS) :
+
+```bash
+mpirun -np 4 ldlt/bin_noomp/bench_steps LDLT 2 2 40000 500 500 3 1e-4 5000 4
+```
+

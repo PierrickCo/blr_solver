@@ -11,20 +11,39 @@ MKLROOT = /opt/intel/oneapi/mkl/2026.1
 IMPI_LIBDIR = /opt/intel/oneapi/mpi/2021.18/lib
 
 MPIFC  = mpiifx
-LIBDIR = lib
-BINDIR = bin
-MAIN   = ../lib
+# OPENMP=0 (`make OPENMP=0`) : compile SANS OpenMP et lie MKL SEQUENTIEL
+# (pas de libiomp5). Recommande pour les runs MPI purs (1 thread par
+# processus) : avec ifx, des que libiomp5 est lie, tous les ALLOCATE passent
+# par l'allocateur du runtime OpenMP d'Intel, qui ne rend jamais la memoire
+# liberee -- mesure : RSS de factorisation -45 % sur une matrice peu
+# compressible, meme temps (voir CLUSTER.md). Sorties dans des repertoires
+# separes (suffixe _noomp) pour ne jamais melanger les deux variantes ;
+# meme option que le Makefile racine, qui doit avoir ete construit avec.
+OPENMP ?= 1
+ifeq ($(OPENMP),0)
+  OMPF   =
+  MKLTHR = -lmkl_sequential
+  SUFFIX = _noomp
+else
+  OMPF   = -qopenmp
+  MKLTHR = -lmkl_intel_thread
+  SUFFIX =
+endif
+
+LIBDIR = lib$(SUFFIX)
+BINDIR = bin$(SUFFIX)
+MAIN   = ../lib$(SUFFIX)
 SRC    = src
 TEST   = test
 EX     = examples
 
 # -module $(LIBDIR) : .mod du LDL^T ecrits ici ; -I$(MAIN) : .mod du projet
 # principal relus la-bas.
-OPTF = -O2 -qopenmp -warn all -check bounds -module $(LIBDIR) -I$(MAIN)
+OPTF = -O2 $(OMPF) -warn all -check bounds -module $(LIBDIR) -I$(MAIN)
 
 $(shell mkdir -p $(BINDIR) $(LIBDIR))
 
-LIBMKL  = -L$(MKLROOT)/lib -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core
+LIBMKL  = -L$(MKLROOT)/lib -lmkl_intel_lp64 $(MKLTHR) -lmkl_core
 LIBS    = $(LIBMKL) -lpthread -lm -ldl
 MPILIBS = -L$(IMPI_LIBDIR) $(LIBS)
 
@@ -37,7 +56,14 @@ MAIN_OBJS = $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_
 
 LDLT_OBJS = $(LIBDIR)/mpi_blr_ldlt_mod.o $(LIBDIR)/mpi_blr_ldlt_arena_mod.o $(LIBDIR)/mpi_blr_ldlt_ooc_mod.o $(LIBDIR)/sym_testmat_mod.o
 
-all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/test_mpi_blr_ldlt_arena $(BINDIR)/test_mpi_blr_ldlt_ooc $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu $(BINDIR)/bench_steps $(BINDIR)/sweep_driver $(BINDIR)/bench_diag_kernels
+# bench_diag_kernels mesure les noyaux a 1/2 threads OpenMP : exclu en OPENMP=0.
+ifeq ($(OPENMP),0)
+  OMP_BENCH =
+else
+  OMP_BENCH = $(BINDIR)/bench_diag_kernels
+endif
+
+all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/test_mpi_blr_ldlt_arena $(BINDIR)/test_mpi_blr_ldlt_ooc $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu $(BINDIR)/bench_steps $(BINDIR)/sweep_driver $(OMP_BENCH)
 
 $(LIBDIR)/mpi_blr_ldlt_mod.o: $(SRC)/mpi_blr_ldlt_mod.f90 $(MAIN)/mpi_blr_matrix_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_mod.f90 -o $@

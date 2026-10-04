@@ -70,7 +70,7 @@ MODULE MPI_BLR_LDLT_MOD
                                  STAGE_PROGRESS_CALLBACK_IFACE, STAGE_PROGRESS_SHOULD_FIRE, &
                                 RHS_LOCAL_RANGE_MBM, RHS_NUMROC_MBM
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
-  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
+  USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB, BLR_TRIM_HEAP
   IMPLICIT NONE
 
   ! Triangle inferieur (diagonale comprise) d'un bloc diagonal KW x KW,
@@ -1007,6 +1007,7 @@ CONTAINS
       END DO
 
       DEALLOCATE(IPIV_K, SWP, DBUF)
+      CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('2) Factorisation LDLt (Bunch-Kaufman confine)', K, NBLK, PBAR_STATE)
       IF (PRESENT(PROGRESS_CALLBACK)) THEN
         IF (STAGE_PROGRESS_SHOULD_FIRE(K, NBLK)) CALL PROGRESS_CALLBACK(K, NBLK)

@@ -20,10 +20,29 @@ MPIFC = mpiifx
 # fois chez ifx : ecrire les .mod produits ET les chercher pour les USE,
 # quel que soit le sous-dossier du .f90 source -- pas besoin de -I
 # supplementaire.
-OBJDIR = build
-OPTF = -O2 -qopenmp -warn all -check bounds -module $(OBJDIR)
+# OPENMP=0 (`make OPENMP=0`) : compile SANS OpenMP et lie MKL SEQUENTIEL
+# (pas de libiomp5). Recommande pour les runs MPI purs (1 thread par
+# processus) : avec ifx, des que libiomp5 est lie, tous les ALLOCATE passent
+# par l'allocateur du runtime OpenMP d'Intel, qui ne rend jamais la memoire
+# liberee -- mesure : RSS de factorisation -45 % sur une matrice peu
+# compressible, meme temps (voir CLUSTER.md). Sorties dans des repertoires
+# separes (suffixe _noomp) pour ne jamais melanger les deux variantes.
+OPENMP ?= 1
+ifeq ($(OPENMP),0)
+  OMPF   =
+  MKLTHR = -lmkl_sequential
+  SUFFIX = _noomp
+else
+  OMPF   = -qopenmp
+  MKLTHR = -lmkl_intel_thread
+  SUFFIX =
+endif
 
-LIBMKL = -L$(MKLROOT)/lib -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core
+OBJDIR = build$(SUFFIX)
+EXE = example_blr_mpi_pivot_user$(SUFFIX)
+OPTF = -O2 $(OMPF) -warn all -check bounds -module $(OBJDIR)
+
+LIBMKL = -L$(MKLROOT)/lib -lmkl_intel_lp64 $(MKLTHR) -lmkl_core
 SCALAPACKLIBS = -lmkl_scalapack_lp64 -lmkl_blacs_intelmpi_lp64
 MPILIBS = -L$(IMPI_LIBDIR) -L$(MKLROOT)/lib $(SCALAPACKLIBS) $(LIBMKL) -lpthread -lm -ldl
 
@@ -31,7 +50,7 @@ MPILIBS = -L$(IMPI_LIBDIR) -L$(MKLROOT)/lib $(SCALAPACKLIBS) $(LIBMKL) -lpthread
 # argument construit la premiere regle rencontree, pas forcement "all"
 # (piege reellement rencontre en ecrivant ce Makefile -- `make` avait
 # construit uniquement blr_kinds_mod.o).
-all: example_blr_mpi_pivot_user
+all: $(EXE)
 
 # Cree OBJDIR avant toute compilation -- prerequis "order-only" (apres le
 # |, dans chaque regle .o ci-dessous) : garantit que le dossier existe
@@ -127,9 +146,9 @@ $(OBJDIR)/user_matrix_mod.o: matrix/user_matrix_mod.f90 $(OBJDIR)/mpi_blr_matrix
 $(OBJDIR)/example_blr_mpi_pivot_user.o: example_blr_mpi_pivot_user.f90 $(LOCALOBJS) | $(OBJDIR)
 	$(MPIFC) $(OPTF) -c example_blr_mpi_pivot_user.f90 -o $@
 
-example_blr_mpi_pivot_user: $(LIBOBJS) $(RANDGENOBJS) $(LOCALOBJS) $(OBJDIR)/example_blr_mpi_pivot_user.o
+$(EXE): $(LIBOBJS) $(RANDGENOBJS) $(LOCALOBJS) $(OBJDIR)/example_blr_mpi_pivot_user.o
 	$(MPIFC) -o $@ $(OPTF) $(LIBOBJS) $(RANDGENOBJS) $(LOCALOBJS) $(OBJDIR)/example_blr_mpi_pivot_user.o $(MPILIBS)
 
 clean:
 	$(RM) -r $(OBJDIR)
-	$(RM) *__genmod.f90 example_blr_mpi_pivot_user
+	$(RM) *__genmod.f90 $(EXE)

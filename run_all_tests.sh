@@ -9,9 +9,11 @@
 # manuellement si besoin) ni les scripts de performance de bench/ (voir
 # CLUSTER.md -- ce script teste la CORRECTION, pas la performance).
 #
-# Usage : ./run_all_tests.sh [intel|gcc]   (depuis blr_solver/, apres avoir
+# Usage : ./run_all_tests.sh [intel|intel-noomp|gcc]   (depuis blr_solver/, apres avoir
 #         source l'environnement -- voir INSTALL.md)
 #   intel (defaut) : Makefile (ifx+MKL+Intel MPI), binaires dans bin/.
+#   intel-noomp    : Makefile avec OPENMP=0 (sans OpenMP, MKL sequentiel),
+#                     binaires dans bin_noomp/ (test_openmp_dense saute).
 #   gcc            : Makefile.gcc (gfortran+BLAS/LAPACK+OpenMPI), binaires
 #                     dans build-gcc/ -- chemin utilise par la CI (voir
 #                     .github/workflows/ci.yml), aucune licence Intel requise.
@@ -20,21 +22,26 @@ set -u
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 TOOLCHAIN="${1:-intel}"
+MAKEARGS=""
 if [ "$TOOLCHAIN" = "gcc" ]; then
   MAKEFILE="Makefile.gcc"
   BINDIR="build-gcc"
+elif [ "$TOOLCHAIN" = "intel-noomp" ]; then
+  MAKEFILE="Makefile"
+  MAKEARGS="OPENMP=0"
+  BINDIR="bin_noomp"
 else
   MAKEFILE="Makefile"
   BINDIR="bin"
 fi
 
 echo "=== Compilation (chaine: $TOOLCHAIN) ==="
-if ! make -f "$MAKEFILE" -j4; then
+if ! make -f "$MAKEFILE" $MAKEARGS -j4; then
   echo "ECHEC DE COMPILATION -- voir la sortie ci-dessus."
   exit 1
 fi
 # LDL^T (ldlt/, reutilise les .o/.mod ci-dessus -- doit venir apres).
-if ! make -C ldlt -f "$MAKEFILE" -j4; then
+if ! make -C ldlt -f "$MAKEFILE" $MAKEARGS -j4; then
   echo "ECHEC DE COMPILATION (ldlt/) -- voir la sortie ci-dessus."
   exit 1
 fi
@@ -91,7 +98,7 @@ run_test test_block_lu            "$BINDIR/test_block_lu" 500 32
 run_test test_blr_compress        "$BINDIR/test_blr_compress"
 run_test test_blr_workspace       "$BINDIR/test_blr_workspace"
 run_test test_blr_matrix_progress "$BINDIR/test_blr_matrix_progress"
-run_test test_openmp_dense        "$BINDIR/test_openmp_dense" 1000 100
+[ "$TOOLCHAIN" != "intel-noomp" ] && run_test test_openmp_dense        "$BINDIR/test_openmp_dense" 1000 100
 
 echo "=== Tests MPI (grille 2x2) ==="
 run_test test_mpi_grid             mpirun -np 4 "$BINDIR/test_mpi_grid" 2 2 500 50

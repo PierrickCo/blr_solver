@@ -48,7 +48,7 @@ MODULE BLR_MATRIX_MOD
   USE BLR_COMPRESS_MOD
   USE PROGRESS_BAR_MOD
   USE THREAD_CONTROL_MOD, ONLY: SET_NUM_THREADS
-  USE OMP_LIB
+  USE BLR_KINDS_MOD, ONLY: BLR_WALLTIME, BLR_MAX_THREADS, BLR_THREAD_INDEX
   IMPLICIT NONE
 
   TYPE :: DENSE_PANEL_T
@@ -110,13 +110,13 @@ CONTAINS
     ! case disjointe de DIAGBLK/OFFBLK) -- un workspace SVD par thread
     ! (jamais partage, voir la note de thread-safety de BLR_WORKSPACE_T).
     ! Suppose GET_BLOCK thread-safe (formule pure, sans etat partage).
-    NTHREADS = OMP_GET_MAX_THREADS()
+    NTHREADS = BLR_MAX_THREADS()
     ALLOCATE(WSARR(NTHREADS))
     DO TID = 1, NTHREADS
       CALL BLR_WORKSPACE_ALLOC(WSARR(TID), NB)
     END DO
 
-    T0 = OMP_GET_WTIME()
+    T0 = BLR_WALLTIME()
     CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
     A_BLR%N = N
     A_BLR%NB = NB
@@ -150,7 +150,7 @@ CONTAINS
           IF (RSVD_FLAG) THEN
             CALL COMPRESS_BLOCK_RSVD_ADAPTIVE(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(I,J))
           ELSE
-            CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(I,J), WSARR(OMP_GET_THREAD_NUM()+1))
+            CALL COMPRESS_BLOCK(MI, NJ, TMP, MI, TOL, A_BLR%OFFBLK(I,J), WSARR(BLR_THREAD_INDEX()))
           END IF
           N_OFFDIAG = N_OFFDIAG + 1
           IF (A_BLR%OFFBLK(I,J)%IS_LOWRANK) THEN
@@ -168,7 +168,7 @@ CONTAINS
       END DO
     END DO
     !$OMP END PARALLEL DO
-    T_ASSEMBLE_COMPRESS = OMP_GET_WTIME() - T0
+    T_ASSEMBLE_COMPRESS = BLR_WALLTIME() - T0
 
     DO TID = 1, NTHREADS
       CALL BLR_WORKSPACE_FREE(WSARR(TID))
@@ -224,13 +224,13 @@ CONTAINS
     ! Un workspace QR+SVD par thread (mise a jour de Schur parallelisee
     ! ci-dessous) -- NB suffit comme taille : MI,NJ<=NB et le rang
     ! recompresse RTOT<=RMAX<NB.
-    NTHREADS = OMP_GET_MAX_THREADS()
+    NTHREADS = BLR_MAX_THREADS()
     ALLOCATE(WSARR(NTHREADS))
     DO TID = 1, NTHREADS
       CALL BLR_WORKSPACE_ALLOC(WSARR(TID), A_BLR%NB)
     END DO
 
-    T0 = OMP_GET_WTIME()
+    T0 = BLR_WALLTIME()
     NBLK = A_BLR%NBLK
     INFO = 0
     N_COMPRESSED = 0
@@ -305,7 +305,7 @@ CONTAINS
             ! factorisation (835s a N=10000/NB=100 avant cette optimisation)
             CALL SCHUR_UPDATE_BLR_BLOCK(A_BLR%OFFBLK(I,J), MI, NJ, KW, &
                                          A_BLR%OFFBLK(I,K), A_BLR%OFFBLK(K,J), TOL, &
-                                         WSARR(OMP_GET_THREAD_NUM()+1))
+                                         WSARR(BLR_THREAD_INDEX()))
           END IF
         END DO
       END DO
@@ -315,7 +315,7 @@ CONTAINS
     END DO
 
     CALL SET_NUM_THREADS(NTHREADS)
-    IF (PRESENT(T_FACTOR)) T_FACTOR = OMP_GET_WTIME() - T0
+    IF (PRESENT(T_FACTOR)) T_FACTOR = BLR_WALLTIME() - T0
 
     DO TID = 1, NTHREADS
       CALL BLR_WORKSPACE_FREE(WSARR(TID))
@@ -346,7 +346,7 @@ CONTAINS
     NDONE = 0
     PBAR_STATE = -1
     NTOTAL = 2*NBLK
-    NTHREADS = OMP_GET_MAX_THREADS()
+    NTHREADS = BLR_MAX_THREADS()
 
     ! L*Y = B (substitution avant, L unitaire, diagonale implicite). La
     ! boucle externe sur K est sequentielle (K depend du resultat de K-1) ;
