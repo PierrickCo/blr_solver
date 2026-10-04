@@ -119,6 +119,10 @@ run_test ldlt_2x2_tol0           mpirun -np 4 "$LDLT_BINDIR/test_mpi_blr_ldlt" 2
 run_bench ldlt_example           mpirun -np 4 "$LDLT_BINDIR/example_blr_mpi_ldlt" 2 2 1500 125 6 1e-4 \
                                    --check-error --check-residual --use-rsvd --nrhs-batch=4
 run_test ldlt_bench_vs_lu        mpirun -np 4 "$LDLT_BINDIR/bench_ldlt_vs_lu" 2 2 1500 125 4 1e-4
+# Resolution distribuee (descente + remontee, DESCENT_MODE=2) : forcee, puis
+# choisie automatiquement (NRHS=40 > 1.5 x largeur effective de L).
+run_test ldlt_resol_distribuee    mpirun -np 4 "$LDLT_BINDIR/bench_ldlt_vs_lu" 2 2 1500 125 9 1e-4 1 50 0.01 1 1 2
+run_test ldlt_resol_auto_nrhs40   mpirun -np 4 "$LDLT_BINDIR/test_mpi_blr_ldlt" 2 2 1200 100 40 1e-4
 # Variantes arena et out-of-core (budget 1 Mo par cache : evictions reelles).
 run_test ldlt_arena_2x3          mpirun -np 6 "$LDLT_BINDIR/test_mpi_blr_ldlt_arena" 2 3 1500 125 5 1e-4
 run_test ldlt_ooc_2x2            mpirun -np 4 "$LDLT_BINDIR/test_mpi_blr_ldlt_ooc" 2 2 3000 150 7 1e-4 1 3 "$LDLT_BINDIR/ldlt_ooc_scratch_ci"

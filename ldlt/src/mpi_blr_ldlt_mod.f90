@@ -1195,7 +1195,7 @@ CONTAINS
   ! ecrase par X. Generique sur la largeur NRHS (appelable par lot).
   !=======================================================================
   SUBROUTINE MPI_BLR_SYM_LDLT_SOLVE_2D(GRID, A, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS, PROGRESS_CALLBACK, &
-                                       T_PHASES)
+                                       T_PHASES, DESCENT_MODE)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)         :: GRID
     TYPE(MPI_BLR_SYM_T), INTENT(IN)  :: A
@@ -1206,9 +1206,30 @@ CONTAINS
     ! T_PHASES (optionnel) : temps MAX sur la grille de (1) Q*B + descente L,
     ! (2) D, (3) remontee L^T + Q^T.
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_PHASES(3)
+    ! DESCENT_MODE (optionnel, defaut 0 = automatique) : algorithme de la
+    ! descente L ET de la remontee L^T (memes deux schemas, symetriques ;
+    ! en mode 2 la remontee reduit S = sum L(I,K)^T*Y_I sur MES seconds
+    ! membres le long de la colonne de grille, sans copie pleine largeur).
+    !   1 = "colonne" : X_K rassemble pleine largeur sur la colonne de grille
+    !       PCOL_K, qui calcule seule les contributions L(I,K)*X_K pour TOUS
+    !       les seconds membres puis les disperse le long des lignes.
+    !       Communications proportionnelles a NRHS ; une seule colonne de
+    !       grille calcule a chaque etape.
+    !   2 = "distribuee" : X_K (tranche locale de seconds membres) diffuse le
+    !       long de la colonne de grille, colonne L(.,K) de mes lignes diffusee
+    !       COMPRESSEE le long de la ligne de grille (un paquet : en-tetes +
+    !       donnees), chaque processus applique L a SES seconds membres --
+    !       toutes les colonnes de grille calculent ; volume de L independant
+    !       de NRHS.
+    !   0 = choix automatique (voir DESCENT_AUTO).
+    INTEGER, INTENT(IN), OPTIONAL :: DESCENT_MODE
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
+    COMPLEX(WP), ALLOCATABLE :: LBUF(:), TR(:,:)
+    INTEGER, ALLOCATABLE :: HDR(:,:)
+    INTEGER :: DMODE, NT, IT, OFF, R, RSI
+    INTEGER(8) :: NTOT8
     DOUBLE PRECISION :: TPH(3), TPH0
     COMPLEX(WP), ALLOCATABLE :: XFULL(:,:), S(:,:), SSUM(:,:), SLOC(:,:)
     INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
@@ -1227,6 +1248,9 @@ CONTAINS
     DO C = 0, GRID%PC-1
       CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
     END DO
+    DMODE = 0
+    IF (PRESENT(DESCENT_MODE)) DMODE = DESCENT_MODE
+    IF (DMODE .NE. 1 .AND. DMODE .NE. 2) DMODE = DESCENT_AUTO(GRID, A, NRHS)
 
     TPH0 = MPI_WTIME()
     ! === 0) B <- Q*B : echanges de chaque bloc, dans l'ordre, sur le B
@@ -1254,6 +1278,10 @@ CONTAINS
         DEALLOCATE(DKK)
         ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
         IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
+      END IF
+      IF (DMODE .EQ. 2) THEN
+        CALL DESCENT_STEP_DISTRIBUTED()
+        CYCLE
       END IF
       IF (GRID%MYCOL .EQ. PCOL_K) THEN
         ALLOCATE(XK_FULL(KW,NRHS))
@@ -1328,13 +1356,19 @@ CONTAINS
       CALL APPLY_DINV_LEFT(B_LOCAL(RS,1), LDB, KW, NRHS_LOC, A%IPIV(1:KW,K), A%DDIAG(1:KW,K), A%DSUB(1:KW,K))
     END DO
 
+    TPH(2) = MPI_WTIME() - TPH0; TPH0 = MPI_WTIME()
+    IF (DMODE .EQ. 2) THEN
+      ! 3) L^T*Y = W, remontee distribuee : voir UPWARD_STEP_DISTRIBUTED.
+      DO K = NBLK, 1, -1
+        CALL UPWARD_STEP_DISTRIBUTED()
+      END DO
+    ELSE
     ! 3) L^T*Y = W, remontee "pleine largeur" : chaque processus recupere
     !    une fois ses lignes de W sur TOUTE la largeur NRHS (XFULL, un
     !    ALLGATHERV par ligne de grille). Etape K : la colonne PCOL_K calcule
     !    sum_(I>K) L(I,K)^T*Y_I et la reduit sur (PROW_K,PCOL_K), proprietaire
     !    du bloc diagonal, qui resout L_KK^T et diffuse Y_K sur sa ligne.
     !    2 communications par etape, aucune diffusion du bloc diagonal.
-    TPH(2) = MPI_WTIME() - TPH0; TPH0 = MPI_WTIME()
     ALLOCATE(XFULL(MAX(MLOC,1),NRHS))
     XFULL = CZERO
     ALLOCATE(XK_LOC(MAX(MLOC,1),MAX(NRHS_LOC,1)))
@@ -1398,6 +1432,7 @@ CONTAINS
     IF (MLOC.GT.0 .AND. NRHS_LOC.GT.0) &
       B_LOCAL(1:MLOC,1:NRHS_LOC) = XFULL(1:MLOC, RSTARTS(GRID%MYCOL):RSTARTS(GRID%MYCOL)+NRHS_LOC-1)
     DEALLOCATE(XFULL)
+    END IF
 
     ! === 4) X = Q^T*Y : echanges de chaque bloc dans l'ordre INVERSE ===
     DO K = 1, NBLK
@@ -1413,6 +1448,238 @@ CONTAINS
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
     TPH(3) = MPI_WTIME() - TPH0
     IF (PRESENT(T_PHASES)) CALL MPI_ALLREDUCE(TPH, T_PHASES, 3, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+
+  CONTAINS
+
+    ! Etape K de la descente "distribuee" (DESCENT_MODE=2), apres la
+    ! resolution L_KK sur la ligne PROW_K (XK_LOC = tranche locale de X_K).
+    SUBROUTINE DESCENT_STEP_DISTRIBUTED()
+      INTEGER :: LID, ID, MID, RSD, IERRD
+      ! X_K, tranche locale de seconds membres, le long de la colonne de grille
+      IF (.NOT. ALLOCATED(XK_LOC)) ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
+      IF (NRHS_LOC .GT. 0) CALL MPI_BCAST(XK_LOC, KW*NRHS_LOC, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERRD)
+      CALL BCAST_LCOL()
+      IF (NT .GT. 0) THEN
+        ! B(I) -= L(I,K) * X_K sur mes seconds membres
+        IF (NRHS_LOC .GT. 0) THEN
+          OFF = 1; IT = 0; RSD = 1
+          DO LID = 1, A%NBLKR_LOC
+            ID = (LID-1)*GRID%PR + GRID%MYROW + 1
+            MID = A%BEND(ID) - A%BSTART(ID) + 1
+            IF (ID .GT. K) THEN
+              IT = IT + 1
+              IF (HDR(1,IT) .EQ. 1) THEN
+                R = HDR(2,IT)
+                IF (R .GT. 0) THEN
+                  ALLOCATE(TR(R,NRHS_LOC))
+                  CALL CGEMM('N', 'N', R, NRHS_LOC, KW, CONE, LBUF(OFF+MID*R), R, XK_LOC, KW, CZERO, TR, R)
+                  CALL CGEMM('N', 'N', MID, NRHS_LOC, R, -CONE, LBUF(OFF), MID, TR, R, CONE, B_LOCAL(RSD,1), LDB)
+                  DEALLOCATE(TR)
+                END IF
+                OFF = OFF + (MID+KW)*R
+              ELSE
+                CALL CGEMM('N', 'N', MID, NRHS_LOC, KW, -CONE, LBUF(OFF), MID, XK_LOC, KW, CONE, B_LOCAL(RSD,1), LDB)
+                OFF = OFF + MID*KW
+              END IF
+            END IF
+            RSD = RSD + MID
+          END DO
+        END IF
+        DEALLOCATE(HDR, LBUF)
+      END IF
+      DEALLOCATE(XK_LOC)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Resolution LDLt', STEP, NSTEPS, PBAR_STATE)
+      IF (PRESENT(PROGRESS_CALLBACK)) THEN
+        IF (STAGE_PROGRESS_SHOULD_FIRE(STEP, NSTEPS)) CALL PROGRESS_CALLBACK(STEP, NSTEPS)
+      END IF
+    END SUBROUTINE DESCENT_STEP_DISTRIBUTED
+
+    ! Diffuse le long de la ligne de grille, depuis PCOL_K, la colonne
+    ! L(.,K) restreinte a MES blocs-lignes I>K : en-tetes HDR(2,NT)
+    ! (bas-rang ?, rang) puis donnees empilees dans LBUF (UFAC puis VFAC,
+    ! ou DENSE), deux diffusions. Meme liste de lignes pour tout ROW_COMM
+    ! (meme MYROW) : condition uniforme. NT = 0 : rien n'est alloue.
+    SUBROUTINE BCAST_LCOL()
+      INTEGER :: LID, ID, MID, LJD, IERRD
+      NT = 0
+      DO LID = 1, A%NBLKR_LOC
+        ID = (LID-1)*GRID%PR + GRID%MYROW + 1
+        IF (ID .GT. K) NT = NT + 1
+      END DO
+      IF (NT .EQ. 0) RETURN
+      LJD = SYM_COL_LOCAL(A%CMAP, K, GRID)
+      ALLOCATE(HDR(2,NT))
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        IT = 0
+        DO LID = 1, A%NBLKR_LOC
+          ID = (LID-1)*GRID%PR + GRID%MYROW + 1
+          IF (ID .LE. K) CYCLE
+          IT = IT + 1
+          HDR(1,IT) = MERGE(1, 0, A%OFFBLK(LID,LJD)%IS_LOWRANK)
+          HDR(2,IT) = A%OFFBLK(LID,LJD)%RANK
+        END DO
+      END IF
+      CALL MPI_BCAST(HDR, 2*NT, MPI_INTEGER, PCOL_K, GRID%ROW_COMM, IERRD)
+      NTOT8 = 0_8; IT = 0
+      DO LID = 1, A%NBLKR_LOC
+        ID = (LID-1)*GRID%PR + GRID%MYROW + 1
+        IF (ID .LE. K) CYCLE
+        IT = IT + 1
+        MID = A%BEND(ID) - A%BSTART(ID) + 1
+        IF (HDR(1,IT) .EQ. 1) THEN
+          NTOT8 = NTOT8 + INT(MID+KW,8)*INT(HDR(2,IT),8)
+        ELSE
+          NTOT8 = NTOT8 + INT(MID,8)*INT(KW,8)
+        END IF
+      END DO
+      ALLOCATE(LBUF(MAX(NTOT8,1_8)))
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        OFF = 1
+        DO LID = 1, A%NBLKR_LOC
+          ID = (LID-1)*GRID%PR + GRID%MYROW + 1
+          IF (ID .LE. K) CYCLE
+          MID = A%BEND(ID) - A%BSTART(ID) + 1
+          ASSOCIATE (BK => A%OFFBLK(LID,LJD))
+            IF (BK%IS_LOWRANK) THEN
+              R = BK%RANK
+              IF (R .GT. 0) THEN
+                LBUF(OFF:OFF+MID*R-1) = RESHAPE(BK%UFAC, [MID*R])
+                LBUF(OFF+MID*R:OFF+(MID+KW)*R-1) = RESHAPE(BK%VFAC, [R*KW])
+              END IF
+              OFF = OFF + (MID+KW)*R
+            ELSE
+              LBUF(OFF:OFF+MID*KW-1) = RESHAPE(BK%DENSE, [MID*KW])
+              OFF = OFF + MID*KW
+            END IF
+          END ASSOCIATE
+        END DO
+      END IF
+      IF (NTOT8 .GT. 0) CALL MPI_BCAST(LBUF, INT(NTOT8), MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERRD)
+    END SUBROUTINE BCAST_LCOL
+
+    ! Etape K de la remontee "distribuee" (DESCENT_MODE=2) : chaque processus
+    ! calcule sur SES seconds membres S = sum_(I>K, mes lignes) L(I,K)^T*Y_I
+    ! (colonne L(.,K) recue par BCAST_LCOL), S est reduit le long de la
+    ! colonne de grille sur la ligne PROW_K, qui fait Y_K = L_KK^-T*(W_K - S)
+    ! en place dans B_LOCAL. Aucune copie pleine largeur (pas de XFULL), et
+    ! toutes les colonnes de grille calculent.
+    SUBROUTINE UPWARD_STEP_DISTRIBUTED()
+      INTEGER :: LID, ID, MID, RSD, IERRD
+      COMPLEX(WP), ALLOCATABLE :: SU(:,:), SR(:,:)
+      KW = A%BEND(K) - A%BSTART(K) + 1
+      PROW_K = MOD(K-1, GRID%PR)
+      PCOL_K = SYM_COL_OWNER(A%CMAP, K, GRID)
+      CALL BCAST_LCOL()
+      ALLOCATE(SU(KW,MAX(NRHS_LOC,1)))
+      SU = CZERO
+      IF (NT .GT. 0) THEN
+        IF (NRHS_LOC .GT. 0) THEN
+          OFF = 1; IT = 0; RSD = 1
+          DO LID = 1, A%NBLKR_LOC
+            ID = (LID-1)*GRID%PR + GRID%MYROW + 1
+            MID = A%BEND(ID) - A%BSTART(ID) + 1
+            IF (ID .GT. K) THEN
+              IT = IT + 1
+              IF (HDR(1,IT) .EQ. 1) THEN
+                R = HDR(2,IT)
+                IF (R .GT. 0) THEN
+                  ALLOCATE(TR(R,NRHS_LOC))
+                  ! L^T*Y = V^T*(U^T*Y)
+                  CALL CGEMM('T', 'N', R, NRHS_LOC, MID, CONE, LBUF(OFF), MID, B_LOCAL(RSD,1), LDB, CZERO, TR, R)
+                  CALL CGEMM('T', 'N', KW, NRHS_LOC, R, CONE, LBUF(OFF+MID*R), R, TR, R, CONE, SU, KW)
+                  DEALLOCATE(TR)
+                END IF
+                OFF = OFF + (MID+KW)*R
+              ELSE
+                CALL CGEMM('T', 'N', KW, NRHS_LOC, MID, CONE, LBUF(OFF), MID, B_LOCAL(RSD,1), LDB, CONE, SU, KW)
+                OFF = OFF + MID*KW
+              END IF
+            END IF
+            RSD = RSD + MID
+          END DO
+        END IF
+        DEALLOCATE(HDR, LBUF)
+      END IF
+      ! Reduction sur la ligne PROW_K (tous les membres de la colonne de
+      ! grille, meme ceux sans ligne I>K : condition uniforme K < NBLK).
+      IF (K .LT. NBLK .AND. NRHS_LOC .GT. 0) THEN
+        IF (GRID%MYROW .EQ. PROW_K) THEN
+          ALLOCATE(SR(KW,NRHS_LOC))
+        ELSE
+          ALLOCATE(SR(1,1))
+        END IF
+        CALL MPI_REDUCE(SU, SR, KW*NRHS_LOC, MPI_COMPLEX, MPI_SUM, PROW_K, GRID%COL_COMM, IERRD)
+      END IF
+      IF (GRID%MYROW .EQ. PROW_K) THEN
+        CALL BCAST_DIAG_LOWER(A, K, KW, GRID%MYCOL.EQ.PCOL_K, PCOL_K, GRID%ROW_COMM, DKK)
+        IF (NRHS_LOC .GT. 0) THEN
+          RSD = LOCAL_ROW_OFFSET_SYM(A, GRID, K)
+          IF (K .LT. NBLK) B_LOCAL(RSD:RSD+KW-1,1:NRHS_LOC) = B_LOCAL(RSD:RSD+KW-1,1:NRHS_LOC) - SR
+          CALL CTRSM('Left', 'Lower', 'Transpose', 'Unit', KW, NRHS_LOC, CONE, DKK, KW, B_LOCAL(RSD,1), LDB)
+        END IF
+        DEALLOCATE(DKK)
+      END IF
+      IF (ALLOCATED(SR)) DEALLOCATE(SR)
+      DEALLOCATE(SU)
+      STEP = STEP + 1
+      IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Resolution LDLt', STEP, NSTEPS, PBAR_STATE)
+      IF (PRESENT(PROGRESS_CALLBACK)) THEN
+        IF (STAGE_PROGRESS_SHOULD_FIRE(STEP, NSTEPS)) CALL PROGRESS_CALLBACK(STEP, NSTEPS)
+      END IF
+    END SUBROUTINE UPWARD_STEP_DISTRIBUTED
+
   END SUBROUTINE MPI_BLR_SYM_LDLT_SOLVE_2D
+
+  ! Largeur effective moyenne de L : stockage total des blocs I>J (dense
+  ! M*N, bas-rang R*(M+N)) divise par la somme des M, i.e. nombre moyen de
+  ! colonnes equivalentes par ligne de L. C'est le volume de L diffuse par
+  ! ligne de matrice et par etape en mode 2, a comparer a NRHS (mode 1).
+  REAL(WP) FUNCTION SYM_L_EFFECTIVE_WIDTH(GRID, A)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    TYPE(MPI_BLR_SYM_T), INTENT(IN) :: A
+    INTEGER :: li, lj, I, J, IERR
+    DOUBLE PRECISION :: LOC(2), GLOB(2)
+    LOC = 0.0D0
+    DO li = 1, A%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A%NBLKC_LOC
+        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        IF (I .LE. J) CYCLE
+        ASSOCIATE (BK => A%OFFBLK(li,lj))
+          IF (BK%IS_LOWRANK) THEN
+            LOC(1) = LOC(1) + DBLE(BK%RANK)*DBLE(BK%M + BK%N)
+          ELSE
+            LOC(1) = LOC(1) + DBLE(BK%M)*DBLE(BK%N)
+          END IF
+          LOC(2) = LOC(2) + DBLE(BK%M)
+        END ASSOCIATE
+      END DO
+    END DO
+    CALL MPI_ALLREDUCE(LOC, GLOB, 2, MPI_DOUBLE_PRECISION, MPI_SUM, GRID%COMM, IERR)
+    SYM_L_EFFECTIVE_WIDTH = REAL(GLOB(1)/MAX(GLOB(2),1.0D0), WP)
+  END FUNCTION SYM_L_EFFECTIVE_WIDTH
+
+  ! Choix automatique de la descente/remontee (DESCENT_MODE=0). Par etape
+  ! et par ligne de matrice, le mode 1 deplace et calcule de l'ordre de NRHS
+  ! colonnes sur une seule colonne de grille, le mode 2 diffuse la largeur
+  ! effective W de L (independante de NRHS) puis calcule sur toutes les
+  ! colonnes de grille. Mesure (N=16000, NB=400, TOL=1e-4, W=4.5, grilles
+  ! 2x2 et 2x4) : mode 1 meilleur a NRHS=1 (x1.5 a x1.8), egalite vers
+  ! NRHS=8, mode 2 x1.7 a NRHS=32 et x3 a NRHS=512-1024 -> mode 2 des que
+  ! NRHS > 1.5*W. Decision identique sur toute la grille (W reduit).
+  INTEGER FUNCTION DESCENT_AUTO(GRID, A, NRHS)
+    TYPE(GRID_T), INTENT(IN)        :: GRID
+    TYPE(MPI_BLR_SYM_T), INTENT(IN) :: A
+    INTEGER, INTENT(IN)             :: NRHS
+    REAL(WP) :: W
+    W = SYM_L_EFFECTIVE_WIDTH(GRID, A)
+    IF (REAL(NRHS,WP) .GT. 1.5_WP*W) THEN
+      DESCENT_AUTO = 2
+    ELSE
+      DESCENT_AUTO = 1
+    END IF
+  END FUNCTION DESCENT_AUTO
 
 END MODULE MPI_BLR_LDLT_MOD

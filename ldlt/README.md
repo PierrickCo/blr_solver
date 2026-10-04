@@ -55,12 +55,27 @@ déjà construits (même principe que `legacy/`).
   colonnes + TRSM) ; le reste du Schur de l'étape K recouvre le tout, et
   l'étape K+1 commence par un `MPI_WAITALL`. Résultat numérique identique
   (mêmes opérations, seul l'ordre change).
-- **Résolution** : Q·B → descente L (algorithme du LU) → D (local, aucune
-  communication) → remontée Lᵀ « pleine largeur » : chaque processus garde
-  ses lignes du second membre sur toute la largeur ; à chaque étape, une
-  réduction le long d'une colonne de grille vers le propriétaire du bloc
-  diagonal, qui résout et diffuse le résultat sur sa ligne (2 communications
-  par étape, aucune diffusion du bloc diagonal) → Qᵀ.
+- **Résolution** : Q·B → descente L → D (local, aucune communication) →
+  remontée Lᵀ → Qᵀ. Deux schémas pour la descente et la remontée
+  (`DESCENT_MODE` de `MPI_BLR_SYM_LDLT_SOLVE_2D`, choix automatique par
+  défaut) :
+  - **mode 1, « colonne »** : à l'étape K, X_K est rassemblé sur toute la
+    largeur des seconds membres sur la colonne de grille propriétaire de K,
+    qui calcule seule les contributions puis les disperse (descente) ; la
+    remontée garde une copie pleine largeur du second membre (XFULL) et
+    réduit vers le propriétaire du bloc diagonal. Communications
+    proportionnelles à NRHS, une seule colonne de grille calcule par étape ;
+  - **mode 2, « distribué »** : X_K (ma tranche de seconds membres) est
+    diffusé le long de la colonne de grille, la colonne L(·,K) de mes lignes
+    est diffusée **compressée** le long de la ligne de grille (un paquet :
+    en-têtes + données), et chaque processus applique L (descente) ou Lᵀ
+    (remontée, suivie d'une réduction le long de la colonne de grille) à
+    **ses** seconds membres. Toutes les colonnes de grille calculent, le
+    volume de L ne dépend pas de NRHS, et la remontée n'a plus de copie
+    pleine largeur ;
+  - **automatique** : mode 2 si NRHS > 1,5 × W, où W est la largeur
+    effective de L (stockage des blocs I>J divisé par la somme de leurs
+    lignes, 4,5 à 7,8 sur la matrice de démo).
 
 Conventions **vérifiées numériquement**, pas supposées d'après la
 documentation : Pᵀ·A·P = L·D·Lᵀ, échanges (k,|IPIV(k)|) appliqués dans
@@ -261,6 +276,29 @@ l'étape K, qui attend la factorisation de K) — leur somme vaut à elle seule
 est trop léger (≈ 0.05 s en tout) pour la recouvrir. Ce plancher croît comme
 N·NB² : c'est ce qui fait préférer NB=400–600 au balayage de paramètres.
 
+## Résolution distribuée (2026-10-04, mesurée)
+
+Résolution LDLᵀ (s), N=16000, NB=400, TOL=1e-4 (W=4,5), 1 thread, 2 runs :
+
+| Grille | NRHS | mode 1 (colonne) | mode 2 (distribué) | gain |
+|---|---|---|---|---|
+| 2×2 | 1 | 0,019–0,022 | 0,031–0,032 | ×0,65 |
+| 2×2 | 8 | 0,044–0,045 | 0,038–0,043 | ≈ |
+| 2×2 | 32 | 0,102–0,105 | 0,061–0,064 | ×1,7 |
+| 2×2 | 128 | 0,315–0,325 | 0,140–0,144 | ×2,3 |
+| 2×2 | 512 | 1,38–1,41 | 0,52–0,54 | ×2,6 |
+| 2×2 | 1024 | 2,65–2,79 | 0,88–1,04 | ×2,9 |
+| 2×4 | 1 | 0,037–0,038 | 0,065–0,068 | ×0,55 |
+| 2×4 | 128 | 0,34–0,35 | 0,16–0,19 | ×2,0 |
+| 2×4 | 512 | 1,35 | 0,41–0,46 | ×3,1 |
+| 2×4 | 1024 | 2,70–2,81 | 0,85–0,89 | ×3,2 |
+
+Descente seule à NRHS=1024 : 1,86–1,96 → 0,46–0,53 s ; remontée :
+0,77–0,97 → 0,34–0,48 s. Le choix automatique prend le mode 1 en dessous
+d'environ 7 seconds membres sur cette matrice. La répartition des blocs
+diagonaux (`DIAG_SPREAD`) ne change pas le temps de résolution, quel que
+soit NRHS (mesuré jusqu'à 1024, écarts dans le bruit).
+
 ## Limites connues, assumées
 
 - **Attentes MPI dominantes** (60 à 90 % de la factorisation, LU compris) :
@@ -271,9 +309,11 @@ N·NB² : c'est ce qui fait préférer NB=400–600 au balayage de paramètres.
   diagonaux »). Leviers restants : factorisation diagonale plus rapide
   (multithreadée chez le propriétaire, ou NB plus petit), ou découpage du
   bloc diagonal en sous-blocs pour raccourcir la chaîne.
-- **Remontée Lᵀ** : copie pleine largeur `XFULL` (MLOC × NRHS) du second
-  membre — mémoire RHS ×PC pendant cette phase, bornée par `--nrhs-batch`
-  (et par paquet en OOC).
+- **Remontée Lᵀ en mode 1** : copie pleine largeur `XFULL` (MLOC × NRHS) du
+  second membre — mémoire RHS ×PC pendant cette phase, bornée par
+  `--nrhs-batch` (et par paquet en OOC). Le mode 2 n'en a pas besoin.
+- **Résolution distribuée (mode 2)** : version classique seulement ; les
+  variantes arena et OOC gardent le mode 1.
 - **OOC** : le budget `MAX_MB_PER_PROCESS` s'applique **à chacun des deux
   caches** (diagonal et hors-diagonale), comme dans le LU OOC — le résident
   peut atteindre 2× le budget. Coût fixe d'environ 2.5–3 ms par étape K
