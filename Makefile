@@ -39,7 +39,21 @@ else
   SUFFIX =
 endif
 
-OPTF = -O2 $(OMPF) -warn all -check bounds -module $(LIBDIR)
+# CHECK=0 (`make CHECK=0`) : compile SANS verification des bornes de
+# tableaux. Utile au developpement, couteuse a l'execution -- mesure
+# (N=40000, NB=500) : assemblage x2.4 (LDLt) a x3.5 (LU), factorisation LU
+# x1.7, resolution x1.1 a x1.4. Recommande pour les calculs de production ;
+# combinable avec OPENMP=0. Sorties dans des repertoires separes (suffixe
+# _nocheck) : make ne detecte pas un changement d'options.
+CHECK ?= 1
+ifeq ($(CHECK),0)
+  CHECKF =
+  SUFFIX := $(SUFFIX)_nocheck
+else
+  CHECKF = -check bounds
+endif
+
+OPTF = -O2 $(OMPF) -warn all $(CHECKF) -module $(LIBDIR)
 
 # -L$(IMPI_LIBDIR) EN PREMIER dans MPILIBS : sans ca, le linker peut
 # resoudre "-lmpi" vers un OpenMPI systeme non lie (/usr/lib/x86_64-

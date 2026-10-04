@@ -119,13 +119,19 @@ d'un cluster à l'autre.
 
 ## 5. Compilation pour les vrais calculs : OpenMP, mémoire et vérifications
 
-**Runs MPI purs (1 thread par processus) : compiler avec `OPENMP=0`.**
+**Runs MPI purs (1 thread par processus), calculs de production :
+compiler avec `OPENMP=0 CHECK=0`.**
 
 ```bash
-make OPENMP=0 && make -C ldlt OPENMP=0        # -> bin_noomp/, ldlt/bin_noomp/
-make -C user_case_dev OPENMP=0                # -> example_blr_mpi_pivot_user_noomp
-./run_all_tests.sh intel-noomp                # meme suite de tests, sans OpenMP
+make OPENMP=0 CHECK=0 && make -C ldlt OPENMP=0 CHECK=0   # -> bin_noomp_nocheck/, ldlt/bin_noomp_nocheck/
+make -C user_case_dev OPENMP=0 CHECK=0                   # -> example_blr_mpi_pivot_user_noomp_nocheck
+CHECK=0 ./run_all_tests.sh intel-noomp                   # meme suite de tests, meme compilation
 ```
+
+Les deux options sont indépendantes (`OPENMP=0` seule, `CHECK=0` seule, ou
+les deux) ; chaque combinaison a ses propres répertoires de sortie
+(suffixes `_noomp`, `_nocheck`), et les Makefiles `ldlt/` et
+`user_case_dev/` prennent les mêmes options que le Makefile racine.
 
 Pourquoi : avec ifx, dès que `libiomp5` (le runtime OpenMP d'Intel, amené
 par MKL threadée) est lié, **tous les `ALLOCATE` passent par l'allocateur
@@ -157,18 +163,19 @@ de factorisation sur le même cas) et `Makefile.ifort2019` (non modifié).
 garder la compilation par défaut (les couches de threads GNU ou TBB de MKL,
 qui éviteraient `libiomp5`, n'ont pas été testées).
 
-**Vérifications de bornes.** Tous les Makefiles compilent avec
-`-check bounds` (`-fcheck=bounds` en gcc), utile au développement mais
-coûteux : mesuré sur le même cas (K=8), assemblage ×2,4 (LDLᵀ) à ×3,5 (LU),
-factorisation LU ×1,7, résolution ×1,1 à ×1,4. Pour les calculs de
-production, retirer `-check bounds` de `OPTF` (et idéalement passer en
-`-O3 -xHost`), dans le Makefile racine, `ldlt/Makefile` et
-`user_case_dev/Makefile`.
+**Vérifications de bornes (`CHECK=0`).** Par défaut, tous les Makefiles
+compilent avec `-check bounds` (`-fcheck=bounds` en gcc, option aussi
+disponible dans `Makefile.gcc` et `ldlt/Makefile.gcc`), utile au
+développement mais coûteux : mesuré sur le même cas (K=8), assemblage ×2,4
+(LDLᵀ) à ×3,5 (LU), factorisation LU ×1,7, résolution ×1,1 à ×1,4.
+`CHECK=0` les retire. Garder la compilation par défaut pour développer et
+déboguer : un dépassement de tableau y est signalé au lieu de corrompre
+silencieusement la mémoire.
 
 **Mesurer soi-même** : `ldlt/bin*/bench_steps` (temps, RSS de fin et pic
 par étape, taux de compression, décomposition de la RSS) :
 
 ```bash
-mpirun -np 4 ldlt/bin_noomp/bench_steps LDLT 2 2 40000 500 500 3 1e-4 5000 4
+mpirun -np 4 ldlt/bin_noomp_nocheck/bench_steps LDLT 2 2 40000 500 500 3 1e-4 5000 4
 ```
 

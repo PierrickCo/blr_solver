@@ -14,6 +14,8 @@
 #   intel (defaut) : Makefile (ifx+MKL+Intel MPI), binaires dans bin/.
 #   intel-noomp    : Makefile avec OPENMP=0 (sans OpenMP, MKL sequentiel),
 #                     binaires dans bin_noomp/ (test_openmp_dense saute).
+#   CHECK=0 ./run_all_tests.sh [...] : meme suite, compilee sans
+#                     verification des bornes (repertoires *_nocheck).
 #   gcc            : Makefile.gcc (gfortran+BLAS/LAPACK+OpenMPI), binaires
 #                     dans build-gcc/ -- chemin utilise par la CI (voir
 #                     .github/workflows/ci.yml), aucune licence Intel requise.
@@ -35,7 +37,12 @@ else
   BINDIR="bin"
 fi
 
-echo "=== Compilation (chaine: $TOOLCHAIN) ==="
+if [ "${CHECK:-1}" = "0" ]; then
+  MAKEARGS="$MAKEARGS CHECK=0"
+  BINDIR="${BINDIR}_nocheck"
+fi
+
+echo "=== Compilation (chaine: $TOOLCHAIN ${MAKEARGS}) ==="
 if ! make -f "$MAKEFILE" $MAKEARGS -j4; then
   echo "ECHEC DE COMPILATION -- voir la sortie ci-dessus."
   exit 1

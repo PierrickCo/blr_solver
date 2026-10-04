@@ -4,13 +4,29 @@
 # Necessite LAPACK >= 3.7 (CSYTRF_RK).
 
 MPIFC    = mpif90
-BUILDDIR = build-gcc
-MAIN     = ../build-gcc
+# CHECK=0 (`make CHECK=0`) : compile SANS verification des bornes de
+# tableaux. Utile au developpement, couteuse a l'execution -- mesure
+# (N=40000, NB=500) : assemblage x2.4 (LDLt) a x3.5 (LU), factorisation LU
+# x1.7, resolution x1.1 a x1.4. Recommande pour les calculs de production ;
+# meme option que le Makefile.gcc racine,
+# qui doit avoir ete construit avec. Sorties dans des repertoires separes (suffixe
+# _nocheck) : make ne detecte pas un changement d'options.
+CHECK ?= 1
+ifeq ($(CHECK),0)
+  CHECKF =
+  CHKSUFFIX = _nocheck
+else
+  CHECKF = -fcheck=bounds
+  CHKSUFFIX =
+endif
+
+BUILDDIR = build-gcc$(CHKSUFFIX)
+MAIN     = ../build-gcc$(CHKSUFFIX)
 SRC      = src
 TEST     = test
 EX       = examples
 
-OPTF = -O2 -fopenmp -Wall -fcheck=bounds -ffree-line-length-none -J$(BUILDDIR) -I$(MAIN)
+OPTF = -O2 -fopenmp -Wall $(CHECKF) -ffree-line-length-none -J$(BUILDDIR) -I$(MAIN)
 
 $(shell mkdir -p $(BUILDDIR))
 
