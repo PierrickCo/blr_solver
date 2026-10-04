@@ -37,7 +37,7 @@ MAIN_OBJS = $(MAIN)/blr_kinds_mod.o $(MAIN)/mpi_grid_mod.o $(MAIN)/blr_compress_
 
 LDLT_OBJS = $(LIBDIR)/mpi_blr_ldlt_mod.o $(LIBDIR)/mpi_blr_ldlt_arena_mod.o $(LIBDIR)/mpi_blr_ldlt_ooc_mod.o $(LIBDIR)/sym_testmat_mod.o
 
-all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/test_mpi_blr_ldlt_arena $(BINDIR)/test_mpi_blr_ldlt_ooc $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu $(BINDIR)/sweep_driver $(BINDIR)/bench_diag_kernels
+all: $(BINDIR)/test_mpi_blr_ldlt $(BINDIR)/test_mpi_blr_ldlt_arena $(BINDIR)/test_mpi_blr_ldlt_ooc $(BINDIR)/example_blr_mpi_ldlt $(BINDIR)/bench_ldlt_vs_lu $(BINDIR)/bench_steps $(BINDIR)/sweep_driver $(BINDIR)/bench_diag_kernels
 
 $(LIBDIR)/mpi_blr_ldlt_mod.o: $(SRC)/mpi_blr_ldlt_mod.f90 $(MAIN)/mpi_blr_matrix_mod.o
 	$(MPIFC) $(OPTF) -c $(SRC)/mpi_blr_ldlt_mod.f90 -o $@
@@ -93,6 +93,12 @@ $(LIBDIR)/bench_ldlt_vs_lu.o: $(TEST)/bench_ldlt_vs_lu.f90 $(LDLT_OBJS)
 	$(MPIFC) $(OPTF) -c $(TEST)/bench_ldlt_vs_lu.f90 -o $@
 
 $(BINDIR)/bench_ldlt_vs_lu: $(MAIN_OBJS) $(LDLT_OBJS) $(LIBDIR)/bench_ldlt_vs_lu.o
+	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
+
+$(LIBDIR)/bench_steps.o: $(TEST)/bench_steps.f90 $(LDLT_OBJS)
+	$(MPIFC) $(OPTF) -c $(TEST)/bench_steps.f90 -o $@
+
+$(BINDIR)/bench_steps: $(MAIN_OBJS) $(LDLT_OBJS) $(LIBDIR)/bench_steps.o
 	$(MPIFC) -o $@ $(OPTF) $^ $(MPILIBS)
 
 clean:
