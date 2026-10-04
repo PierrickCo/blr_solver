@@ -31,12 +31,30 @@ else
   CHKSUFFIX =
 endif
 
-BUILDDIR = build-gcc$(CHKSUFFIX)
+# FAST=1 (`make FAST=1`) : -O3 et jeu d'instructions de la machine qui
+# compile (FAST_ARCH, defaut -march=native). Sur un cluster, compiler sur un noeud
+# de calcul, ou fixer l'architecture des noeuds : FAST_ARCH=-march=skylake-avx512 par exemple.
+# Mesure (N=40000, NB=500, sans OpenMP ni verification des bornes) :
+# assemblage x1.8 (LU) a x2.6 (LDLt) plus rapide qu'en -O2 (evaluation du
+# noyau de la matrice vectorisee) ; factorisation et resolution : effet
+# variable selon le cas (-8 % a +30 %), a mesurer sur sa propre matrice.
+# Combinable avec OPENMP=0 et CHECK=0 ; sorties suffixees _fast.
+FAST ?= 0
+FAST_ARCH ?= -march=native
+ifeq ($(FAST),1)
+  OPTLEVEL = -O3 $(FAST_ARCH)
+  FASTSUFFIX = _fast
+else
+  OPTLEVEL = -O2
+  FASTSUFFIX =
+endif
+
+BUILDDIR = build-gcc$(CHKSUFFIX)$(FASTSUFFIX)
 
 # -ffree-line-length-none : plusieurs lignes du projet depassent la limite
 # standard de 132 colonnes en forme libre (ifx est plus permissif par
 # defaut) -- sans ce flag, gfortran tronque/rejette ces lignes.
-OPTF = -O2 -fopenmp -Wall $(CHECKF) -ffree-line-length-none -J$(BUILDDIR) -I$(BUILDDIR)
+OPTF = $(OPTLEVEL) -fopenmp -Wall $(CHECKF) -ffree-line-length-none -J$(BUILDDIR) -I$(BUILDDIR)
 
 SRC  = src
 TEST = test

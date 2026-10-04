@@ -53,7 +53,24 @@ else
   CHECKF = -check bounds
 endif
 
-OPTF = -O2 $(OMPF) -warn all $(CHECKF) -module $(LIBDIR)
+# FAST=1 (`make FAST=1`) : -O3 et jeu d'instructions de la machine qui
+# compile (FAST_ARCH, defaut -xHost). Sur un cluster, compiler sur un noeud
+# de calcul, ou fixer l'architecture des noeuds : FAST_ARCH=-xCORE-AVX512 par exemple.
+# Mesure (N=40000, NB=500, sans OpenMP ni verification des bornes) :
+# assemblage x1.8 (LU) a x2.6 (LDLt) plus rapide qu'en -O2 (evaluation du
+# noyau de la matrice vectorisee) ; factorisation et resolution : effet
+# variable selon le cas (-8 % a +30 %), a mesurer sur sa propre matrice.
+# Combinable avec OPENMP=0 et CHECK=0 ; sorties suffixees _fast.
+FAST ?= 0
+FAST_ARCH ?= -xHost
+ifeq ($(FAST),1)
+  OPTLEVEL = -O3 $(FAST_ARCH)
+  SUFFIX := $(SUFFIX)_fast
+else
+  OPTLEVEL = -O2
+endif
+
+OPTF = $(OPTLEVEL) $(OMPF) -warn all $(CHECKF) -module $(LIBDIR)
 
 # -L$(IMPI_LIBDIR) EN PREMIER dans MPILIBS : sans ca, le linker peut
 # resoudre "-lmpi" vers un OpenMPI systeme non lie (/usr/lib/x86_64-

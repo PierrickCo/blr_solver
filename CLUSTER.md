@@ -120,18 +120,21 @@ d'un cluster à l'autre.
 ## 5. Compilation pour les vrais calculs : OpenMP, mémoire et vérifications
 
 **Runs MPI purs (1 thread par processus), calculs de production :
-compiler avec `OPENMP=0 CHECK=0`.**
+compiler avec `OPENMP=0 CHECK=0`, plus `FAST=1` (sur un nœud de calcul)
+quand l'assemblage pèse lourd dans le temps total — voir « Optimisation »
+ci-dessous.**
 
 ```bash
-make OPENMP=0 CHECK=0 && make -C ldlt OPENMP=0 CHECK=0   # -> bin_noomp_nocheck/, ldlt/bin_noomp_nocheck/
-make -C user_case_dev OPENMP=0 CHECK=0                   # -> example_blr_mpi_pivot_user_noomp_nocheck
-CHECK=0 ./run_all_tests.sh intel-noomp                   # meme suite de tests, meme compilation
+O="OPENMP=0 CHECK=0 FAST=1"
+make $O && make -C ldlt $O              # -> bin_noomp_nocheck_fast/, ldlt/bin_noomp_nocheck_fast/
+make -C user_case_dev $O                # -> example_blr_mpi_pivot_user_noomp_nocheck_fast
+CHECK=0 FAST=1 ./run_all_tests.sh intel-noomp   # meme suite de tests, meme compilation
 ```
 
-Les deux options sont indépendantes (`OPENMP=0` seule, `CHECK=0` seule, ou
-les deux) ; chaque combinaison a ses propres répertoires de sortie
-(suffixes `_noomp`, `_nocheck`), et les Makefiles `ldlt/` et
-`user_case_dev/` prennent les mêmes options que le Makefile racine.
+Les trois options sont indépendantes et combinables ; chaque combinaison a
+ses propres répertoires de sortie (suffixes `_noomp`, `_nocheck`, `_fast`,
+dans cet ordre), et les Makefiles `ldlt/` et `user_case_dev/` prennent les
+mêmes options que le Makefile racine.
 
 Pourquoi : avec ifx, dès que `libiomp5` (le runtime OpenMP d'Intel, amené
 par MKL threadée) est lié, **tous les `ALLOCATE` passent par l'allocateur
@@ -172,10 +175,33 @@ développement mais coûteux : mesuré sur le même cas (K=8), assemblage ×2,4
 déboguer : un dépassement de tableau y est signalé au lieu de corrompre
 silencieusement la mémoire.
 
+**Optimisation (`FAST=1`).** Par défaut `-O2` générique ; `FAST=1` passe en
+`-O3` avec le jeu d'instructions de la machine qui compile (`FAST_ARCH`,
+défaut `-xHost`, `-march=native` en gcc). Mesuré (N=40000, NB=500, sans
+OpenMP ni vérification des bornes, une mesure par cas) :
+
+| `-O2` → `FAST=1` | LU K=8 | LDLᵀ K=8 | LU K=5000 | LDLᵀ K=5000 |
+|---|---|---|---|---|
+| assemblage | 20,8 → 11,7 s | 15,0 → 5,9 s | 32,6 → 14,0 s | 15,2 → 8,5 s |
+| factorisation | 2,1 → 2,9 s | 1,6 → 1,7 s | 172,7 → 159,5 s | 80,9 → 97,8 s |
+| résolution (500 seconds membres) | 6,3 → 7,8 s | 1,9 → 2,0 s | 14,4 → 15,6 s | 6,8 → 8,6 s |
+
+L'assemblage gagne nettement (l'évaluation du noyau de la matrice est
+vectorisée) ; factorisation et résolution varient de −8 % à +30 % selon le
+cas (sur cette machine, des runs identiques de la factorisation LDLᵀ K=5000
+ont varié de 65 à 91 s : les écarts de 10 à 20 % ne sont pas
+significatifs). Le gain net dépend donc du poids de l'assemblage : à
+mesurer sur sa propre matrice (`bench_steps`, en compilant les deux
+variantes). **`-xHost` vise le processeur de
+la machine de compilation** : compiler sur un nœud de calcul, ou imposer
+l'architecture des nœuds, par exemple `make $O FAST_ARCH=-xCORE-AVX512`
+(un binaire compilé pour une architecture plus récente que celle des nœuds
+s'arrête au démarrage).
+
 **Mesurer soi-même** : `ldlt/bin*/bench_steps` (temps, RSS de fin et pic
 par étape, taux de compression, décomposition de la RSS) :
 
 ```bash
-mpirun -np 4 ldlt/bin_noomp_nocheck/bench_steps LDLT 2 2 40000 500 500 3 1e-4 5000 4
+mpirun -np 4 ldlt/bin_noomp_nocheck_fast/bench_steps LDLT 2 2 40000 500 500 3 1e-4 5000 4
 ```
 

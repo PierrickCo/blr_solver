@@ -16,6 +16,8 @@
 #                     binaires dans bin_noomp/ (test_openmp_dense saute).
 #   CHECK=0 ./run_all_tests.sh [...] : meme suite, compilee sans
 #                     verification des bornes (repertoires *_nocheck).
+#   FAST=1 ./run_all_tests.sh [...]  : idem en -O3 + FAST_ARCH (*_fast) ;
+#                     combinable avec CHECK=0.
 #   gcc            : Makefile.gcc (gfortran+BLAS/LAPACK+OpenMPI), binaires
 #                     dans build-gcc/ -- chemin utilise par la CI (voir
 #                     .github/workflows/ci.yml), aucune licence Intel requise.
@@ -40,6 +42,10 @@ fi
 if [ "${CHECK:-1}" = "0" ]; then
   MAKEARGS="$MAKEARGS CHECK=0"
   BINDIR="${BINDIR}_nocheck"
+fi
+if [ "${FAST:-0}" = "1" ]; then
+  MAKEARGS="$MAKEARGS FAST=1"
+  BINDIR="${BINDIR}_fast"
 fi
 
 echo "=== Compilation (chaine: $TOOLCHAIN ${MAKEARGS}) ==="
