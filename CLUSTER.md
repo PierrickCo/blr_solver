@@ -159,6 +159,29 @@ Temps de factorisation LU : 178 / 177 / 177 s (identiques). LDLᵀ : 67 à
 91 s selon les runs dans les trois configurations (variabilité de la
 machine de test, pas d'écart systématique mesuré).
 
+**Coût en temps de `OPENMP=0` : aucun.** Mesure isolée (N=40000, NB=500,
+K=8, 3 paquets de 500 seconds membres, `CHECK=0 FAST=1` partout, 4
+compilations **entrelacées** et répétées deux fois) :
+
+| | LU : fact. / résolution | LU : RSS fin / pic | LDLᵀ : fact. / résolution | LDLᵀ : RSS fin / pic |
+|---|---|---|---|---|
+| OpenMP, MKL threadée | 2,7–3,1 / 22,7–25,4 s | 149 / 363 Mo | 1,95 / 6,0–6,1 s | 119 / 178 Mo |
+| OpenMP, MKL séquentielle | 3,1–3,7 / 24,0–25,6 s | 147 / 362 Mo | 1,8–1,9 / 5,6–6,3 s | 117 / 176 Mo |
+| `OPENMP=0` | 3,0–3,2 / 22,6–22,9 s | 133 / 316 Mo | 1,3–1,9 / 4,9–6,1 s | 106 / 162 Mo |
+| `OPENMP=0`, `BLR_MALLOC_TRIM=0` | 2,9–3,1 / 22,7–23,4 s | 136 / 316 Mo | 1,3–1,8 / 5,1–6,2 s | 108 / 163 Mo |
+
+Ni MKL séquentielle, ni l'allocateur glibc, ni `malloc_trim` ne coûtent de
+temps au-delà du bruit (10 à 15 % entre deux runs identiques) ; la
+mémoire baisse dès cette matrice compressible (−10 % en fin de
+factorisation, −13 % au pic de résolution) et de 45 % sur la matrice peu
+compressible. **Pour comparer des temps, entrelacer les variantes et
+répéter** : sur la machine de test, une même compilation a varié de 30 %
+entre le matin et le soir (LU, résolution : 19,5 puis 22,7 à 25,4 s), ce
+qui suffit à fabriquer de faux écarts entre runs lancés à des heures
+différentes. Testé et écarté : relever `MALLOC_MMAP_THRESHOLD_` et
+`MALLOC_TRIM_THRESHOLD_` (64 Mo ou 1 Go) ralentit la résolution de 17 %
+(LDLᵀ) à 30 % (LU) pour un gain mémoire négligeable.
+
 Non concernés : la chaîne gcc (`Makefile.gcc`, libgomp n'intercepte pas
 les allocations ; `BLR_TRIM_HEAP` y agit directement : 460 → 300 Mo en fin
 de factorisation sur le même cas) et `Makefile.ifort2019` (non modifié).
