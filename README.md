@@ -26,6 +26,16 @@ indépendante et comparables entre eux (même recette de matrice de test) :
 | **C** | LU dense monolithique, sans découpage en blocs (référence MKL pure) | `block_lu_mod.f90`, `bench_seq.f90` |
 | **BLR+MPI** | Solveur MPI dont le stockage local par processus reste compressé de bout en bout (jamais dense hors blocs diagonaux), panneaux diffusés déjà compressés | `mpi_blr_matrix_mod.f90`, `test_mpi_blr_matrix.f90` (sans pivot), `test_mpi_blr_matrix_pivot.f90` (avec pivot confiné au bloc diagonal), `test_mpi_blr_matrix_pivot_arena.f90` (même algorithme, allocateur arena pour le stockage bas-rang), `test_mpi_blr_matrix_pivot_ooc.f90` (même algorithme, out-of-core) |
 
+**Distribution des blocs** (BLR+MPI, LU et LDLᵀ) : blocs-lignes
+cycliques, blocs-colonnes en cyclique **décalé** par défaut (`DIAG_SPREAD`
+des assemblages, `BLR_COL_OWNER` dans `mpi_blr_matrix_mod.f90`) : les blocs
+diagonaux passent par tous les processus, au lieu de PR·PC/PGCD(PR,PC) en
+cyclique pur (2 sur 4 en 2×2). Mesuré (N=16000, 1 thread) : mémoire max
+par processus −37 à −47 % (LU 2×2, NB=800 : 52,1 → 27,8 Mo), mémoire
+totale et temps inchangés ; identique au cyclique pur si PGCD(PR,PC)=1.
+Les checkpoints enregistrent la distribution et les anciens restent
+relisibles (voir [`examples/README.md`](examples/README.md)).
+
 **BLR+MPI** est la pièce la plus aboutie du projet : c'est le seul module où
 le stockage *distribué* lui-même reste compressé (tous les modules MPI plus
 anciens gardent une matrice locale dense, la compression n'y accélère que le

@@ -176,7 +176,7 @@ CONTAINS
     DOUBLE PRECISION :: T0
     IF (MYID0.EQ.0) WRITE(6,'(A)') ' --- LU BLR+MPI (reference, matrice entiere) ---'
     CALL MPI_ASSEMBLE_BLR_MATRIX(GRID, N, NB, TOL, SYM_GET_BLOCK, AL, T_ASM(1), NC, NO, RS, &
-                                 SHOW_PROGRESS=.TRUE., USE_RSVD=(USE_RSVD_INT.NE.0))
+                                 SHOW_PROGRESS=.TRUE., USE_RSVD=(USE_RSVD_INT.NE.0), DIAG_SPREAD=(SPREAD_INT.NE.0))
     CALL REDUCE_MEM(MPI_BLR_MATRIX_MEMORY_BYTES(AL), MEM_A_MAX(1), MEM_A_SUM(1))
     CALL MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, AL, TOL, INFO, NC, NO, RS, NSW(1), T_FAC(1), SHOW_PROGRESS=.TRUE., &
                                         T_BREAKDOWN=TBK(:,1))

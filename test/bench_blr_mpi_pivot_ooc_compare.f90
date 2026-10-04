@@ -427,7 +427,7 @@ CONTAINS
 
     DO J = 1, AB%NBLK
       NJ = AB%BEND(J)-AB%BSTART(J)+1
-      PROWJ = MOD(J-1, GD%PR); PCOLJ = MOD(J-1, GD%PC)
+      PROWJ = MOD(J-1, GD%PR); PCOLJ = BLR_COL_OWNER(AB%CMAP, J, GD)
 
       ALLOCATE(XJ_FULL(NJ,NR))
       IF (GD%MYROW .EQ. PROWJ) THEN
@@ -450,7 +450,7 @@ CONTAINS
       END DO
       ALLOCATE(CONTRIB(MLOC_ALL,NR))
       IF (GD%MYCOL .EQ. PCOLJ) THEN
-        lj = (J-1)/GD%PC + 1
+        lj = BLR_COL_LOCAL(AB%CMAP, J, GD)
         CONTRIB = CZERO
         RE = 0
         DO li = 1, AB%NBLKR_LOC

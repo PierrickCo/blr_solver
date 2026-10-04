@@ -802,7 +802,7 @@ CONTAINS
     DO lli = 1, A%NBLKR_LOC
       II = (lli-1)*GRID%PR + GRID%MYROW + 1
       DO llj = 1, A%NBLKC_LOC
-        JJ = SYM_COL_GLOBAL(A%CMAP, llj, GRID)
+        JJ = BLR_COL_GLOBAL(A%CMAP, llj, GRID)
         IF (II .LE. JJ) CYCLE
         IF (A%OFFBLK(lli,llj)%IS_LOWRANK) THEN
           WRITE(U,'(I0,A,I0,A,I0)') II, ',', JJ, ',lowrank,', A%OFFBLK(lli,llj)%RANK

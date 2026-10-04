@@ -326,6 +326,15 @@ QU'UN SEUL rang, TOUS les rangs s'arretent proprement (reduction
 `MPI_ALLREDUCE`/`MPI_LAND` collective) -- jamais de blocage partiel ni de
 calcul silencieusement corrompu.
 
+**Distribution des blocs-colonnes** (depuis 2026-10-04) : les fichiers de
+matrice commencent par le marqueur `-7411` suivi de `CMAP` (0 = cyclique
+pur, 1 = cyclique decale, defaut -- voir `BLR_COL_OWNER` dans
+`src/mpi_blr_matrix_mod.f90`), puis l'en-tete habituel. Les fichiers ecrits
+AVANT ce changement (sans marqueur : le premier entier est N > 0) restent
+relisibles : ils sont reconnus et recharges en distribution cyclique pure.
+Un ancien executable refuse proprement un fichier au nouveau format
+(verifie : relecture croisee ancien/nouveau dans les deux sens).
+
 **Variante out-of-core** : `SAVE_BLR_MATRIX_OOC`/`LOAD_BLR_MATRIX_OOC`
 vidangent d'abord les caches (`OOC_CACHE_FLUSH_ALL`/`OOC_DIAG_CACHE_
 FLUSH_ALL`) puis relisent/reecrivent chaque bloc UN A LA FOIS via

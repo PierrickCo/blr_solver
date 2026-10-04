@@ -327,7 +327,7 @@ soit NRHS (mesuré jusqu'à 1024, écarts dans le bruit).
   pour le LU arena), non mesuré ici.
 - **Déséquilibre de charge sur grille carrée** : corrigé par la
   distribution décalée des colonnes (voir « Répartition des blocs
-  diagonaux ») ; reste présent dans le LU.
+  diagonaux »), pour le LDLᵀ comme pour le LU.
 - **Matrices mal conditionnées** : comme pour le LU, l'erreur de compression
   (~TOL) est amplifiée par le conditionnement. Exemple : la variante « pivots
   mixtes » du test (`STRONG=1 DIAG=0.1`, `CGESV` dense seul ~6e-4) dépasse

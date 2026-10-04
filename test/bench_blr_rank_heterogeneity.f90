@@ -173,7 +173,7 @@ CONTAINS
     DO li = 1, A_BLR%NBLKR_LOC
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       DO lj = 1, A_BLR%NBLKC_LOC
-        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
         IF (I .EQ. J) CYCLE
         IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
           WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',lowrank,', A_BLR%OFFBLK(li,lj)%RANK

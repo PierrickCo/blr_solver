@@ -15,7 +15,7 @@
 ! MPI_BLR_MATRIX_T pour les blocs-lignes (BLOCK_NUMROC, local li <->
 ! global I=(li-1)*PR+MYROW+1) ; blocs-colonnes par defaut en cyclique
 ! DECALE pour repartir les blocs diagonaux sur tous les processus
-! (SYM_COL_OWNER / SYM_COL_LOCAL / SYM_COL_GLOBAL, champ CMAP).
+! (BLR_COL_OWNER / BLR_COL_LOCAL / BLR_COL_GLOBAL, champ CMAP).
 !
 ! PIVOT : Bunch-Kaufman borne (CSYTRF_RK, pivots 1x1 et 2x2) CONFINE au
 ! bloc diagonal -- meme philosophie que le pivot partiel confine du LU.
@@ -66,7 +66,8 @@ MODULE MPI_BLR_LDLT_MOD
   USE BLR_COMPRESS_MOD
   USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE
-  USE MPI_BLR_MATRIX_MOD, ONLY: BLOCK_NUMROC, STAGE_PROGRESS_CALLBACK_IFACE, STAGE_PROGRESS_SHOULD_FIRE, &
+  USE MPI_BLR_MATRIX_MOD, ONLY: BLOCK_NUMROC, BLR_COL_OWNER, BLR_COL_LOCAL, BLR_COL_GLOBAL, BLR_NBLKC_LOC, &
+                                 STAGE_PROGRESS_CALLBACK_IFACE, STAGE_PROGRESS_SHOULD_FIRE, &
                                 RHS_LOCAL_RANGE_MBM, RHS_NUMROC_MBM
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB
@@ -80,7 +81,7 @@ MODULE MPI_BLR_LDLT_MOD
 
   TYPE :: MPI_BLR_SYM_T
     INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
-    INTEGER :: CMAP = 1     ! distribution des blocs-colonnes (SYM_COL_OWNER) : 0 cyclique, 1 decalee
+    INTEGER :: CMAP = 1     ! distribution des blocs-colonnes (BLR_COL_OWNER) : 0 cyclique, 1 decalee
     INTEGER, ALLOCATABLE :: BSTART(:), BEND(:)           ! decoupage GLOBAL, partage
     TYPE(PACKED_TRI_T), ALLOCATABLE  :: DIAGP(:)         ! bloc GLOBAL K, compact -- alloue seulement chez le proprietaire
     TYPE(BLR_BLOCK_T), ALLOCATABLE   :: OFFBLK(:,:)      ! (li,lj) LOCAUX -- rempli seulement si I>J
@@ -91,88 +92,8 @@ MODULE MPI_BLR_LDLT_MOD
 
 CONTAINS
 
-  !=======================================================================
-  ! Distribution des blocs-COLONNES sur la grille (les blocs-lignes restent
-  ! cycliques : I -> ligne de grille MOD(I-1,PR), local li=(I-1)/PR+1).
-  !   CMAP = 0 : cyclique pur, J -> MOD(J-1,PC) (comme le LU). Le bloc
-  !     diagonal K tombe sur (MOD(K-1,PR), MOD(K-1,PC)) : si g = PGCD(PR,PC)
-  !     > 1, seuls PR*PC/g processus possedent des blocs diagonaux (2 sur 4
-  !     en 2x2, 4 sur 8 en 2x4) et concentrent leur factorisation et leur
-  !     Schur dense.
-  !   CMAP = 1 (defaut) : cyclique DECALE d'une colonne a chaque periode de
-  !     L = PPCM(PR,PC) blocs, J -> MOD(J-1 + (J-1)/L, PC). Sur g periodes
-  !     (g*L = PR*PC blocs), les blocs diagonaux visitent chacun des PR*PC
-  !     processus exactement une fois ; chaque colonne de grille recoit
-  !     toujours L/PC blocs par periode. Si g = 1 (PR et PC premiers entre
-  !     eux, dont PR=1 ou PC=1), la distribution cyclique couvre deja toute
-  !     la grille : CMAP=1 y est identique a CMAP=0.
-  ! Indice local lj dans la colonne proprietaire : rang de J parmi les
-  ! blocs-colonnes de cette colonne (croissant avec J dans les deux cas).
-  !=======================================================================
-  INTEGER FUNCTION SYM_CMAP_PERIOD(CMAP, GRID)
-    INTEGER, INTENT(IN)      :: CMAP
-    TYPE(GRID_T), INTENT(IN) :: GRID
-    INTEGER :: A1, B1, T
-    SYM_CMAP_PERIOD = 0                       ! 0 : pas de decalage
-    IF (CMAP .EQ. 0) RETURN
-    A1 = GRID%PR; B1 = GRID%PC
-    DO WHILE (B1 .NE. 0)
-      T = MOD(A1, B1); A1 = B1; B1 = T
-    END DO
-    IF (A1 .GT. 1) SYM_CMAP_PERIOD = (GRID%PR/A1)*GRID%PC   ! PPCM
-  END FUNCTION SYM_CMAP_PERIOD
-
-  ! Colonne de grille proprietaire du bloc-colonne global J.
-  INTEGER FUNCTION SYM_COL_OWNER(CMAP, J, GRID)
-    INTEGER, INTENT(IN)      :: CMAP, J
-    TYPE(GRID_T), INTENT(IN) :: GRID
-    INTEGER :: L
-    L = SYM_CMAP_PERIOD(CMAP, GRID)
-    IF (L .EQ. 0) THEN
-      SYM_COL_OWNER = MOD(J-1, GRID%PC)
-    ELSE
-      SYM_COL_OWNER = MOD(J-1 + (J-1)/L, GRID%PC)
-    END IF
-  END FUNCTION SYM_COL_OWNER
-
-  ! Indice local du bloc-colonne global J dans sa colonne proprietaire.
-  INTEGER FUNCTION SYM_COL_LOCAL(CMAP, J, GRID)
-    INTEGER, INTENT(IN)      :: CMAP, J
-    TYPE(GRID_T), INTENT(IN) :: GRID
-    INTEGER :: L
-    L = SYM_CMAP_PERIOD(CMAP, GRID)
-    IF (L .EQ. 0) THEN
-      SYM_COL_LOCAL = (J-1)/GRID%PC + 1
-    ELSE
-      SYM_COL_LOCAL = ((J-1)/L)*(L/GRID%PC) + MOD(J-1, L)/GRID%PC + 1
-    END IF
-  END FUNCTION SYM_COL_LOCAL
-
-  ! Bloc-colonne global du bloc-colonne local LJ de MA colonne de grille.
-  INTEGER FUNCTION SYM_COL_GLOBAL(CMAP, LJ, GRID)
-    INTEGER, INTENT(IN)      :: CMAP, LJ
-    TYPE(GRID_T), INTENT(IN) :: GRID
-    INTEGER :: L, P, Q
-    L = SYM_CMAP_PERIOD(CMAP, GRID)
-    IF (L .EQ. 0) THEN
-      SYM_COL_GLOBAL = (LJ-1)*GRID%PC + GRID%MYCOL + 1
-    ELSE
-      P = (LJ-1)/(L/GRID%PC)
-      Q = MOD(LJ-1, L/GRID%PC)
-      SYM_COL_GLOBAL = P*L + Q*GRID%PC + MODULO(GRID%MYCOL - P, GRID%PC) + 1
-    END IF
-  END FUNCTION SYM_COL_GLOBAL
-
-  ! Nombre de blocs-colonnes de MA colonne de grille.
-  INTEGER FUNCTION SYM_NBLKC_LOC(CMAP, NBLK, GRID)
-    INTEGER, INTENT(IN)      :: CMAP, NBLK
-    TYPE(GRID_T), INTENT(IN) :: GRID
-    INTEGER :: J
-    SYM_NBLKC_LOC = 0
-    DO J = 1, NBLK
-      IF (SYM_COL_OWNER(CMAP, J, GRID) .EQ. GRID%MYCOL) SYM_NBLKC_LOC = SYM_NBLKC_LOC + 1
-    END DO
-  END FUNCTION SYM_NBLKC_LOC
+  ! Distribution des blocs-colonnes : BLR_COL_OWNER/LOCAL/GLOBAL et
+  ! BLR_NBLKC_LOC (mpi_blr_matrix_mod.f90), partagees avec le LU.
 
   !=======================================================================
   ! Primitives de bloc (dense ou bas-rang) propres au LDL^T
@@ -527,7 +448,7 @@ CONTAINS
     INTEGER, INTENT(IN), OPTIONAL     :: RSVD_OVERSAMPLE, RSVD_NPOWER
     PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
     ! DIAG_SPREAD (defaut .TRUE.) : distribution decalee des blocs-colonnes
-    ! (CMAP=1, voir SYM_COL_OWNER) -- les blocs diagonaux visitent tous
+    ! (CMAP=1, voir BLR_COL_OWNER) -- les blocs diagonaux visitent tous
     ! les processus ; .FALSE. : cyclique pur, comme le LU.
     LOGICAL, INTENT(IN), OPTIONAL            :: DIAG_SPREAD
 
@@ -554,7 +475,7 @@ CONTAINS
     A%CMAP = 1
     IF (PRESENT(DIAG_SPREAD)) A%CMAP = MERGE(1, 0, DIAG_SPREAD)
     A%NBLKR_LOC = BLOCK_NUMROC(A%NBLK, GRID%PR, GRID%MYROW)
-    A%NBLKC_LOC = SYM_NBLKC_LOC(A%CMAP, A%NBLK, GRID)
+    A%NBLKC_LOC = BLR_NBLKC_LOC(A%CMAP, A%NBLK, GRID)
     ALLOCATE(A%DIAGP(A%NBLK))
     ALLOCATE(A%OFFBLK(MAX(A%NBLKR_LOC,1), MAX(A%NBLKC_LOC,1)))
 
@@ -563,7 +484,7 @@ CONTAINS
     DO li = 1, A%NBLKR_LOC
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (I .GE. J) NTOTAL = NTOTAL + 1
       END DO
     END DO
@@ -574,7 +495,7 @@ CONTAINS
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       MI = A%BEND(I) - A%BSTART(I) + 1
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (I .LT. J) CYCLE
         NJ = A%BEND(J) - A%BSTART(J) + 1
         IF (I .EQ. J) THEN
@@ -700,7 +621,7 @@ CONTAINS
     DO li = 1, A%NBLKR_LOC
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (I .LE. J) CYCLE                    ! triangle inferieur strict seulement
         WRITE(U) I, J, A%OFFBLK(li,lj)%IS_LOWRANK, A%OFFBLK(li,lj)%M, A%OFFBLK(li,lj)%N, A%OFFBLK(li,lj)%RANK
         IF (A%OFFBLK(li,lj)%IS_LOWRANK) THEN
@@ -761,7 +682,7 @@ CONTAINS
     A%CMAP = F_MAGIC - 7311                ! distribution des colonnes de la sauvegarde
     CALL BLOCK_PARTITION(N, NB, A%NBLK, A%BSTART, A%BEND)
     A%NBLKR_LOC = BLOCK_NUMROC(A%NBLK, GRID%PR, GRID%MYROW)
-    A%NBLKC_LOC = SYM_NBLKC_LOC(A%CMAP, A%NBLK, GRID)
+    A%NBLKC_LOC = BLR_NBLKC_LOC(A%CMAP, A%NBLK, GRID)
     ALLOCATE(A%DIAGP(A%NBLK))
     ALLOCATE(A%OFFBLK(MAX(A%NBLKR_LOC,1), MAX(A%NBLKC_LOC,1)))
     READ(U) ND
@@ -773,7 +694,7 @@ CONTAINS
     DO li = 1, A%NBLKR_LOC
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (I .LE. J) CYCLE
         READ(U) R_I, R_J, R_LOWRANK, R_M, R_N, R_RANK
         A%OFFBLK(li,lj)%IS_LOWRANK = R_LOWRANK
@@ -811,7 +732,7 @@ CONTAINS
     DO li = 1, A%NBLKR_LOC
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (I .LE. J) CYCLE
         NO = NO + 1
         IF (A%OFFBLK(li,lj)%IS_LOWRANK) THEN
@@ -924,11 +845,11 @@ CONTAINS
     DO K = 1, NBLK
       KW = A%BEND(K) - A%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
-      PCOL_K = SYM_COL_OWNER(A%CMAP, K, GRID)
+      PCOL_K = BLR_COL_OWNER(A%CMAP, K, GRID)
       ROOT_K = PROW_K*GRID%PC + PCOL_K
       OWNER = (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K)
       li_K = (K-1)/GRID%PR + 1
-      lj_K = SYM_COL_LOCAL(A%CMAP, K, GRID)
+      lj_K = BLR_COL_LOCAL(A%CMAP, K, GRID)
       INFO_STEP = 0
       ALLOCATE(IPIV_K(KW), SWP(KW), DBUF(2*KW))
       IPIV_K = 0; DBUF = (0.0_WP,0.0_WP)
@@ -976,7 +897,7 @@ CONTAINS
       TT0 = MPI_WTIME()
       IF (GRID%MYROW .EQ. PROW_K .AND. NS_K .GT. 0) THEN
         DO lj = 1, A%NBLKC_LOC
-          J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+          J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
           IF (J .GE. K) CYCLE
           CALL BLR_BLOCK_ROW_SWAP(A%OFFBLK(li_K,lj), KW, SWP)
         END DO
@@ -1039,7 +960,7 @@ CONTAINS
       !    Tous les membres d'un COL_COMM (meme MYCOL) parcourent la meme
       !    liste lj : condition uniforme sur le communicateur.
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (J .LE. K) CYCLE
         NJ = A%BEND(J) - A%BSTART(J) + 1
         PROW_J = MOD(J-1, GRID%PR)
@@ -1062,10 +983,10 @@ CONTAINS
       !    (K+1,K+1) est factorise et diffuse sans bloquer ; les autres
       !    colonnes de grille postent leur reception avant leur Schur.
       IF (LA .AND. K .LT. NBLK) THEN
-        IF (GRID%MYCOL .NE. SYM_COL_OWNER(A%CMAP, K+1, GRID)) CALL POST_NEXT_DIAG(K+1)
+        IF (GRID%MYCOL .NE. BLR_COL_OWNER(A%CMAP, K+1, GRID)) CALL POST_NEXT_DIAG(K+1)
       END IF
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (J .LE. K) CYCLE
         NJ = A%BEND(J) - A%BSTART(J) + 1
         DO li = 1, A%NBLKR_LOC
@@ -1147,7 +1068,7 @@ CONTAINS
       DOUBLE PRECISION :: TF0
       KWN = A%BEND(KN) - A%BSTART(KN) + 1
       PRN = MOD(KN-1, GRID%PR)
-      PCN = SYM_COL_OWNER(A%CMAP, KN, GRID)
+      PCN = BLR_COL_OWNER(A%CMAP, KN, GRID)
       NPN = KWN*(KWN+1)/2
       IF (GRID%MYROW.EQ.PRN .AND. GRID%MYCOL.EQ.PCN) THEN
         TF0 = MPI_WTIME()
@@ -1170,7 +1091,7 @@ CONTAINS
           CALL COUNT_PIVOTS(KWN, IBUF_N(1:KWN), DBUF_N(KWN+1:2*KWN), NSN, N2N)
           DKN = (0.0_WP,0.0_WP)
           CALL SYM_UNPACK_LOWER(KWN, APK_N, DKN, KWN)
-          LJN = SYM_COL_LOCAL(A%CMAP, KN, GRID)
+          LJN = BLR_COL_LOCAL(A%CMAP, KN, GRID)
           DO LIN = 1, A%NBLKR_LOC
             IN = (LIN-1)*GRID%PR + GRID%MYROW + 1
             IF (IN .LE. KN) CYCLE
@@ -1269,7 +1190,7 @@ CONTAINS
     DO K = 1, NBLK
       KW = A%BEND(K) - A%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
-      PCOL_K = SYM_COL_OWNER(A%CMAP, K, GRID)
+      PCOL_K = BLR_COL_OWNER(A%CMAP, K, GRID)
       IF (GRID%MYROW .EQ. PROW_K) THEN
         CALL BCAST_DIAG_LOWER(A, K, KW, GRID%MYCOL.EQ.PCOL_K, PCOL_K, GRID%ROW_COMM, DKK)
         RS = LOCAL_ROW_OFFSET_SYM(A, GRID, K)
@@ -1298,7 +1219,7 @@ CONTAINS
       END IF
       IF (GRID%MYCOL .EQ. PCOL_K) CALL MPI_BCAST(XK_FULL, KW*NRHS, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
 
-      lj = SYM_COL_LOCAL(A%CMAP, K, GRID)
+      lj = BLR_COL_LOCAL(A%CMAP, K, GRID)
       NROWTRAIL = 0
       DO li = 1, A%NBLKR_LOC
         I = (li-1)*GRID%PR + GRID%MYROW + 1
@@ -1382,12 +1303,12 @@ CONTAINS
     DO K = NBLK, 1, -1
       KW = A%BEND(K) - A%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
-      PCOL_K = SYM_COL_OWNER(A%CMAP, K, GRID)
+      PCOL_K = BLR_COL_OWNER(A%CMAP, K, GRID)
       OWNER = (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K)
       IF (GRID%MYCOL.EQ.PCOL_K .AND. K.LT.NBLK) THEN
         ALLOCATE(S(KW,NRHS))
         S = CZERO
-        lj = SYM_COL_LOCAL(A%CMAP, K, GRID)
+        lj = BLR_COL_LOCAL(A%CMAP, K, GRID)
         RS = 1
         DO li = 1, A%NBLKR_LOC
           I = (li-1)*GRID%PR + GRID%MYROW + 1
@@ -1508,7 +1429,7 @@ CONTAINS
         IF (ID .GT. K) NT = NT + 1
       END DO
       IF (NT .EQ. 0) RETURN
-      LJD = SYM_COL_LOCAL(A%CMAP, K, GRID)
+      LJD = BLR_COL_LOCAL(A%CMAP, K, GRID)
       ALLOCATE(HDR(2,NT))
       IF (GRID%MYCOL .EQ. PCOL_K) THEN
         IT = 0
@@ -1569,7 +1490,7 @@ CONTAINS
       COMPLEX(WP), ALLOCATABLE :: SU(:,:), SR(:,:)
       KW = A%BEND(K) - A%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
-      PCOL_K = SYM_COL_OWNER(A%CMAP, K, GRID)
+      PCOL_K = BLR_COL_OWNER(A%CMAP, K, GRID)
       CALL BCAST_LCOL()
       ALLOCATE(SU(KW,MAX(NRHS_LOC,1)))
       SU = CZERO
@@ -1645,7 +1566,7 @@ CONTAINS
     DO li = 1, A%NBLKR_LOC
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       DO lj = 1, A%NBLKC_LOC
-        J = SYM_COL_GLOBAL(A%CMAP, lj, GRID)
+        J = BLR_COL_GLOBAL(A%CMAP, lj, GRID)
         IF (I .LE. J) CYCLE
         ASSOCIATE (BK => A%OFFBLK(li,lj))
           IF (BK%IS_LOWRANK) THEN

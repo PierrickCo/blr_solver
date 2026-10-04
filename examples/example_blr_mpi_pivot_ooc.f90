@@ -559,7 +559,7 @@ CONTAINS
     DO li2 = 1, A_BLR%NBLKR_LOC
       I2 = (li2-1)*GRID%PR + GRID%MYROW + 1
       DO lj2 = 1, A_BLR%NBLKC_LOC
-        J2 = (lj2-1)*GRID%PC + GRID%MYCOL + 1
+        J2 = BLR_COL_GLOBAL(A_BLR%CMAP, lj2, GRID)
         IF (I2 .EQ. J2) CYCLE
         NO_LOCAL = NO_LOCAL + 1
         IF (A_BLR%OFFBLK(li2,lj2)%IS_LOWRANK) THEN
@@ -598,6 +598,9 @@ CONTAINS
     WRITE(RSTR,'(I6.6)') MYID0
     OPEN(NEWUNIT=U, FILE=TRIM(PREFIX)//'_rank'//TRIM(RSTR)//'.dat', &
          ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+    ! Marqueur de format (N > 0 dans l'ancien format, sans marqueur) +
+    ! distribution des blocs-colonnes (CMAP, voir BLR_COL_OWNER).
+    WRITE(U) -7411, A_BLR%CMAP
     WRITE(U) N, NB, A_BLR%NBLK, PR, PC, GRID%MYROW, GRID%MYCOL, MYID0, &
          A_BLR%NBLKR_LOC, A_BLR%NBLKC_LOC
 
@@ -617,7 +620,7 @@ CONTAINS
     DO li2 = 1, A_BLR%NBLKR_LOC
       I2 = (li2-1)*GRID%PR + GRID%MYROW + 1
       DO lj2 = 1, A_BLR%NBLKC_LOC
-        J2 = (lj2-1)*GRID%PC + GRID%MYCOL + 1
+        J2 = BLR_COL_GLOBAL(A_BLR%CMAP, lj2, GRID)
         IF (I2 .EQ. J2) CYCLE
         CALL OOC_READ_BLOCK_RAW(A_BLR%STORE_A, A_BLR%OFFBLK(li2,lj2), BLK)
         WRITE(U) I2, J2, BLK%IS_LOWRANK, BLK%M, BLK%N, BLK%RANK
@@ -652,7 +655,7 @@ CONTAINS
     LOGICAL, INTENT(OUT) :: OK
     TYPE(BLR_BLOCK_T) :: BLK
     INTEGER :: U, li2, lj2, I2, J2, ND, K2, MI, IOS, IERR2
-    INTEGER :: F_N, F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
+    INTEGER :: F_CMAP, F_N, F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
     INTEGER :: R_I, R_J, R_M, R_N, R_RANK
     LOGICAL :: R_LOWRANK, OK_LOCAL
     CHARACTER(LEN=16) :: RSTR
@@ -667,7 +670,12 @@ CONTAINS
            ' (rang ', MYID0, ') -- avez-vous sauvegarde avec SAVE_MATRIX/SAVE_FACTORED=1 auparavant ?'
       OK_LOCAL = .FALSE.
     ELSE
-      READ(U) F_N, F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
+      ! Nouveau format : marqueur -7411 puis CMAP ; ancien format (premier
+      ! entier = N > 0) : distribution cyclique pure (CMAP=0).
+      READ(U) F_N
+      F_CMAP = 0
+      IF (F_N .EQ. -7411) READ(U) F_CMAP, F_N
+      READ(U) F_NB, F_NBLK, F_PR, F_PC, F_MYROW, F_MYCOL, F_MYID, F_NBLKR, F_NBLKC
       IF (F_N.NE.N .OR. F_NB.NE.NB .OR. F_PR.NE.PR .OR. F_PC.NE.PC .OR. &
           F_MYROW.NE.GRID%MYROW .OR. F_MYCOL.NE.GRID%MYCOL .OR. F_MYID.NE.MYID0) THEN
         WRITE(6,'(A,A,A,I0,A)') ' ERREUR : checkpoint ', TRIM(FNAME), &
@@ -686,7 +694,8 @@ CONTAINS
     A_BLR%N = N; A_BLR%NB = NB
     CALL BLOCK_PARTITION(N, NB, A_BLR%NBLK, A_BLR%BSTART, A_BLR%BEND)
     A_BLR%NBLKR_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PR, GRID%MYROW)
-    A_BLR%NBLKC_LOC = BLOCK_NUMROC(A_BLR%NBLK, GRID%PC, GRID%MYCOL)
+    A_BLR%CMAP = F_CMAP
+    A_BLR%NBLKC_LOC = BLR_NBLKC_LOC(A_BLR%CMAP, A_BLR%NBLK, GRID)
     ALLOCATE(A_BLR%DIAGBLK(A_BLR%NBLK))
     ALLOCATE(A_BLR%OFFBLK(MAX(A_BLR%NBLKR_LOC,1), MAX(A_BLR%NBLKC_LOC,1)))
     CALL OOC_STORE_INIT(A_BLR%STORE_A, TRIM(SCRATCH_DIR), 'a', MYID0)
@@ -708,7 +717,7 @@ CONTAINS
     DO li2 = 1, A_BLR%NBLKR_LOC
       I2 = (li2-1)*GRID%PR + GRID%MYROW + 1
       DO lj2 = 1, A_BLR%NBLKC_LOC
-        J2 = (lj2-1)*GRID%PC + GRID%MYCOL + 1
+        J2 = BLR_COL_GLOBAL(A_BLR%CMAP, lj2, GRID)
         IF (I2 .EQ. J2) CYCLE
         READ(U) R_I, R_J, R_LOWRANK, R_M, R_N, R_RANK
         BLK%IS_LOWRANK = R_LOWRANK; BLK%M = R_M; BLK%N = R_N; BLK%RANK = R_RANK
@@ -910,7 +919,7 @@ CONTAINS
     DO li = 1, A_BLR%NBLKR_LOC
       I = (li-1)*GRID%PR + GRID%MYROW + 1
       DO lj = 1, A_BLR%NBLKC_LOC
-        J = (lj-1)*GRID%PC + GRID%MYCOL + 1
+        J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
         IF (I .EQ. J) CYCLE
         IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
           WRITE(U,'(I0,A,I0,A,I0)') I, ',', J, ',lowrank,', A_BLR%OFFBLK(li,lj)%RANK
