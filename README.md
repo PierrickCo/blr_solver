@@ -36,6 +36,28 @@ totale et temps inchangés ; identique au cyclique pur si PGCD(PR,PC)=1.
 Les checkpoints enregistrent la distribution et les anciens restent
 relisibles (voir [`examples/README.md`](examples/README.md)).
 
+**Recompression incrémentale du Schur hors diagonale** (LU et LDLᵀ,
+depuis 2026-11-03). La mise à jour d'un bloc bas-rang par un produit
+bas-rang, suivie de sa recompression, est le coût dominant de la
+factorisation.
+
+- **Invariant gardé :** un bloc issu d'une recompression garde `UFAC` à
+  colonnes orthonormées et `VFAC = diag(SV)·Wᵀ`, avec W orthonormée (champs
+  `ORTHO` et `SV` de `BLR_BLOCK_T`).
+- **Mise à jour suivante** (`FAST_RECOMPRESS_ORTHO`) : la mise à jour est
+  projetée sur ces bases ; seul le résidu est orthonormalisé, puis vient
+  la SVD du petit noyau. La matrice et la troncature sont les mêmes que
+  la recompression complète ; seuls les arrondis diffèrent.
+- **Mesuré** sur une matrice BEM à N = 40 230 (LDLᵀ, NB = 702,
+  1 processus) : factorisation 90 → 67-69 s (−24 %), mémoire inchangée.
+- **Comparaison :** `ORTHO_RECOMP = .FALSE.` rétablit la recompression
+  complète.
+- **Diagnostic :** `SCHUR_PROF = .TRUE.` active le profil par cas, étape de
+  recompression et rangs (variables `SPROF_*` de `blr_compress_mod.f90`,
+  séquentiel). `T_BREAKDOWN_MIN` de `MPI_BLR_SYM_LDLT_FACTOR` donne le
+  minimum par processus de chaque poste, à comparer au maximum
+  `T_BREAKDOWN`.
+
 **BLR+MPI** est la pièce la plus aboutie du projet : c'est le seul module où
 le stockage *distribué* lui-même reste compressé (tous les modules MPI plus
 anciens gardent une matrice locale dense, la compression n'y accélère que le
@@ -80,8 +102,10 @@ calcul). Il existe en quatre variantes, toutes validées :
   factorisation reste `O(N³)` en ordre, avec une constante bien plus petite
   grâce à la compression (mesuré : BLR+MPI ×2-2.4 plus rapide et ×2.7-4.5
   moins gourmand en mémoire que la référence MPI dense, à N=10000-20000).
-  Voir la mémoire du projet pour la localisation précise du coût
-  (`FAST_RECOMPRESS`, 83-86% du temps de factorisation).
+  Le coût dominant est la recompression du Schur hors diagonale : 83-86 %
+  du temps de factorisation, et 94 % du Schur sur une matrice BEM à
+  N = 40 230, avant la recompression incrémentale qui en retire environ un
+  quart.
 - **Pivotage confiné, pas global** : le pivot ne cherche que dans les lignes
   du bloc diagonal courant — plus faible qu'un pivotage global, mais c'est
   exactement le compromis utilisé en production par MUMPS/STRUMPACK

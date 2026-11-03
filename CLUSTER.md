@@ -105,7 +105,8 @@ heures ; réduire `REPEATS`, `NB_LIST` ou `SOLVERS` si besoin.
 
 Pour `mpi_blr_matrix_mod.f90` (BLR+MPI), la taille de bloc optimale résulte
 d'un compromis entre deux coûts qui évoluent en sens opposé avec `NB` :
-- la **recompression** (dominante, 83-86% du temps de factorisation)
+- la **recompression** (dominante, 83-86% du temps de factorisation,
+  environ −25 % depuis la recompression incrémentale de 2026-11-03)
   décroît en `O(N³/NB²)` — favorise un `NB` grand ;
 - le **LU du bloc diagonal** croît en `O(N·NB²)` — favorise un `NB` petit.
 
