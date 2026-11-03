@@ -81,11 +81,37 @@ MODULE BLR_COMPRESS_MOD
   ! et M/2) rejetees.
   REAL(WP) :: COMPRESS_WORTHWHILE_RATIO = 1.0_WP/3.0_WP
 
+  ! Profil des mises a jour de Schur hors-diagonale (diagnostic, actif si
+  ! SCHUR_PROF ; sequentiel : ne pas activer sous OpenMP). Par cas :
+  !   1 cible dense ; 2 cible et produit bas-rang, recompression reussie ;
+  !   3 cible et produit bas-rang, repli dense ; 4 cible bas-rang, produit
+  !   dense (repli dense).
+  ! SPROF_N nombre de mises a jour, SPROF_T temps total (s), SPROF_TP temps
+  ! des produits L*U ; SPROF_TR temps de FAST_RECOMPRESS : (1) copie + QR de
+  ! [UA|-PU], (2) QR de [VA;PV]^T, (3) coeur (produit + SVD), (4) facteurs
+  ! finaux ; SPROF_R sommes des rangs RA, RP et du rang recompresse (cas 2).
+  LOGICAL :: SCHUR_PROF = .FALSE.
+
+  ! Recompression incrementale des blocs ORTHO (FAST_RECOMPRESS_ORTHO) ;
+  ! .FALSE. : recompression complete a chaque mise a jour (comparaison).
+  LOGICAL :: ORTHO_RECOMP = .TRUE.
+  INTEGER(8) :: SPROF_N(4) = 0_8, SPROF_R(3) = 0_8, SPROF_NO = 0_8   ! SPROF_NO : recompressions incrementales
+  INTEGER(8) :: SPROF_RK(2) = 0_8   ! sommes des rangs des residus (lignes, colonnes) des recompressions incrementales
+  DOUBLE PRECISION :: SPROF_T(4) = 0.0D0, SPROF_TR(4) = 0.0D0, SPROF_TP = 0.0D0
+
   TYPE :: BLR_BLOCK_T
     LOGICAL :: IS_LOWRANK = .FALSE.
     INTEGER :: M = 0, N = 0, RANK = 0
     COMPLEX(WP), ALLOCATABLE :: DENSE(:,:)         ! si IS_LOWRANK = .FALSE.
     COMPLEX(WP), ALLOCATABLE :: UFAC(:,:), VFAC(:,:)  ! si IS_LOWRANK = .TRUE.
+    ! ORTHO : bloc issu d'une recompression, UFAC a colonnes orthonormees
+    ! et VFAC = diag(SV) * W^T, W a colonnes orthonormees (W^H W = I), SV
+    ! valeurs singulieres (RANK). Permet la recompression incrementale
+    ! (FAST_RECOMPRESS_ORTHO) a la mise a jour de Schur suivante. Remis a
+    ! .FALSE. par toute operation qui modifie les facteurs autrement que par
+    ! une permutation (TRSM, D^-1, reception MPI).
+    LOGICAL :: ORTHO = .FALSE.
+    REAL(WP), ALLOCATABLE :: SV(:)
   END TYPE BLR_BLOCK_T
 
   ! Variante ARENA de BLR_BLOCK_T (composantes POINTEUR, vues carvees dans
@@ -904,6 +930,7 @@ CONTAINS
     COMPLEX(WP), POINTER :: RU(:,:), RV(:,:), WMAT(:,:), UW(:,:), VWH(:,:), SVWH(:,:), CWORK(:)
     REAL(WP), POINTER :: SW(:), RWORK(:)
     REAL(WP) :: THRESH
+    DOUBLE PRECISION :: TP0
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
 
     RTOT = RA + RP
@@ -943,6 +970,7 @@ CONTAINS
       CWORK => CWORK_LOC
     END IF
 
+    IF (SCHUR_PROF) TP0 = BLR_WALLTIME()
     UCAT(1:MI,1:RA)      = UA
     UCAT(1:MI,RA+1:RTOT) = -PU
 
@@ -961,6 +989,7 @@ CONTAINS
     END DO
     CALL CUNGQR(MI, RTOT, RTOT, UCAT, LDU, TAUU, CWORK, LWORK, INFO)
     ! UCAT contient maintenant QU (MI x RTOT)
+    IF (SCHUR_PROF) CALL PROF_LAP(1, TP0)
 
     ! QR de VCATT -> QV (ecrase VCATT), RV
     CALL CGEQRF(NJ, RTOT, VCATT, LDVQ, TAUV, CWORK, LWORK, INFO)
@@ -970,12 +999,14 @@ CONTAINS
     END DO
     CALL CUNGQR(NJ, RTOT, RTOT, VCATT, LDVQ, TAUV, CWORK, LWORK, INFO)
     ! VCATT contient maintenant QV (NJ x RTOT)
+    IF (SCHUR_PROF) CALL PROF_LAP(2, TP0)
 
     ! W = RU * RV^T (transposee ORDINAIRE -- voir note ci-dessus)
     CALL CGEMM('No transpose', 'Transpose', RTOT, RTOT, RTOT, CONE, &
                 RU, LDSQ, RV, LDSQ, CZERO, WMAT, LDSQ)
 
     CALL CGESVD('S', 'S', RTOT, RTOT, WMAT, LDSQ, SW, UW, LDSQ, VWH, LDSQ, CWORK, LWORK, RWORK, INFO)
+    IF (SCHUR_PROF) CALL PROF_LAP(3, TP0)
 
     IF (INFO .NE. 0) THEN
       OK = .FALSE.
@@ -1014,7 +1045,15 @@ CONTAINS
       END DO
       CALL CGEMM('No transpose', 'Transpose', R, NJ, RTOT, CONE, &
                   SVWH, LDSV, VCATT, LDVQ, CZERO, NEWBLK%VFAC, R)
+      ! UFAC = QU*UW et VFAC = diag(SW)*(VWH*QV^T) : bases orthonormees.
+      NEWBLK%ORTHO = .TRUE.
+      ALLOCATE(NEWBLK%SV(R))
+      NEWBLK%SV = SW(1:R)
       IF (.NOT. PRESENT(WS)) DEALLOCATE(SVWH_LOC)
+      IF (SCHUR_PROF) THEN
+        CALL PROF_LAP(4, TP0)
+        SPROF_R(1) = SPROF_R(1) + RA; SPROF_R(2) = SPROF_R(2) + RP; SPROF_R(3) = SPROF_R(3) + R
+      END IF
     END IF
 
     IF (.NOT. PRESENT(WS)) DEALLOCATE(UCAT_LOC, VCATT_LOC, TAUU_LOC, TAUV_LOC, RU_LOC, RV_LOC, &
@@ -1059,11 +1098,12 @@ CONTAINS
 
     TYPE(BLR_BLOCK_T) :: PBLK, NEWBLK, DENSEBLK
     COMPLEX(WP), ALLOCATABLE :: DENSE_TMP(:,:)
-    INTEGER :: RMAX
+    INTEGER :: RMAX, ICASE
     LOGICAL :: OK, MOVEALLOC_ON
-    DOUBLE PRECISION :: TT0
+    DOUBLE PRECISION :: TT0, TS0
 
     IF (MI.EQ.0 .OR. NJ.EQ.0 .OR. KW.EQ.0) RETURN
+    IF (SCHUR_PROF) TS0 = BLR_WALLTIME()
 
     MOVEALLOC_ON = .FALSE.
     IF (PRESENT(USE_MOVE_ALLOC)) MOVEALLOC_ON = USE_MOVE_ALLOC
@@ -1071,12 +1111,22 @@ CONTAINS
     IF (PRESENT(T_PRODUCT)) TT0 = BLR_WALLTIME()
     CALL COMPUTE_LU_PRODUCT(MI, NJ, KW, LBLK, UBLK, PBLK)
     IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (BLR_WALLTIME() - TT0)
+    IF (SCHUR_PROF) SPROF_TP = SPROF_TP + (BLR_WALLTIME() - TS0)
+    ICASE = 1
+    IF (ABLK%IS_LOWRANK) ICASE = MERGE(3, 4, PBLK%IS_LOWRANK)
 
     IF (ABLK%IS_LOWRANK .AND. PBLK%IS_LOWRANK) THEN
       ! cas 2 : A et L*U basse-rang -> tenter de rester en low-rank
       RMAX = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(MIN(MI,NJ),WP)) - 1)
       IF (PRESENT(T_RECOMP)) TT0 = BLR_WALLTIME()
-      IF (PRESENT(WS)) THEN
+      IF (PRESENT(WS) .AND. ORTHO_RECOMP .AND. ABLK%ORTHO .AND. ALLOCATED(ABLK%SV)) THEN
+        IF (SIZE(ABLK%SV) .EQ. ABLK%RANK) THEN
+          CALL FAST_RECOMPRESS_ORTHO(MI, NJ, ABLK, PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, WS)
+        ELSE
+          CALL FAST_RECOMPRESS(MI, NJ, ABLK%RANK, ABLK%UFAC, ABLK%VFAC, &
+                                PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, WS)
+        END IF
+      ELSE IF (PRESENT(WS)) THEN
         CALL FAST_RECOMPRESS(MI, NJ, ABLK%RANK, ABLK%UFAC, ABLK%VFAC, &
                               PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, WS)
       ELSE
@@ -1094,10 +1144,17 @@ CONTAINS
           IF (ALLOCATED(ABLK%DENSE)) DEALLOCATE(ABLK%DENSE)
           CALL MOVE_ALLOC(NEWBLK%UFAC, ABLK%UFAC)
           CALL MOVE_ALLOC(NEWBLK%VFAC, ABLK%VFAC)
+          IF (ALLOCATED(ABLK%SV)) DEALLOCATE(ABLK%SV)
+          IF (ALLOCATED(NEWBLK%SV)) CALL MOVE_ALLOC(NEWBLK%SV, ABLK%SV)
+          ABLK%ORTHO = NEWBLK%ORTHO
           ABLK%IS_LOWRANK = .TRUE.
           ABLK%M = MI; ABLK%N = NJ; ABLK%RANK = NEWBLK%RANK
         ELSE
           ABLK = NEWBLK
+        END IF
+        IF (SCHUR_PROF) THEN
+          SPROF_N(2) = SPROF_N(2) + 1
+          SPROF_T(2) = SPROF_T(2) + (BLR_WALLTIME() - TS0)
         END IF
         RETURN
       END IF
@@ -1117,6 +1174,8 @@ CONTAINS
       IF (ALLOCATED(ABLK%VFAC))  DEALLOCATE(ABLK%VFAC)
       IF (ALLOCATED(ABLK%DENSE)) DEALLOCATE(ABLK%DENSE)
       CALL MOVE_ALLOC(DENSE_TMP, ABLK%DENSE)
+      IF (ALLOCATED(ABLK%SV)) DEALLOCATE(ABLK%SV)
+      ABLK%ORTHO = .FALSE.
       ABLK%IS_LOWRANK = .FALSE.
       ABLK%M = MI; ABLK%N = NJ
     ELSE
@@ -1126,7 +1185,185 @@ CONTAINS
       ABLK = DENSEBLK
     END IF
     IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (BLR_WALLTIME() - TT0)
+    IF (SCHUR_PROF) THEN
+      SPROF_N(ICASE) = SPROF_N(ICASE) + 1
+      SPROF_T(ICASE) = SPROF_T(ICASE) + (BLR_WALLTIME() - TS0)
+    END IF
   END SUBROUTINE SCHUR_UPDATE_BLR_BLOCK
+
+  !-----------------------------------------------------------------------
+  ! Recompression INCREMENTALE de C = A - PU*PV pour un bloc cible ORTHO :
+  ! A = U*diag(S)*Wc^T, U (MI x RA) et Wc (NJ x RA) a colonnes orthonormees
+  ! (Wc^T = diag(1/S)*VFAC), S = ABLK%SV. Au lieu de re-orthonormaliser les
+  ! RA+RP colonnes de [U|-PU] et de [VA;PV]^T (FAST_RECOMPRESS), on projette
+  ! la mise a jour sur les bases existantes (ORTHO_RESIDUAL : PU = U*X +
+  ! Q1*B1, PV^T = Wc*Y + Q2*B2, Q1 et Q2 orthonormees et orthogonales aux
+  ! bases), d'ou
+  !   C = [U Q1] * K * [Wc Q2]^T,  K = diag(S, 0) - [X;B1]*[Y;B2]^T,
+  ! puis SVD du coeur K (au plus (RA+RP) x (RA+RP), comme FAST_RECOMPRESS)
+  ! et meme troncature (TOL relatif a la plus grande valeur singuliere).
+  ! Meme matrice C, meme critere : resultat identique aux arrondis pres ;
+  ! QR de largeur RP seulement, aucune QR de la base existante. La sortie
+  ! verifie de nouveau les invariants ORTHO. Memes conditions de sortie
+  ! OK = .FALSE. que FAST_RECOMPRESS (RA+RP >= MIN(MI,NJ), rang > RMAX).
+  ! Tableaux de travail de taille MI ou NJ pris dans WS (UCAT, VCATT,
+  ! BCOPY, UFULL, VTFULL, de dimension principale WS%MAXDIM).
+  !-----------------------------------------------------------------------
+  SUBROUTINE FAST_RECOMPRESS_ORTHO(MI, NJ, ABLK, RP, PU, PV, TOL, RMAX, NEWBLK, OK, WS)
+    INTEGER, INTENT(IN)            :: MI, NJ, RP, RMAX
+    TYPE(BLR_BLOCK_T), INTENT(IN)  :: ABLK
+    COMPLEX(WP), INTENT(IN)        :: PU(MI,RP), PV(RP,NJ)
+    REAL(WP), INTENT(IN)           :: TOL
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: NEWBLK
+    LOGICAL, INTENT(OUT)           :: OK
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT) :: WS
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: X(:,:), Y(:,:), B1(:,:), B2(:,:), L1(:,:), L2(:,:), KM(:,:), UK(:,:), VKT(:,:)
+    REAL(WP), ALLOCATABLE :: SK(:), RWK(:)
+    INTEGER, ALLOCATABLE :: IWK(:)
+    INTEGER :: RA, R1, R2, K1, K2, KMIN, KMAX, R, I, INFO, LD
+    REAL(WP) :: THRESH
+    DOUBLE PRECISION :: TP0
+
+    OK = .FALSE.
+    RA = ABLK%RANK
+    IF (RA + RP .GE. MIN(MI,NJ) .OR. RA + RP .GT. RMAX) RETURN
+    LD = WS%MAXDIM
+    IF (SCHUR_PROF) TP0 = BLR_WALLTIME()
+    ALLOCATE(X(RA,RP), Y(RA,RP), B1(RP,RP), B2(RP,RP))
+
+    ! cote lignes : PU = U*X + Q1*B1 (Q1 dans BCOPY)
+    WS%UCAT(1:MI,1:RP) = PU
+    CALL ORTHO_RESIDUAL(MI, RA, ABLK%UFAC, MI, RP, WS%UCAT, LD, X, WS%BCOPY, LD, B1, R1, WS, INFO)
+    IF (INFO .NE. 0) RETURN
+    IF (SCHUR_PROF) CALL PROF_LAP(1, TP0)
+
+    ! cote colonnes : Wc = (diag(1/S)*VFAC)^T (UFULL), PV^T = Wc*Y + Q2*B2
+    ! (Q2 dans VTFULL)
+    DO I = 1, RA
+      WS%UFULL(1:NJ,I) = ABLK%VFAC(I,1:NJ) / ABLK%SV(I)
+    END DO
+    DO I = 1, RP
+      WS%VCATT(1:NJ,I) = PV(I,1:NJ)
+    END DO
+    CALL ORTHO_RESIDUAL(NJ, RA, WS%UFULL, LD, RP, WS%VCATT, LD, Y, WS%VTFULL, LD, B2, R2, WS, INFO)
+    IF (INFO .NE. 0) RETURN
+    IF (SCHUR_PROF) CALL PROF_LAP(2, TP0)
+
+    ! coeur K = diag(S,0) - [X;B1]*[Y;B2]^T et sa SVD
+    K1 = RA + R1; K2 = RA + R2; KMIN = MIN(K1, K2)
+    ALLOCATE(L1(K1,RP), L2(K2,RP), KM(K1,K2), SK(KMIN), UK(K1,KMIN), VKT(KMIN,K2))
+    L1(1:RA,:) = X
+    IF (R1 .GT. 0) L1(RA+1:K1,:) = B1(1:R1,:)
+    L2(1:RA,:) = Y
+    IF (R2 .GT. 0) L2(RA+1:K2,:) = B2(1:R2,:)
+    KM = CZERO
+    DO I = 1, RA
+      KM(I,I) = CMPLX(ABLK%SV(I), 0.0_WP, WP)
+    END DO
+    CALL CGEMM('No transpose', 'Transpose', K1, K2, RP, -CONE, L1, K1, L2, K2, CONE, KM, K1)
+    ! SVD par diviser-pour-regner (CGESDD) : plus rapide que CGESVD a cette
+    ! taille (coeur au plus (RA+RP) x (RA+RP)). RWORK et IWORK aux tailles
+    ! minimales de LAPACK pour JOBZ = 'S' ; CWORK2 (dimensionne pour un SVD
+    ! MAXDIM x MAXDIM) suffit.
+    KMAX = MAX(K1, K2)
+    ALLOCATE(RWK(MAX(5*KMIN*KMIN + 5*KMIN, 2*KMAX*KMIN + 2*KMIN*KMIN + KMIN)), IWK(8*KMIN))
+    CALL CGESDD('S', K1, K2, KM, K1, SK, UK, K1, VKT, KMIN, WS%CWORK2, SIZE(WS%CWORK2), RWK, IWK, INFO)
+    IF (INFO .NE. 0) RETURN
+    THRESH = TOL * MAX(SK(1), TINY(1.0_WP))
+    R = 0
+    DO I = 1, KMIN
+      IF (SK(I) .GT. THRESH) R = R + 1
+    END DO
+    R = MAX(R, 1)
+    IF (SCHUR_PROF) CALL PROF_LAP(3, TP0)
+    IF (R .GT. RMAX) RETURN
+
+    ! UFAC = [U Q1]*UK(:,1:R) ; VFAC = diag(SK)*VKT(1:R,:)*[Wc Q2]^T
+    NEWBLK%IS_LOWRANK = .TRUE.
+    NEWBLK%M = MI; NEWBLK%N = NJ; NEWBLK%RANK = R
+    ALLOCATE(NEWBLK%UFAC(MI,R), NEWBLK%VFAC(R,NJ), NEWBLK%SV(R))
+    CALL CGEMM('No transpose', 'No transpose', MI, R, RA, CONE, ABLK%UFAC, MI, UK, K1, CZERO, NEWBLK%UFAC, MI)
+    IF (R1 .GT. 0) CALL CGEMM('No transpose', 'No transpose', MI, R, R1, CONE, WS%BCOPY, LD, UK(RA+1,1), K1, &
+                              CONE, NEWBLK%UFAC, MI)
+    CALL CGEMM('No transpose', 'Transpose', R, NJ, RA, CONE, VKT, KMIN, WS%UFULL, LD, CZERO, NEWBLK%VFAC, R)
+    IF (R2 .GT. 0) CALL CGEMM('No transpose', 'Transpose', R, NJ, R2, CONE, VKT(1,RA+1), KMIN, WS%VTFULL, LD, &
+                              CONE, NEWBLK%VFAC, R)
+    DO I = 1, R
+      NEWBLK%VFAC(I,1:NJ) = SK(I) * NEWBLK%VFAC(I,1:NJ)
+    END DO
+    NEWBLK%SV = SK(1:R)
+    NEWBLK%ORTHO = .TRUE.
+    IF (SCHUR_PROF) THEN
+      SPROF_NO = SPROF_NO + 1
+      SPROF_RK(1) = SPROF_RK(1) + R1; SPROF_RK(2) = SPROF_RK(2) + R2
+    END IF
+    OK = .TRUE.
+    IF (SCHUR_PROF) THEN
+      CALL PROF_LAP(4, TP0)
+      SPROF_R(1) = SPROF_R(1) + RA; SPROF_R(2) = SPROF_R(2) + RP; SPROF_R(3) = SPROF_R(3) + R
+    END IF
+  END SUBROUTINE FAST_RECOMPRESS_ORTHO
+
+  !-----------------------------------------------------------------------
+  ! Base Q0 (N x RA, colonnes orthonormees) et E (N x RP, ecrase) :
+  ! E = Q0*X + Q*BK aux arrondis pres, Q (N x RK, dans Q/LDQ) a colonnes
+  ! orthonormees et orthogonales a Q0, BK (RK premieres lignes de RP x RP).
+  ! Deux passes de Gram-Schmidt par blocs (stabilite), QR du residu, puis
+  ! SVD de son facteur triangulaire : RK = rang numerique du residu
+  ! (directions de valeur singuliere <= 16 eps ||E||_F ignorees : bruit
+  ! d'arrondi, dont l'orthogonalite a Q0 ne serait pas garantie).
+  !-----------------------------------------------------------------------
+  SUBROUTINE ORTHO_RESIDUAL(N, RA, Q0, LDQ0, RP, E, LDE, X, Q, LDQ, BK, RK, WS, INFO)
+    INTEGER, INTENT(IN)        :: N, RA, LDQ0, RP, LDE, LDQ
+    COMPLEX(WP), INTENT(IN)    :: Q0(LDQ0,*)
+    COMPLEX(WP), INTENT(INOUT) :: E(LDE,*)
+    COMPLEX(WP), INTENT(OUT)   :: X(RA,RP), Q(LDQ,*), BK(RP,RP)
+    INTEGER, INTENT(OUT)       :: RK, INFO
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT) :: WS
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: T(:,:), RT(:,:), UR(:,:), VRH(:,:)
+    REAL(WP), ALLOCATABLE :: SR(:)
+    REAL(WP) :: ENRM, RDUM(1)
+    REAL(WP), EXTERNAL :: CLANGE
+    INTEGER :: I, LWORK
+    ENRM = CLANGE('F', N, RP, E, LDE, RDUM)
+    ALLOCATE(T(RA,RP), RT(RP,RP), UR(RP,RP), VRH(RP,RP), SR(RP))
+    CALL CGEMM('Conjugate transpose', 'No transpose', RA, RP, N, CONE, Q0, LDQ0, E, LDE, CZERO, X, RA)
+    CALL CGEMM('No transpose', 'No transpose', N, RP, RA, -CONE, Q0, LDQ0, X, RA, CONE, E, LDE)
+    CALL CGEMM('Conjugate transpose', 'No transpose', RA, RP, N, CONE, Q0, LDQ0, E, LDE, CZERO, T, RA)
+    CALL CGEMM('No transpose', 'No transpose', N, RP, RA, -CONE, Q0, LDQ0, T, RA, CONE, E, LDE)
+    X = X + T
+    LWORK = SIZE(WS%CWORK2)
+    CALL CGEQRF(N, RP, E, LDE, WS%TAUU, WS%CWORK2, LWORK, INFO)
+    IF (INFO .NE. 0) RETURN
+    RT = CZERO
+    DO I = 1, RP
+      RT(1:I,I) = E(1:I,I)
+    END DO
+    CALL CUNGQR(N, RP, RP, E, LDE, WS%TAUU, WS%CWORK2, LWORK, INFO)
+    IF (INFO .NE. 0) RETURN
+    CALL CGESVD('S', 'S', RP, RP, RT, RP, SR, UR, RP, VRH, RP, WS%CWORK2, LWORK, WS%RWORK2, INFO)
+    IF (INFO .NE. 0) RETURN
+    RK = 0
+    DO I = 1, RP
+      IF (SR(I) .GT. 16.0_WP*EPSILON(1.0_WP)*ENRM) RK = RK + 1
+    END DO
+    IF (RK .GT. 0) CALL CGEMM('No transpose', 'No transpose', N, RK, RP, CONE, E, LDE, UR, RP, CZERO, Q, LDQ)
+    DO I = 1, RK
+      BK(I,1:RP) = SR(I) * VRH(I,1:RP)
+    END DO
+  END SUBROUTINE ORTHO_RESIDUAL
+
+  ! Profil : ajoute le temps ecoule depuis T0 a SPROF_TR(I) et repart.
+  SUBROUTINE PROF_LAP(I, T0)
+    INTEGER, INTENT(IN) :: I
+    DOUBLE PRECISION, INTENT(INOUT) :: T0
+    DOUBLE PRECISION :: T1
+    T1 = BLR_WALLTIME()
+    SPROF_TR(I) = SPROF_TR(I) + (T1 - T0)
+    T0 = T1
+  END SUBROUTINE PROF_LAP
 
   !-----------------------------------------------------------------------
   ! PROPOSITION 2 (post-etape 6) : Y <- ALPHA*BLK*X + BETA*Y, ou BLK est
@@ -1306,6 +1543,7 @@ CONTAINS
     COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
     TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    BLK%ORTHO = .FALSE.
     IF (BLK%IS_LOWRANK) THEN
       CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, BLK%RANK, CONE, DKK, KW, BLK%UFAC, KW)
     ELSE
@@ -1324,6 +1562,7 @@ CONTAINS
     INTEGER, INTENT(IN)             :: KW
     COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    BLK%ORTHO = .FALSE.
     IF (BLK%IS_LOWRANK) THEN
       CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', BLK%RANK, KW, CONE, DKK, KW, BLK%VFAC, BLK%RANK)
     ELSE

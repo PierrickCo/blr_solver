@@ -256,6 +256,7 @@ CONTAINS
     INTEGER, INTENT(IN)              :: KW
     COMPLEX(WP), INTENT(IN)          :: DKK(KW,KW)
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    BLK%ORTHO = .FALSE.
     IF (BLK%M .EQ. 0) RETURN
     IF (BLK%IS_LOWRANK) THEN
       IF (BLK%RANK .GT. 0) CALL CTRSM('Right', 'Lower', 'Transpose', 'Unit', BLK%RANK, KW, CONE, DKK, KW, BLK%VFAC, BLK%RANK)
@@ -321,6 +322,7 @@ CONTAINS
     TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
     INTEGER, INTENT(IN)              :: KW, IPIV(KW)
     COMPLEX(WP), INTENT(IN)          :: DD(KW), DS(KW)
+    BLK%ORTHO = .FALSE.
     IF (BLK%M .EQ. 0) RETURN
     IF (BLK%IS_LOWRANK) THEN
       IF (BLK%RANK .GT. 0) CALL APPLY_DINV_RIGHT(BLK%VFAC, BLK%RANK, BLK%RANK, KW, IPIV, DD, DS)
@@ -757,7 +759,7 @@ CONTAINS
   !=======================================================================
   SUBROUTINE MPI_BLR_SYM_LDLT_FACTOR(GRID, A, TOL, INFO, N_COMPRESSED, N_OFFDIAG, RANK_SUM, &
                                      N_SWAPS, N_2X2, T_FACTOR, SHOW_PROGRESS, SHOW_RSS_TRACE, &
-                                     USE_MOVE_ALLOC, PROGRESS_CALLBACK, T_BREAKDOWN, LOOKAHEAD)
+                                     USE_MOVE_ALLOC, PROGRESS_CALLBACK, T_BREAKDOWN, LOOKAHEAD, T_BREAKDOWN_MIN)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)           :: GRID
     TYPE(MPI_BLR_SYM_T), INTENT(INOUT) :: A
@@ -776,6 +778,9 @@ CONTAINS
     ! (7) boucle complete. Chaque categorie est un MAX independant : leur
     ! somme peut differer de (7).
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_BREAKDOWN(7)
+    ! T_BREAKDOWN_MIN (optionnel) : memes categories, MIN sur la grille
+    ! (avec T_BREAKDOWN : desequilibre entre processus).
+    DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_BREAKDOWN_MIN(7)
     ! LOOKAHEAD (defaut .TRUE.) : anticipation de profondeur 1. A l'etape K,
     ! des que la colonne K+1 a recu sa mise a jour de Schur, le proprietaire
     ! du bloc (K+1,K+1) le factorise et lance des diffusions NON BLOQUANTES
@@ -1017,6 +1022,8 @@ CONTAINS
     IF (RSS_TRACE) WRITE(6,'(A,F8.1,A)') '     [RSS trace] MAX observe pendant la factorisation = ', RSS_MAX_MB, ' Mo'
     TB(7) = MPI_WTIME() - TLOOP0
     IF (PRESENT(T_BREAKDOWN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN, 7, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
+    IF (PRESENT(T_BREAKDOWN_MIN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN_MIN, 7, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, &
+                                                     IERR)
 
     DEALLOCATE(WRECV, LTRECV, E, WORK, DWORK)
     IF (ALLOCATED(IBUF_N)) DEALLOCATE(IBUF_N, DBUF_N, APK_N)
