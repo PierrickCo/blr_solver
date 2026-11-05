@@ -606,7 +606,7 @@ CONTAINS
     INFO = 0
     NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8
     ALLOCATE(LRECV(MAX(A_BLR%NBLKR_LOC,1)), URECV(MAX(A_BLR%NBLKC_LOC,1)))
-    CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB)
+    CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB, FACT_WORKSPACE_RANK(A_BLR%NB))
 
     DO K = 1, NBLK
       KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
@@ -742,6 +742,14 @@ CONTAINS
         END DO
       END DO
 
+      ! Panneaux recus des blocs-lignes / blocs-colonnes deja traites (I, J
+      ! <= K+1) : plus jamais lus, liberes a chaque etape (voir le LDLt).
+      DO li = 1, A_BLR%NBLKR_LOC
+        IF ((li-1)*GRID%PR + GRID%MYROW + 1 .LE. K+1) CALL BLR_BLOCK_RELEASE(LRECV(li))
+      END DO
+      DO lj = 1, A_BLR%NBLKC_LOC
+        IF (BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID) .LE. K+1) CALL BLR_BLOCK_RELEASE(URECV(lj))
+      END DO
       CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_MILESTONE('Factorisation LU (sans pivot)', K, NBLK, LAST_PCT)
     END DO
@@ -866,7 +874,7 @@ CONTAINS
     ALLOCATE(LRECV(MAX(A_BLR%NBLKR_LOC,1)), URECV(MAX(A_BLR%NBLKC_LOC,1)))
     ALLOCATE(A_BLR%IPIV(A_BLR%NB, NBLK))
     A_BLR%IPIV = 0
-    CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB)
+    CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB, FACT_WORKSPACE_RANK(A_BLR%NB))
     TB = 0.0D0
     TLOOP0 = MPI_WTIME()
 
@@ -1023,6 +1031,14 @@ CONTAINS
         END DO
       END DO
 
+      ! Panneaux recus des blocs-lignes / blocs-colonnes deja traites (I, J
+      ! <= K+1) : plus jamais lus, liberes a chaque etape (voir le LDLt).
+      DO li = 1, A_BLR%NBLKR_LOC
+        IF ((li-1)*GRID%PR + GRID%MYROW + 1 .LE. K+1) CALL BLR_BLOCK_RELEASE(LRECV(li))
+      END DO
+      DO lj = 1, A_BLR%NBLKC_LOC
+        IF (BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID) .LE. K+1) CALL BLR_BLOCK_RELEASE(URECV(lj))
+      END DO
       CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('2) Factorisation LU (pivot)', K, NBLK, PBAR_STATE)
       IF (PRESENT(PROGRESS_CALLBACK)) THEN

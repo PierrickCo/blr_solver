@@ -198,6 +198,11 @@ MODULE BLR_COMPRESS_MOD
   !-----------------------------------------------------------------------
   TYPE :: BLR_WORKSPACE_T
     INTEGER :: MAXDIM = 0
+    ! LDR : rang total maximal des recompressions, dimension des petits
+    ! tableaux (RU ... SVWH) et nombre de colonnes de UCAT, VCATT, BCOPY,
+    ! UFULL, VTFULL. Egal a MAXDIM dans la variante complete ; plus petit
+    ! dans la variante "factorisation" (BLR_WORKSPACE_ALLOC avec MAXRANK).
+    INTEGER :: LDR = 0
     ! -- COMPRESS_BLOCK (SVD tronquee) --
     COMPLEX(WP), ALLOCATABLE :: BCOPY(:,:), UFULL(:,:), VTFULL(:,:), CWORK1(:)
     REAL(WP), ALLOCATABLE    :: S1(:), RWORK1(:)
@@ -231,13 +236,44 @@ CONTAINS
   ! puis reutilise pour tous les appels ulterieurs quelle que soit leur
   ! taille reelle (toujours <= MAXDIM).
   !-----------------------------------------------------------------------
-  SUBROUTINE BLR_WORKSPACE_ALLOC(WS, MAXDIM)
+  !
+  ! MAXRANK (optionnel) : variante "factorisation", pour les seules mises
+  ! a jour de Schur (FAST_RECOMPRESS, FAST_RECOMPRESS_ORTHO) dont le rang
+  ! total ne depasse jamais RMAX (voir FACT_WORKSPACE_RANK) : tableaux
+  ! MAXDIM x MAXRANK et MAXRANK x MAXRANK au lieu de MAXDIM x MAXDIM (NB =
+  ! 702 : 44 -> 10 Mo). COMPRESS_BLOCK ne doit pas recevoir cet espace.
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_WORKSPACE_ALLOC(WS, MAXDIM, MAXRANK)
     TYPE(BLR_WORKSPACE_T), INTENT(OUT) :: WS
     INTEGER, INTENT(IN) :: MAXDIM
-    INTEGER :: LWORK, INFO
+    INTEGER, INTENT(IN), OPTIONAL :: MAXRANK
+    INTEGER :: LWORK, INFO, MD, LR
     COMPLEX(WP) :: WQ(1)
 
     WS%MAXDIM = MAX(MAXDIM, 1)
+    IF (PRESENT(MAXRANK)) THEN
+      MD = WS%MAXDIM
+      LR = MIN(MD, MAX(MAXRANK, 1))
+      WS%LDR = LR
+      ALLOCATE(WS%BCOPY(MD,LR), WS%UFULL(MD,LR), WS%VTFULL(MD,LR))
+      ALLOCATE(WS%S1(1), WS%RWORK1(1))
+      ALLOCATE(WS%UCAT(MD,LR), WS%VCATT(MD,LR))
+      ALLOCATE(WS%TAUU(MD), WS%TAUV(MD))
+      ALLOCATE(WS%RU(LR,LR), WS%RV(LR,LR), WS%WMAT(LR,LR))
+      ALLOCATE(WS%UW(LR,LR), WS%VWH(LR,LR), WS%SVWH(LR,LR))
+      ALLOCATE(WS%SW(LR), WS%RWORK2(5*LR))
+      LWORK = 1
+      CALL CGEQRF(MD, LR, WS%UCAT, MD, WS%TAUU, WQ, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+      CALL CUNGQR(MD, LR, LR, WS%UCAT, MD, WS%TAUU, WQ, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+      CALL CGESVD('S', 'S', LR, LR, WS%WMAT, LR, WS%SW, WS%UW, LR, WS%VWH, LR, WQ, -1, WS%RWORK2, INFO)
+      LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+      LWORK = MAX(LWORK, LR*LR + 3*LR)          ! CGESDD (JOBZ = 'S') de FAST_RECOMPRESS_ORTHO
+      ALLOCATE(WS%CWORK1(1), WS%CWORK2(LWORK))
+      RETURN
+    END IF
+    WS%LDR = WS%MAXDIM
 
     ALLOCATE(WS%BCOPY(WS%MAXDIM,WS%MAXDIM), WS%UFULL(WS%MAXDIM,WS%MAXDIM), WS%VTFULL(WS%MAXDIM,WS%MAXDIM))
     ALLOCATE(WS%S1(WS%MAXDIM), WS%RWORK1(5*WS%MAXDIM))
@@ -262,6 +298,51 @@ CONTAINS
 
     ALLOCATE(WS%CWORK1(LWORK), WS%CWORK2(LWORK))
   END SUBROUTINE BLR_WORKSPACE_ALLOC
+
+  ! Octets occupes par un espace de travail (diagnostic memoire).
+  FUNCTION BLR_WORKSPACE_BYTES(WS) RESULT(NB)
+    TYPE(BLR_WORKSPACE_T), INTENT(IN) :: WS
+    INTEGER(8) :: NB
+    NB = 0_8
+    IF (ALLOCATED(WS%BCOPY))  NB = NB + 8_8*SIZE(WS%BCOPY,KIND=8)
+    IF (ALLOCATED(WS%UFULL))  NB = NB + 8_8*SIZE(WS%UFULL,KIND=8)
+    IF (ALLOCATED(WS%VTFULL)) NB = NB + 8_8*SIZE(WS%VTFULL,KIND=8)
+    IF (ALLOCATED(WS%CWORK1)) NB = NB + 8_8*SIZE(WS%CWORK1,KIND=8)
+    IF (ALLOCATED(WS%CWORK2)) NB = NB + 8_8*SIZE(WS%CWORK2,KIND=8)
+    IF (ALLOCATED(WS%UCAT))   NB = NB + 8_8*SIZE(WS%UCAT,KIND=8)
+    IF (ALLOCATED(WS%VCATT))  NB = NB + 8_8*SIZE(WS%VCATT,KIND=8)
+    IF (ALLOCATED(WS%RU))     NB = NB + 8_8*SIZE(WS%RU,KIND=8)
+    IF (ALLOCATED(WS%RV))     NB = NB + 8_8*SIZE(WS%RV,KIND=8)
+    IF (ALLOCATED(WS%WMAT))   NB = NB + 8_8*SIZE(WS%WMAT,KIND=8)
+    IF (ALLOCATED(WS%UW))     NB = NB + 8_8*SIZE(WS%UW,KIND=8)
+    IF (ALLOCATED(WS%VWH))    NB = NB + 8_8*SIZE(WS%VWH,KIND=8)
+    IF (ALLOCATED(WS%SVWH))   NB = NB + 8_8*SIZE(WS%SVWH,KIND=8)
+    IF (ALLOCATED(WS%TAUU))   NB = NB + 8_8*SIZE(WS%TAUU,KIND=8)
+    IF (ALLOCATED(WS%TAUV))   NB = NB + 8_8*SIZE(WS%TAUV,KIND=8)
+    IF (ALLOCATED(WS%S1))     NB = NB + 4_8*SIZE(WS%S1,KIND=8)
+    IF (ALLOCATED(WS%RWORK1)) NB = NB + 4_8*SIZE(WS%RWORK1,KIND=8)
+    IF (ALLOCATED(WS%SW))     NB = NB + 4_8*SIZE(WS%SW,KIND=8)
+    IF (ALLOCATED(WS%RWORK2)) NB = NB + 4_8*SIZE(WS%RWORK2,KIND=8)
+  END FUNCTION BLR_WORKSPACE_BYTES
+
+  ! Rang total maximal d'une recompression de Schur pour des blocs de taille
+  ! au plus NB (RMAX de SCHUR_UPDATE_BLR_BLOCK, + 1) : MAXRANK de l'espace
+  ! de travail de factorisation.
+  INTEGER FUNCTION FACT_WORKSPACE_RANK(NB)
+    INTEGER, INTENT(IN) :: NB
+    FACT_WORKSPACE_RANK = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(NB,WP))) + 1
+  END FUNCTION FACT_WORKSPACE_RANK
+
+  ! Libere tous les tableaux d'un bloc et le remet a l'etat vide.
+  SUBROUTINE BLR_BLOCK_RELEASE(BLK)
+    TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
+    IF (ALLOCATED(BLK%DENSE)) DEALLOCATE(BLK%DENSE)
+    IF (ALLOCATED(BLK%UFAC))  DEALLOCATE(BLK%UFAC)
+    IF (ALLOCATED(BLK%VFAC))  DEALLOCATE(BLK%VFAC)
+    IF (ALLOCATED(BLK%SV))    DEALLOCATE(BLK%SV)
+    BLK%IS_LOWRANK = .FALSE.; BLK%ORTHO = .FALSE.
+    BLK%M = 0; BLK%N = 0; BLK%RANK = 0
+  END SUBROUTINE BLR_BLOCK_RELEASE
 
   SUBROUTINE BLR_WORKSPACE_FREE(WS)
     TYPE(BLR_WORKSPACE_T), INTENT(INOUT) :: WS
@@ -940,7 +1021,11 @@ CONTAINS
     END IF
 
     IF (PRESENT(WS)) THEN
-      LDU = WS%MAXDIM; LDVQ = WS%MAXDIM; LDSQ = WS%MAXDIM
+      IF (RTOT .GT. WS%LDR) THEN          ! espace de factorisation trop petit : repli dense
+        OK = .FALSE.
+        RETURN
+      END IF
+      LDU = WS%MAXDIM; LDVQ = WS%MAXDIM; LDSQ = WS%LDR
       UCAT => WS%UCAT; VCATT => WS%VCATT; TAUU => WS%TAUU; TAUV => WS%TAUV
       RU => WS%RU; RV => WS%RV; WMAT => WS%WMAT; UW => WS%UW; VWH => WS%VWH
       SW => WS%SW; RWORK => WS%RWORK2; CWORK => WS%CWORK2
@@ -1033,7 +1118,7 @@ CONTAINS
                   UCAT, LDU, UW, LDSQ, CZERO, NEWBLK%UFAC, MI)
 
       IF (PRESENT(WS)) THEN
-        LDSV = WS%MAXDIM
+        LDSV = WS%LDR
         SVWH => WS%SVWH
       ELSE
         LDSV = R
@@ -1218,7 +1303,7 @@ CONTAINS
     LOGICAL, INTENT(OUT)           :: OK
     TYPE(BLR_WORKSPACE_T), INTENT(INOUT) :: WS
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
-    COMPLEX(WP), ALLOCATABLE :: X(:,:), Y(:,:), B1(:,:), B2(:,:), L1(:,:), L2(:,:), KM(:,:), UK(:,:), VKT(:,:)
+    COMPLEX(WP), ALLOCATABLE :: X(:,:), Y(:,:), B1(:,:), B2(:,:), L1(:,:), L2(:,:), KM(:,:), UK(:,:), VKT(:,:), CWL(:)
     REAL(WP), ALLOCATABLE :: SK(:), RWK(:)
     INTEGER, ALLOCATABLE :: IWK(:)
     INTEGER :: RA, R1, R2, K1, K2, KMIN, KMAX, R, I, INFO, LD
@@ -1227,7 +1312,7 @@ CONTAINS
 
     OK = .FALSE.
     RA = ABLK%RANK
-    IF (RA + RP .GE. MIN(MI,NJ) .OR. RA + RP .GT. RMAX) RETURN
+    IF (RA + RP .GE. MIN(MI,NJ) .OR. RA + RP .GT. RMAX .OR. RA + RP .GT. WS%LDR) RETURN
     LD = WS%MAXDIM
     IF (SCHUR_PROF) TP0 = BLR_WALLTIME()
     ALLOCATE(X(RA,RP), Y(RA,RP), B1(RP,RP), B2(RP,RP))
@@ -1268,7 +1353,12 @@ CONTAINS
     ! MAXDIM x MAXDIM) suffit.
     KMAX = MAX(K1, K2)
     ALLOCATE(RWK(MAX(5*KMIN*KMIN + 5*KMIN, 2*KMAX*KMIN + 2*KMIN*KMIN + KMIN)), IWK(8*KMIN))
-    CALL CGESDD('S', K1, K2, KM, K1, SK, UK, K1, VKT, KMIN, WS%CWORK2, SIZE(WS%CWORK2), RWK, IWK, INFO)
+    IF (SIZE(WS%CWORK2) .GE. KMIN*KMIN + 2*KMIN + KMAX) THEN
+      CALL CGESDD('S', K1, K2, KM, K1, SK, UK, K1, VKT, KMIN, WS%CWORK2, SIZE(WS%CWORK2), RWK, IWK, INFO)
+    ELSE
+      ALLOCATE(CWL(KMIN*KMIN + 2*KMIN + KMAX))
+      CALL CGESDD('S', K1, K2, KM, K1, SK, UK, K1, VKT, KMIN, CWL, SIZE(CWL), RWK, IWK, INFO)
+    END IF
     IF (INFO .NE. 0) RETURN
     THRESH = TOL * MAX(SK(1), TINY(1.0_WP))
     R = 0
@@ -1917,7 +2007,11 @@ CONTAINS
     END IF
 
     IF (PRESENT(WS)) THEN
-      LDU = WS%MAXDIM; LDVQ = WS%MAXDIM; LDSQ = WS%MAXDIM
+      IF (RTOT .GT. WS%LDR) THEN          ! espace de factorisation trop petit : repli dense
+        OK = .FALSE.
+        RETURN
+      END IF
+      LDU = WS%MAXDIM; LDVQ = WS%MAXDIM; LDSQ = WS%LDR
       UCAT => WS%UCAT; VCATT => WS%VCATT; TAUU => WS%TAUU; TAUV => WS%TAUV
       RU => WS%RU; RV => WS%RV; WMAT => WS%WMAT; UW => WS%UW; VWH => WS%VWH
       SW => WS%SW; RWORK => WS%RWORK2; CWORK => WS%CWORK2
@@ -2016,7 +2110,7 @@ CONTAINS
                   UCAT, LDU, UW, LDSQ, CZERO, NEWBLK%UFAC, MI)
 
       IF (PRESENT(WS)) THEN
-        LDSV = WS%MAXDIM
+        LDSV = WS%LDR
         SVWH => WS%SVWH
       ELSE
         LDSV = R

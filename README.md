@@ -58,6 +58,18 @@ factorisation.
   minimum par processus de chaque poste, à comparer au maximum
   `T_BREAKDOWN`.
 
+**Mémoire de la factorisation** (LU et LDLᵀ, depuis 2026-11-05) :
+- **Tampons de panneau libérés à chaque étape.** Les tampons des
+  blocs-lignes et blocs-colonnes déjà traités ne sont plus gardés jusqu'à
+  la fin de la factorisation.
+- **Espace de travail dimensionné pour la factorisation.**
+  `BLR_WORKSPACE_ALLOC(WS, NB, FACT_WORKSPACE_RANK(NB))` alloue des tableaux
+  NB × rang maximal au lieu de NB × NB.
+- **Mesuré** sur la matrice BEM à N = 40 230 (2×2) : pic par processus
+  487-498 → 342 Mo (−30 %), résultat identique au bit près.
+- **Diagnostic :** `FACT_MEM_PROF = .TRUE.` imprime le profil mémoire par
+  étape du LDLᵀ (lignes `[MEMFACT]`).
+
 **BLR+MPI** est la pièce la plus aboutie du projet : c'est le seul module où
 le stockage *distribué* lui-même reste compressé (tous les modules MPI plus
 anciens gardent une matrice locale dense, la compression n'y accélère que le

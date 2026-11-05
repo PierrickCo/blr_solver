@@ -79,6 +79,14 @@ MODULE MPI_BLR_LDLT_MOD
     COMPLEX(WP), ALLOCATABLE :: AP(:)
   END TYPE PACKED_TRI_T
 
+  ! Profil memoire de la factorisation (diagnostic, FACT_MEM_PROF) : a la
+  ! fin de chaque etape K, MAX sur la grille (Mo) du pic de RSS de l'etape
+  ! (VmHWM remis a zero au debut de l'etape), de la RSS, de la memoire
+  ! allouee (mallinfo), de la matrice/facteurs, des panneaux recus (WRECV,
+  ! LTRECV), de la copie des L(I,K) chez le proprietaire de la colonne K
+  ! et des espaces de travail (WS, DWORK). Affiche par le rang 0.
+  LOGICAL :: FACT_MEM_PROF = .FALSE.
+
   TYPE :: MPI_BLR_SYM_T
     INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
     INTEGER :: CMAP = 1     ! distribution des blocs-colonnes (BLR_COL_OWNER) : 0 cyclique, 1 decalee
@@ -826,7 +834,7 @@ CONTAINS
     IF (ALLOCATED(A%DSUB))  DEALLOCATE(A%DSUB)
     ALLOCATE(A%IPIV(A%NB,NBLK), A%DDIAG(A%NB,NBLK), A%DSUB(A%NB,NBLK))
     A%IPIV = 0; A%DDIAG = (0.0_WP,0.0_WP); A%DSUB = (0.0_WP,0.0_WP)
-    CALL BLR_WORKSPACE_ALLOC(WS, A%NB)
+    CALL BLR_WORKSPACE_ALLOC(WS, A%NB, FACT_WORKSPACE_RANK(A%NB))
 
     ! Espace de travail de SYM_BK_FACTOR dimensionne une fois pour NB (le
     ! plus grand bloc diagonal possible).
@@ -847,7 +855,10 @@ CONTAINS
     TB = 0.0D0
     TLOOP0 = MPI_WTIME()
 
+    IF (FACT_MEM_PROF .AND. GRID%MYID .EQ. 0) WRITE(6,'(A)') ' [MEMFACT]  K   pic_etape   RSS  alloue  matrice  '// &
+         'W_recus  Lt_recus  copie_L  WS  DWORK  (Mo, max par processus)'
     DO K = 1, NBLK
+      IF (FACT_MEM_PROF) CALL MEMPROF_RESET_HWM()
       KW = A%BEND(K) - A%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
       PCOL_K = BLR_COL_OWNER(A%CMAP, K, GRID)
@@ -1011,6 +1022,18 @@ CONTAINS
         IF (LA .AND. J .EQ. K+1) CALL POST_NEXT_DIAG(K+1)
       END DO
 
+      IF (FACT_MEM_PROF) CALL MEMPROF_STEP()
+      ! Panneaux recus des blocs-lignes / blocs-colonnes deja traites (I, J
+      ! <= K+1) : plus jamais lus. Liberes a chaque etape plutot qu'en fin de
+      ! factorisation (le dernier recu, voisin du bloc diagonal, est souvent
+      ! dense : jusqu'a ~150 Mo par processus accumules a N = 40 000).
+      DO li = 1, A%NBLKR_LOC
+        IF ((li-1)*GRID%PR + GRID%MYROW + 1 .LE. K+1) CALL BLR_BLOCK_RELEASE(WRECV(li))
+      END DO
+      DO lj = 1, A%NBLKC_LOC
+        IF (BLR_COL_GLOBAL(A%CMAP, lj, GRID) .LE. K+1) CALL BLR_BLOCK_RELEASE(LTRECV(lj))
+      END DO
+      CALL BLR_BLOCK_RELEASE(TMPB)
       DEALLOCATE(IPIV_K, SWP, DBUF)
       CALL BLR_TRIM_HEAP()        ! fin d'etape : memoire liberee rendue au systeme
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('2) Factorisation LDLt (Bunch-Kaufman confine)', K, NBLK, PBAR_STATE)
@@ -1040,6 +1063,34 @@ CONTAINS
     IF (PRESENT(N_2X2))   N_2X2 = N2_TOT
 
   CONTAINS
+
+    ! Profil memoire de l'etape K (FACT_MEM_PROF), voir l'en-tete du module.
+    SUBROUTINE MEMPROF_STEP()
+      INTEGER(8) :: V(10), VM(10), BW, BL, BC
+      INTEGER :: LIP, LJP, IP, JP, IERRP
+      BW = 0_8; BL = 0_8; BC = 0_8
+      DO LIP = 1, A%NBLKR_LOC
+        IP = (LIP-1)*GRID%PR + GRID%MYROW + 1
+        IF (IP .LE. K) CYCLE
+        BW = BW + BLR_BLOCK_BYTES(WRECV(LIP))
+        IF (GRID%MYCOL .EQ. PCOL_K) BC = BC + BLR_BLOCK_BYTES(A%OFFBLK(LIP,lj_K))
+      END DO
+      DO LJP = 1, A%NBLKC_LOC
+        JP = BLR_COL_GLOBAL(A%CMAP, LJP, GRID)
+        IF (JP .LE. K) CYCLE
+        BL = BL + BLR_BLOCK_BYTES(LTRECV(LJP))
+      END DO
+      V(1) = INT(K,8)
+      V(2) = MEMPROF_HWM_KB()*1024_8
+      V(3) = GET_RSS_KB()*1024_8
+      V(4) = MEMPROF_ALLOC_BYTES()
+      V(5) = MPI_BLR_SYM_MEMORY_BYTES(A)
+      V(6) = BW; V(7) = BL; V(8) = BC
+      V(9) = BLR_WORKSPACE_BYTES(WS)
+      V(10) = 8_8*INT(SIZE(DWORK),8)
+      CALL MPI_REDUCE(V, VM, 10, MPI_INTEGER8, MPI_MAX, 0, GRID%COMM, IERRP)
+      IF (GRID%MYID .EQ. 0) WRITE(6,'(A,I4,9F9.1)') ' [MEMFACT] ', INT(VM(1)), REAL(VM(2:10),8)/1.0D6
+    END SUBROUTINE MEMPROF_STEP
 
     ! Bunch-Kaufman sur le bloc diagonal compact KD (proprietaire seulement) :
     ! IP = IPIV, DB = (D, E), INFO_D = indice global du premier pivot nul.
@@ -1117,6 +1168,53 @@ CONTAINS
     END SUBROUTINE POST_NEXT_DIAG
 
   END SUBROUTINE MPI_BLR_SYM_LDLT_FACTOR
+
+  ! Profil memoire : remet a zero le pic de RSS (VmHWM) du processus.
+  SUBROUTINE MEMPROF_RESET_HWM()
+    INTEGER :: U, IOS
+    OPEN(NEWUNIT=U, FILE='/proc/self/clear_refs', STATUS='OLD', ACTION='WRITE', IOSTAT=IOS)
+    IF (IOS .NE. 0) RETURN
+    WRITE(U, '(A)', IOSTAT=IOS) '5'
+    CLOSE(U)
+  END SUBROUTINE MEMPROF_RESET_HWM
+
+  ! Profil memoire : pic de RSS (VmHWM, Ko ; -1 si illisible).
+  FUNCTION MEMPROF_HWM_KB() RESULT(HWM)
+    INTEGER(8) :: HWM
+    INTEGER :: U, IOS
+    CHARACTER(LEN=256) :: LINE
+    HWM = -1_8
+    OPEN(NEWUNIT=U, FILE='/proc/self/status', STATUS='OLD', ACTION='READ', IOSTAT=IOS)
+    IF (IOS .NE. 0) RETURN
+    DO
+      READ(U, '(A)', IOSTAT=IOS) LINE
+      IF (IOS .NE. 0) EXIT
+      IF (LINE(1:6) .EQ. 'VmHWM:') THEN
+        READ(LINE(7:), *, IOSTAT=IOS) HWM
+        EXIT
+      END IF
+    END DO
+    CLOSE(U)
+  END FUNCTION MEMPROF_HWM_KB
+
+  ! Profil memoire : octets alloues par malloc et vivants (glibc mallinfo,
+  ! champs int lus modulo 2^32 ; uordblks + hblkhd).
+  FUNCTION MEMPROF_ALLOC_BYTES() RESULT(NB)
+    USE ISO_C_BINDING, ONLY: C_INT
+    INTEGER(8) :: NB
+    TYPE, BIND(C) :: MALLINFO_T
+      INTEGER(C_INT) :: ARENA, ORDBLKS, SMBLKS, HBLKS, HBLKHD, USMBLKS, FSMBLKS, UORDBLKS, FORDBLKS, KEEPCOST
+    END TYPE MALLINFO_T
+    INTERFACE
+      FUNCTION MALLINFO() BIND(C, NAME='mallinfo')
+        IMPORT :: MALLINFO_T
+        TYPE(MALLINFO_T) :: MALLINFO
+      END FUNCTION MALLINFO
+    END INTERFACE
+    TYPE(MALLINFO_T) :: MI
+    MI = MALLINFO()
+    NB = MODULO(INT(MI%UORDBLKS,8), 4294967296_8) + MODULO(INT(MI%HBLKHD,8), 4294967296_8)
+  END FUNCTION MEMPROF_ALLOC_BYTES
 
   !=======================================================================
   ! Resolution A*X=B apres MPI_BLR_SYM_LDLT_FACTOR. B_LOCAL (MLOC lignes
