@@ -415,3 +415,52 @@ Sans l'argument, `BLR_LU_SOLVE_MODE=1` ou `2` force le schéma.
   produit est appliqué directement au second membre.
 - **Tests :** trois cas ajoutés à `run_all_tests.sh` ; six grilles
   vérifiées avec les bornes, dont 2×3 avec 2 seconds membres.
+
+## 10. Anticipation, trace et profil mémoire : LU aligné sur le LDLᵀ
+
+**Anticipation d'une étape en LU** (`LOOKAHEAD`, activée par défaut ;
+`BLR_LU_LOOKAHEAD=0` la coupe). À l'étape K, dès que la colonne K+1 a reçu
+sa mise à jour de Schur :
+- le propriétaire du bloc (K+1,K+1) le factorise et lance des diffusions
+  non bloquantes des pivots (toute la grille) et du bloc (sa colonne de
+  grille) ;
+- cette colonne de grille traite aussitôt son panneau L(I,K+1) ;
+- l'étape K+1 commence par une simple attente.
+
+Le résultat est identique au bit près : mêmes opérations, seul l'ordre
+change. Le panneau U(K+1,J) reste traité au début de l'étape K+1, car ses
+lignes doivent d'abord recevoir tout le Schur de l'étape K puis l'échange
+de lignes du pivot.
+
+**Trace, compteurs, profil mémoire, relevé pour le simulateur en LU.** Les
+mêmes commandes qu'en LDLᵀ :
+- `BLR_TRACE_FACT=1` (ou `FACT_STEP_TRACE`) : lignes `[TRACE]` ;
+- `FACT_MEM_PROF` : lignes `[MEMFACT]` (pic de l'étape, RSS, alloué,
+  matrice, panneaux L et U reçus, espace de travail) ;
+- `BLR_DUMP_WORK=1` : relevé `blr_work_rank<id>.bin`, lu par
+  `tools/blr_sim/simulate.py`.
+
+L'affichage de la trace est une routine unique, `FACT_TRACE_REPORT`
+(`mpi_blr_matrix_mod.f90`), appelée par les deux solveurs. Les drapeaux
+`FACT_MEM_PROF`, `FACT_STEP_TRACE` et les fonctions `MEMPROF_*` y ont été
+déplacés.
+
+**Mesures** (`bem_solver`, LU, grille 2×2, passes alternées) :
+
+| Cas | Sans anticipation | Avec |
+|---|---|---|
+| Sphère impédante, 6 816 inconnues | 1,00-1,02 s | 0,93-0,96 s |
+| Cornet à port modal, 7 287 inconnues | 2,14-2,30 s | 2,21-2,23 s |
+| Cornet, 12 291 inconnues | 5,19-6,61 s | 5,30-5,92 s |
+
+- **Gain de 0 à 6 % sur le portable,** comme en LDLᵀ (0 à 7 %). Le gain est
+  attendu quand la factorisation du bloc diagonal pèse dans l'étape, donc
+  avec beaucoup de processus.
+- **Solutions identiques au bit près** avec et sans anticipation (3 cas).
+- **LDLᵀ inchangé :** même résumé de trace et même solution au bit près
+  qu'avant le déplacement de la routine.
+- **Simulateur sur un relevé LU** (cornet 12k, relevé en 2×2) : il retrouve exactement
+  la trace directe (déséquilibre 13,7 %, synchronisation 17,3 %, borne 3,0,
+  122 diffusions groupées).
+- `run_all_tests.sh intel-noomp` : tous les tests passent, deux cas
+  ajoutés.

@@ -68,7 +68,8 @@ MODULE MPI_BLR_LDLT_MOD
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE
   USE MPI_BLR_MATRIX_MOD, ONLY: BLOCK_NUMROC, BLR_COL_OWNER, BLR_COL_LOCAL, BLR_COL_GLOBAL, BLR_NBLKC_LOC, &
                                  STAGE_PROGRESS_CALLBACK_IFACE, STAGE_PROGRESS_SHOULD_FIRE, BLR_CHECK_COUNT32, &
-                                RHS_LOCAL_RANGE_MBM, RHS_NUMROC_MBM
+                                RHS_LOCAL_RANGE_MBM, RHS_NUMROC_MBM, FACT_MEM_PROF, FACT_STEP_TRACE, &
+                                MEMPROF_RESET_HWM, MEMPROF_HWM_KB, MEMPROF_ALLOC_BYTES, FACT_TRACE_REPORT
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB, BLR_TRIM_HEAP
   IMPLICIT NONE
@@ -78,22 +79,6 @@ MODULE MPI_BLR_LDLT_MOD
   TYPE :: PACKED_TRI_T
     COMPLEX(WP), ALLOCATABLE :: AP(:)
   END TYPE PACKED_TRI_T
-
-  ! Profil memoire de la factorisation (diagnostic, FACT_MEM_PROF) : a la
-  ! fin de chaque etape K, MAX sur la grille (Mo) du pic de RSS de l'etape
-  ! (VmHWM remis a zero au debut de l'etape), de la RSS, de la memoire
-  ! allouee (mallinfo), de la matrice/facteurs, des panneaux recus (WRECV,
-  ! LTRECV), de la copie des L(I,K) chez le proprietaire de la colonne K
-  ! et des espaces de travail (WS, DWORK). Affiche par le rang 0.
-  LOGICAL :: FACT_MEM_PROF = .FALSE.
-
-  ! Trace des attentes MPI de la factorisation (diagnostic, FACT_STEP_TRACE) :
-  ! par processus, temps de communication ventile (1 debut d'etape : pivots
-  ! et bloc diagonal, 2 panneaux le long des lignes comme emetteur, 3
-  ! panneaux le long des colonnes, 4 anticipation, 5 panneaux le long des
-  ! lignes comme recepteur), et par etape le Schur et les communications
-  ! de chaque processus. Affiche par le rang 0.
-  LOGICAL :: FACT_STEP_TRACE = .FALSE.
 
   TYPE :: MPI_BLR_SYM_T
     INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
@@ -1115,48 +1100,7 @@ CONTAINS
     END DO
     IF (RSS_TRACE) WRITE(6,'(A,F8.1,A)') '     [RSS trace] MAX observe pendant la factorisation = ', RSS_MAX_MB, ' Mo'
     TB(7) = MPI_WTIME() - TLOOP0
-    IF (TRACE) THEN
-      NPG = GRID%PR*GRID%PC
-      ALLOCATE(STEPG(6,NBLK,MERGE(NPG,1,GRID%MYID.EQ.0)), TWG(5,MERGE(NPG,1,GRID%MYID.EQ.0)))
-      CALL MPI_GATHER(STEPT, 6*NBLK, MPI_DOUBLE_PRECISION, STEPG, 6*NBLK, MPI_DOUBLE_PRECISION, 0, GRID%COMM, IERR)
-      CALL MPI_GATHER(TW, 5, MPI_DOUBLE_PRECISION, TWG, 5, MPI_DOUBLE_PRECISION, 0, GRID%COMM, IERR)
-      IF (GRID%MYID .EQ. 0) THEN
-        ! Resume independant des temps : travail estime du Schur (WORK_COUNT)
-        ! et diffusions de blocs par processus.
-        WSYNC = 0.0D0; WMAXT = 0.0D0; WMOY = 0.0D0
-        DO K = 1, NBLK
-          WSYNC = WSYNC + MAXVAL(STEPG(4,K,:))
-        END DO
-        DO IPG = 1, NPG
-          WMAXT = MAX(WMAXT, SUM(STEPG(4,:,IPG)))
-          WMOY = WMOY + SUM(STEPG(4,:,IPG))/DBLE(NPG)
-        END DO
-        WRITE(6,'(A,I0,A,I0,A,I0,A,I0)') ' [TRACE] grille ', GRID%PR, ' x ', GRID%PC, ', N = ', A%N, ', blocs = ', NBLK
-        WRITE(6,'(A,ES10.3,A,ES10.3,A,ES10.3)') ' [TRACE] travail du Schur par processus : moyenne ', WMOY, &
-             ', maximum ', WMAXT, ', somme des maximums par etape ', WSYNC
-        WRITE(6,'(A,F6.1,A,F6.1,A,F6.1,A)') ' [TRACE] efficacite : desequilibre global ', 100.0D0*(WMAXT/MAX(WMOY,1.0D-30) &
-             - 1.0D0), ' %, synchronisation par etape ', 100.0D0*(WSYNC/MAX(WMAXT,1.0D-30) - 1.0D0), &
-             ' %, borne d''acceleration ', DBLE(NPG)*WMOY/MAX(WSYNC,1.0D-30), ' (ideal = nombre de processus)'
-        WRITE(6,'(A,F10.0,A,F10.0,A,ES10.3,A)') ' [TRACE] diffusions de blocs par processus : moyenne ', &
-             SUM(STEPG(5,:,:))/DBLE(NPG), ' appels, maximum ', MAXVAL(SUM(STEPG(5,:,:), DIM=1)), ' ; ', &
-             SUM(STEPG(6,:,:))/DBLE(NPG), ' elements en moyenne'
-        WDIAG = WMOY/MAX(SUM(STEPG(5,:,:))/DBLE(NPG), 1.0D0)
-        WRITE(6,'(A,ES10.3)') ' [TRACE] travail du Schur par appel de diffusion (moyenne) : ', WDIAG
-        IF (NPG .LE. 8) THEN
-          WRITE(6,'(A)') ' [TRACE] communications par processus (s) : debut d''etape, lignes (emetteur), colonnes, '// &
-               'anticipation, lignes (recepteur) ; total Schur ; total communications'
-          DO IPG = 1, NPG
-            WRITE(6,'(A,I3,A,I0,A,I0,A,5F8.2,A,F8.2,A,F8.2)') ' [TRACE] proc', IPG-1, ' (', (IPG-1)/GRID%PC, ',', &
-                 MOD(IPG-1,GRID%PC), ')', TWG(:,IPG), ' ;', SUM(STEPG(1,:,IPG)), ' ;', SUM(STEPG(2,:,IPG))
-          END DO
-          WRITE(6,'(A)') ' [TRACE]   K  duree | Schur par processus | communications par processus'
-          DO K = 1, NBLK
-            WRITE(6,'(A,I4,F7.2,A,*(F7.2))') ' [TRACE] ', K, MAXVAL(STEPG(3,K,:)), ' |', STEPG(1,K,:), STEPG(2,K,:)
-          END DO
-        END IF
-      END IF
-      DEALLOCATE(STEPG, TWG)
-    END IF
+    IF (TRACE) CALL FACT_TRACE_REPORT(GRID, A%N, NBLK, STEPT, TW)
     IF (DUMPW) CLOSE(UDW)
     DEALLOCATE(STEPT)
     IF (PRESENT(T_BREAKDOWN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN, 7, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
@@ -1283,53 +1227,6 @@ CONTAINS
     END SUBROUTINE POST_NEXT_DIAG
 
   END SUBROUTINE MPI_BLR_SYM_LDLT_FACTOR
-
-  ! Profil memoire : remet a zero le pic de RSS (VmHWM) du processus.
-  SUBROUTINE MEMPROF_RESET_HWM()
-    INTEGER :: U, IOS
-    OPEN(NEWUNIT=U, FILE='/proc/self/clear_refs', STATUS='OLD', ACTION='WRITE', IOSTAT=IOS)
-    IF (IOS .NE. 0) RETURN
-    WRITE(U, '(A)', IOSTAT=IOS) '5'
-    CLOSE(U)
-  END SUBROUTINE MEMPROF_RESET_HWM
-
-  ! Profil memoire : pic de RSS (VmHWM, Ko ; -1 si illisible).
-  FUNCTION MEMPROF_HWM_KB() RESULT(HWM)
-    INTEGER(8) :: HWM
-    INTEGER :: U, IOS
-    CHARACTER(LEN=256) :: LINE
-    HWM = -1_8
-    OPEN(NEWUNIT=U, FILE='/proc/self/status', STATUS='OLD', ACTION='READ', IOSTAT=IOS)
-    IF (IOS .NE. 0) RETURN
-    DO
-      READ(U, '(A)', IOSTAT=IOS) LINE
-      IF (IOS .NE. 0) EXIT
-      IF (LINE(1:6) .EQ. 'VmHWM:') THEN
-        READ(LINE(7:), *, IOSTAT=IOS) HWM
-        EXIT
-      END IF
-    END DO
-    CLOSE(U)
-  END FUNCTION MEMPROF_HWM_KB
-
-  ! Profil memoire : octets alloues par malloc et vivants (glibc mallinfo,
-  ! champs int lus modulo 2^32 ; uordblks + hblkhd).
-  FUNCTION MEMPROF_ALLOC_BYTES() RESULT(NB)
-    USE ISO_C_BINDING, ONLY: C_INT
-    INTEGER(8) :: NB
-    TYPE, BIND(C) :: MALLINFO_T
-      INTEGER(C_INT) :: ARENA, ORDBLKS, SMBLKS, HBLKS, HBLKHD, USMBLKS, FSMBLKS, UORDBLKS, FORDBLKS, KEEPCOST
-    END TYPE MALLINFO_T
-    INTERFACE
-      FUNCTION MALLINFO() BIND(C, NAME='mallinfo')
-        IMPORT :: MALLINFO_T
-        TYPE(MALLINFO_T) :: MALLINFO
-      END FUNCTION MALLINFO
-    END INTERFACE
-    TYPE(MALLINFO_T) :: MI
-    MI = MALLINFO()
-    NB = MODULO(INT(MI%UORDBLKS,8), 4294967296_8) + MODULO(INT(MI%HBLKHD,8), 4294967296_8)
-  END FUNCTION MEMPROF_ALLOC_BYTES
 
   !=======================================================================
   ! Resolution A*X=B apres MPI_BLR_SYM_LDLT_FACTOR. B_LOCAL (MLOC lignes

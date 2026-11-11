@@ -119,6 +119,10 @@ run_test test_mpi_lu_pivot         mpirun -np 4 "$BINDIR/test_mpi_lu_pivot" 2 2 
 run_test test_mpi_lu_solve_2d      mpirun -np 4 "$BINDIR/test_mpi_lu_solve_2d" 2 2 500 50 20
 run_test test_mpi_blr_matrix       mpirun -np 4 "$BINDIR/test_mpi_blr_matrix" 2 2 1000 100 20 1e-4
 run_test test_mpi_blr_matrix_pivot mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 20 1e-4
+# Factorisation LU sans anticipation (BLR_LU_LOOKAHEAD=0 ; le defaut l'active),
+# puis avec la trace et le releve du travail (BLR_TRACE_FACT, BLR_DUMP_WORK).
+run_test lu_sans_anticipation     env BLR_LU_LOOKAHEAD=0 mpirun -np 6 "$BINDIR/test_mpi_blr_matrix_pivot" 2 3 1500 125 4 1e-4
+run_test lu_trace                 env BLR_TRACE_FACT=1 mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 4 1e-4
 # Resolution LU distribuee (DESCENT_MODE=2) forcee, puis ancien schema force ;
 # grille 2x3 avec moins de seconds membres que de colonnes de grille.
 run_test lu_resol_distribuee      env BLR_LU_SOLVE_MODE=2 mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 20 1e-4

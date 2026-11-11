@@ -52,11 +52,28 @@ MODULE MPI_BLR_MATRIX_MOD
   USE MPI_GRID_MOD
   USE BLR_COMPRESS_MOD
   USE BLR_OOC_MOD
-  USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK, BCAST_BLR_PANEL
+  USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK, BCAST_BLR_PANEL, BCAST_NCALL, BCAST_ELEMS
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE, DENSE_PANEL_T
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE, PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB, BLR_TRIM_HEAP
   IMPLICIT NONE
+
+  ! Profil memoire de la factorisation (diagnostic, FACT_MEM_PROF) : a la
+  ! fin de chaque etape K, MAX sur la grille (Mo) du pic de RSS de l'etape
+  ! (VmHWM remis a zero au debut de l'etape), de la RSS, de la memoire
+  ! allouee (mallinfo), de la matrice/facteurs, des panneaux recus (WRECV,
+  ! LTRECV ; LRECV, URECV en LU), de la copie des L(I,K) chez le proprietaire de la colonne K
+  ! et des espaces de travail (WS, DWORK). Affiche par le rang 0.
+  LOGICAL :: FACT_MEM_PROF = .FALSE.
+
+  ! Trace des attentes MPI de la factorisation (diagnostic, FACT_STEP_TRACE) :
+  ! par processus, temps de communication ventile (1 debut d'etape : pivots
+  ! et bloc diagonal, 2 panneaux le long des lignes comme emetteur, 3
+  ! panneaux le long des colonnes, 4 anticipation, 5 panneaux le long des
+  ! lignes comme recepteur), et par etape le Schur et les communications
+  ! de chaque processus. Affiche par le rang 0.
+  LOGICAL :: FACT_STEP_TRACE = .FALSE.
+
 
   ! Hook optionnel pour un suivi fin (ex: RSS/CPU) de l'avancement DANS
   ! l'assemblage/la factorisation/la resolution -- ces boucles sont
@@ -768,6 +785,110 @@ CONTAINS
     CALL MPI_ALLREDUCE(RS_LOCAL, RANK_SUM, 1, MPI_INTEGER8, MPI_SUM, GRID%COMM, IERR)
   END SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_NOPIV
 
+  ! Profil memoire : remet a zero le pic de RSS (VmHWM) du processus.
+  SUBROUTINE MEMPROF_RESET_HWM()
+    INTEGER :: U, IOS
+    OPEN(NEWUNIT=U, FILE='/proc/self/clear_refs', STATUS='OLD', ACTION='WRITE', IOSTAT=IOS)
+    IF (IOS .NE. 0) RETURN
+    WRITE(U, '(A)', IOSTAT=IOS) '5'
+    CLOSE(U)
+  END SUBROUTINE MEMPROF_RESET_HWM
+
+  ! Profil memoire : pic de RSS (VmHWM, Ko ; -1 si illisible).
+  FUNCTION MEMPROF_HWM_KB() RESULT(HWM)
+    INTEGER(8) :: HWM
+    INTEGER :: U, IOS
+    CHARACTER(LEN=256) :: LINE
+    HWM = -1_8
+    OPEN(NEWUNIT=U, FILE='/proc/self/status', STATUS='OLD', ACTION='READ', IOSTAT=IOS)
+    IF (IOS .NE. 0) RETURN
+    DO
+      READ(U, '(A)', IOSTAT=IOS) LINE
+      IF (IOS .NE. 0) EXIT
+      IF (LINE(1:6) .EQ. 'VmHWM:') THEN
+        READ(LINE(7:), *, IOSTAT=IOS) HWM
+        EXIT
+      END IF
+    END DO
+    CLOSE(U)
+  END FUNCTION MEMPROF_HWM_KB
+
+  ! Profil memoire : octets alloues par malloc et vivants (glibc mallinfo,
+  ! champs int lus modulo 2^32 ; uordblks + hblkhd).
+  FUNCTION MEMPROF_ALLOC_BYTES() RESULT(NB)
+    USE ISO_C_BINDING, ONLY: C_INT
+    INTEGER(8) :: NB
+    TYPE, BIND(C) :: MALLINFO_T
+      INTEGER(C_INT) :: ARENA, ORDBLKS, SMBLKS, HBLKS, HBLKHD, USMBLKS, FSMBLKS, UORDBLKS, FORDBLKS, KEEPCOST
+    END TYPE MALLINFO_T
+    INTERFACE
+      FUNCTION MALLINFO() BIND(C, NAME='mallinfo')
+        IMPORT :: MALLINFO_T
+        TYPE(MALLINFO_T) :: MALLINFO
+      END FUNCTION MALLINFO
+    END INTERFACE
+    TYPE(MALLINFO_T) :: MI
+    MI = MALLINFO()
+    NB = MODULO(INT(MI%UORDBLKS,8), 4294967296_8) + MODULO(INT(MI%HBLKHD,8), 4294967296_8)
+  END FUNCTION MEMPROF_ALLOC_BYTES
+
+  !-----------------------------------------------------------------------
+  ! Trace d'une factorisation (FACT_STEP_TRACE ou BLR_TRACE_FACT=1), commune
+  ! au LU et au LDLt. STEPT(1:6,K) par processus et par etape : temps de
+  ! Schur, temps de communication, duree, travail estime du Schur, appels
+  ! et elements des diffusions de blocs. TW(1:5) : communications par
+  ! categorie. Rassemble sur le rang 0, qui affiche les lignes [TRACE].
+  !-----------------------------------------------------------------------
+  SUBROUTINE FACT_TRACE_REPORT(GRID, N, NBLK, STEPT, TW)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)     :: GRID
+    INTEGER, INTENT(IN)          :: N, NBLK
+    DOUBLE PRECISION, INTENT(IN) :: STEPT(6,NBLK), TW(5)
+    DOUBLE PRECISION, ALLOCATABLE :: STEPG(:,:,:), TWG(:,:)
+    DOUBLE PRECISION :: WSYNC, WMAXT, WMOY, WDIAG
+    INTEGER :: NPG, IPG, K, IERR
+      NPG = GRID%PR*GRID%PC
+      ALLOCATE(STEPG(6,NBLK,MERGE(NPG,1,GRID%MYID.EQ.0)), TWG(5,MERGE(NPG,1,GRID%MYID.EQ.0)))
+      CALL MPI_GATHER(STEPT, 6*NBLK, MPI_DOUBLE_PRECISION, STEPG, 6*NBLK, MPI_DOUBLE_PRECISION, 0, GRID%COMM, IERR)
+      CALL MPI_GATHER(TW, 5, MPI_DOUBLE_PRECISION, TWG, 5, MPI_DOUBLE_PRECISION, 0, GRID%COMM, IERR)
+      IF (GRID%MYID .EQ. 0) THEN
+        ! Resume independant des temps : travail estime du Schur (WORK_COUNT)
+        ! et diffusions de blocs par processus.
+        WSYNC = 0.0D0; WMAXT = 0.0D0; WMOY = 0.0D0
+        DO K = 1, NBLK
+          WSYNC = WSYNC + MAXVAL(STEPG(4,K,:))
+        END DO
+        DO IPG = 1, NPG
+          WMAXT = MAX(WMAXT, SUM(STEPG(4,:,IPG)))
+          WMOY = WMOY + SUM(STEPG(4,:,IPG))/DBLE(NPG)
+        END DO
+        WRITE(6,'(A,I0,A,I0,A,I0,A,I0)') ' [TRACE] grille ', GRID%PR, ' x ', GRID%PC, ', N = ', N, ', blocs = ', NBLK
+        WRITE(6,'(A,ES10.3,A,ES10.3,A,ES10.3)') ' [TRACE] travail du Schur par processus : moyenne ', WMOY, &
+             ', maximum ', WMAXT, ', somme des maximums par etape ', WSYNC
+        WRITE(6,'(A,F6.1,A,F6.1,A,F6.1,A)') ' [TRACE] efficacite : desequilibre global ', 100.0D0*(WMAXT/MAX(WMOY,1.0D-30) &
+             - 1.0D0), ' %, synchronisation par etape ', 100.0D0*(WSYNC/MAX(WMAXT,1.0D-30) - 1.0D0), &
+             ' %, borne d''acceleration ', DBLE(NPG)*WMOY/MAX(WSYNC,1.0D-30), ' (ideal = nombre de processus)'
+        WRITE(6,'(A,F10.0,A,F10.0,A,ES10.3,A)') ' [TRACE] diffusions de blocs par processus : moyenne ', &
+             SUM(STEPG(5,:,:))/DBLE(NPG), ' appels, maximum ', MAXVAL(SUM(STEPG(5,:,:), DIM=1)), ' ; ', &
+             SUM(STEPG(6,:,:))/DBLE(NPG), ' elements en moyenne'
+        WDIAG = WMOY/MAX(SUM(STEPG(5,:,:))/DBLE(NPG), 1.0D0)
+        WRITE(6,'(A,ES10.3)') ' [TRACE] travail du Schur par appel de diffusion (moyenne) : ', WDIAG
+        IF (NPG .LE. 8) THEN
+          WRITE(6,'(A)') ' [TRACE] communications par processus (s) : debut d''etape, lignes (emetteur), colonnes, '// &
+               'anticipation, lignes (recepteur) ; total Schur ; total communications'
+          DO IPG = 1, NPG
+            WRITE(6,'(A,I3,A,I0,A,I0,A,5F8.2,A,F8.2,A,F8.2)') ' [TRACE] proc', IPG-1, ' (', (IPG-1)/GRID%PC, ',', &
+                 MOD(IPG-1,GRID%PC), ')', TWG(:,IPG), ' ;', SUM(STEPG(1,:,IPG)), ' ;', SUM(STEPG(2,:,IPG))
+          END DO
+          WRITE(6,'(A)') ' [TRACE]   K  duree | Schur par processus | communications par processus'
+          DO K = 1, NBLK
+            WRITE(6,'(A,I4,F7.2,A,*(F7.2))') ' [TRACE] ', K, MAXVAL(STEPG(3,K,:)), ' |', STEPG(1,K,:), STEPG(2,K,:)
+          END DO
+        END IF
+      END IF
+      DEALLOCATE(STEPG, TWG)
+  END SUBROUTINE FACT_TRACE_REPORT
+
   !-----------------------------------------------------------------------
   ! Factorisation LU en place, avec pivot partiel confine au bloc diagonal
   ! (meme philosophie que block_lu_mod.f90 et mpi_lu_pivot_mod.f90 -- pivot
@@ -806,7 +927,7 @@ CONTAINS
   SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT(GRID, A_BLR, TOL, INFO, &
                                              N_COMPRESSED, N_OFFDIAG, RANK_SUM, N_SWAPS, T_FACTOR, &
                                              SHOW_PROGRESS, SHOW_RSS_TRACE, USE_MOVE_ALLOC, PROGRESS_CALLBACK, &
-                                             T_BREAKDOWN)
+                                             T_BREAKDOWN, LOOKAHEAD)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)          :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(INOUT) :: A_BLR
@@ -839,6 +960,15 @@ CONTAINS
     ! (7) boucle complete. Chaque categorie est un MAX independant : leur
     ! somme peut differer de (7).
     DOUBLE PRECISION, INTENT(OUT), OPTIONAL :: T_BREAKDOWN(7)
+    ! LOOKAHEAD (defaut .TRUE. ; BLR_LU_LOOKAHEAD=0 le coupe) : anticipation
+    ! de profondeur 1, comme le LDLt. A l'etape K, des que la colonne K+1 a
+    ! recu sa mise a jour de Schur, le proprietaire du bloc (K+1,K+1) le
+    ! factorise et lance des diffusions NON BLOQUANTES (MPI_IBCAST) de
+    ! INFO/IPIV a toute la grille et du bloc a sa colonne de grille, qui
+    ! traite aussitot son panneau L(I,K+1). Le reste du Schur de l'etape K
+    ! recouvre ces diffusions ; l'etape K+1 commence par un MPI_WAITALL.
+    ! Resultat numerique identique (memes operations, seul l'ordre change).
+    LOGICAL, INTENT(IN), OPTIONAL     :: LOOKAHEAD
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
@@ -852,6 +982,19 @@ CONTAINS
     INTEGER(8) :: RS_LOCAL
     DOUBLE PRECISION :: T0, T_FACTOR_L, RSS_MAX_MB, TB(7), TT0, TLOOP0
     LOGICAL :: PROGRESS, RSS_TRACE
+    ! tampons des diffusions anticipees (en vol entre deux etapes)
+    INTEGER, ALLOCATABLE, ASYNCHRONOUS :: IBUF_N(:)
+    COMPLEX(WP), ALLOCATABLE, ASYNCHRONOUS :: DKN_N(:)
+    INTEGER :: REQ(2), NREQ
+    LOGICAL :: LA, PENDING, LADONE
+    ! trace, compteurs, profil memoire, releve du travail (voir le LDLt)
+    DOUBLE PRECISION :: TW(5), TDW, TB0(7), TSTEP0, W0, WUPD
+    DOUBLE PRECISION, ALLOCATABLE :: STEPT(:,:)
+    INTEGER(8) :: NC0, NE0
+    CHARACTER(LEN=8) :: ENVT
+    LOGICAL :: TRACE, DUMPW
+    INTEGER :: UDW
+    CHARACTER(LEN=64) :: FDW
 
     ! Boucle K=1..NBLK GLOBALEMENT synchronisee (MPI_BCAST a chaque etape,
     ! voir plus bas) -- contrairement a l'assemblage, K/NBLK est ici un
@@ -875,10 +1018,37 @@ CONTAINS
     ALLOCATE(A_BLR%IPIV(A_BLR%NB, NBLK))
     A_BLR%IPIV = 0
     CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB, FACT_WORKSPACE_RANK(A_BLR%NB))
+    LA = .TRUE.
+    IF (PRESENT(LOOKAHEAD)) LA = LOOKAHEAD
+    CALL GET_ENVIRONMENT_VARIABLE('BLR_LU_LOOKAHEAD', ENVT)
+    IF (TRIM(ENVT) .EQ. '0') LA = .FALSE.
+    PENDING = .FALSE.
+    NREQ = 0
+    IF (LA) ALLOCATE(IBUF_N(0:A_BLR%NB), DKN_N(A_BLR%NB*A_BLR%NB))
     TB = 0.0D0
+    TW = 0.0D0
+    CALL GET_ENVIRONMENT_VARIABLE('BLR_TRACE_FACT', ENVT)
+    TRACE = FACT_STEP_TRACE .OR. (TRIM(ENVT) .EQ. '1')
+    IF (TRACE) WORK_COUNT = .TRUE.
+    ! BLR_DUMP_WORK=1 : releve du travail de chaque mise a jour de Schur
+    ! (K, I, J, travail), entree de tools/blr_sim/simulate.py.
+    CALL GET_ENVIRONMENT_VARIABLE('BLR_DUMP_WORK', ENVT)
+    DUMPW = (TRIM(ENVT) .EQ. '1')
+    IF (DUMPW) THEN
+      WORK_COUNT = .TRUE.
+      WRITE(FDW,'(A,I0,A)') 'blr_work_rank', GRID%MYID, '.bin'
+      OPEN(NEWUNIT=UDW, FILE=TRIM(FDW), ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+    END IF
+    ALLOCATE(STEPT(6,NBLK))
+    STEPT = 0.0D0
+    IF (FACT_MEM_PROF .AND. GRID%MYID .EQ. 0) WRITE(6,'(A)') ' [MEMFACT]  K   pic_etape   RSS  alloue  matrice  '// &
+         'L_recus  U_recus  WS  (Mo, max par processus)'
     TLOOP0 = MPI_WTIME()
 
     DO K = 1, NBLK
+      IF (FACT_MEM_PROF) CALL MEMPROF_RESET_HWM()
+      TB0 = TB; TSTEP0 = MPI_WTIME(); W0 = SCHUR_WORK; NC0 = BCAST_NCALL; NE0 = BCAST_ELEMS
+      LADONE = LA .AND. K .GT. 1
       KW = A_BLR%BEND(K) - A_BLR%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
       PCOL_K = BLR_COL_OWNER(A_BLR%CMAP, K, GRID)
@@ -886,25 +1056,36 @@ CONTAINS
       ALLOCATE(IPIV_K(KW))
       IPIV_K = 0
 
-      ! 1) facteur diagonal AVEC PIVOT (CGETRF), local au proprietaire
-      IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) THEN
+      ! 1) facteur diagonal AVEC PIVOT (CGETRF), local au proprietaire -- ou,
+      !    en anticipation, deja fait a l'etape K-1 : on attend alors
+      !    seulement la fin des diffusions non bloquantes.
+      IF (PENDING) THEN
         TT0 = MPI_WTIME()
-        CALL CGETRF(KW, KW, A_BLR%DIAGBLK(K)%D, KW, IPIV_K, IINFO)
-        IF (IINFO .NE. 0) INFO_STEP = A_BLR%BSTART(K) - 1 + IINFO
-        TB(1) = TB(1) + (MPI_WTIME() - TT0)
+        CALL MPI_WAITALL(NREQ, REQ, MPI_STATUSES_IGNORE, IERR)
+        TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(1) = TW(1) + TDW
+        PENDING = .FALSE.
+        INFO_STEP = IBUF_N(0)
+        IPIV_K = IBUF_N(1:KW)
+      ELSE
+        IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) THEN
+          TT0 = MPI_WTIME()
+          CALL CGETRF(KW, KW, A_BLR%DIAGBLK(K)%D, KW, IPIV_K, IINFO)
+          IF (IINFO .NE. 0) INFO_STEP = A_BLR%BSTART(K) - 1 + IINFO
+          TB(1) = TB(1) + (MPI_WTIME() - TT0)
+        END IF
+        TT0 = MPI_WTIME()
+        CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+        ! Diffusion GLOBALE (voir commentaire de tete) -- petite (KW entiers)
+        IF (INFO_STEP .EQ. 0) CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
+        TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(1) = TW(1) + TDW
       END IF
-      TT0 = MPI_WTIME()
-      CALL MPI_BCAST(INFO_STEP, 1, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
       IF (INFO_STEP .NE. 0) THEN
         INFO = INFO_STEP
-        DEALLOCATE(LRECV, URECV, IPIV_K)
+        DEALLOCATE(LRECV, URECV, IPIV_K, STEPT)
+        IF (DUMPW) CLOSE(UDW)
         CALL BLR_WORKSPACE_FREE(WS)
         RETURN
       END IF
-
-      ! Diffusion GLOBALE (voir commentaire de tete) -- petite (KW entiers)
-      CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, PROW_K*GRID%PC+PCOL_K, GRID%COMM, IERR)
-      TB(4) = TB(4) + (MPI_WTIME() - TT0)
       A_BLR%IPIV(1:KW,K) = IPIV_K
 
       ! 2) propage le pivot aux AUTRES blocs de la MEME ligne-bloc K, deja
@@ -933,8 +1114,9 @@ CONTAINS
       IF (GRID%MYROW.EQ.PROW_K .AND. GRID%MYCOL.EQ.PCOL_K) DKK = A_BLR%DIAGBLK(K)%D
       TT0 = MPI_WTIME()
       IF (GRID%MYROW .EQ. PROW_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERR)
-      IF (GRID%MYCOL .EQ. PCOL_K) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
-      TB(4) = TB(4) + (MPI_WTIME() - TT0)
+      ! (colonne PCOL_K : deja recu et utilise a l'etape K-1 en anticipation)
+      IF (GRID%MYCOL .EQ. PCOL_K .AND. .NOT. LADONE) CALL MPI_BCAST(DKK, KW*KW, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERR)
+      TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(1) = TW(1) + TDW
       TT0 = MPI_WTIME()
 
       ! 4) U12 : la ligne PROW_K applique le TRSM sur SES blocs locaux
@@ -957,7 +1139,8 @@ CONTAINS
 
       ! 5) L21 : la colonne PCOL_K applique le TRSM sur SES blocs locaux
       !    (colonne K, jamais concernee par le pivot de l'etape 2).
-      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+      !    Deja fait a l'etape K-1 en anticipation (POST_NEXT_DIAG).
+      IF (GRID%MYCOL .EQ. PCOL_K .AND. .NOT. LADONE) THEN
         lj = BLR_COL_LOCAL(A_BLR%CMAP, K, GRID)
         DO li = 1, A_BLR%NBLKR_LOC
           I = (li-1)*GRID%PR + GRID%MYROW + 1
@@ -989,6 +1172,13 @@ CONTAINS
         IF (GRID%MYCOL .EQ. PCOL_K) LRECV(li) = A_BLR%OFFBLK(li,BLR_COL_LOCAL(A_BLR%CMAP, K, GRID))
       END DO
       CALL BCAST_BLR_PANEL(GRID%ROW_COMM, NPB, PIX, PRT, PMS, PNS, LRECV)
+      TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW
+      IF (GRID%MYCOL .EQ. PCOL_K) THEN
+        TW(2) = TW(2) + TDW
+      ELSE
+        TW(5) = TW(5) + TDW
+      END IF
+      TT0 = MPI_WTIME()
 
       NPB = 0
       DO lj = 1, A_BLR%NBLKC_LOC
@@ -1000,9 +1190,15 @@ CONTAINS
         IF (GRID%MYROW .EQ. PROW_K) URECV(lj) = A_BLR%OFFBLK((K-1)/GRID%PR+1,lj)
       END DO
       CALL BCAST_BLR_PANEL(GRID%COL_COMM, NPB, PIX, PRT, PMS, PNS, URECV)
-      TB(4) = TB(4) + (MPI_WTIME() - TT0)
+      TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(3) = TW(3) + TDW
 
-      ! 7) mise a jour de Schur locale -- inchange.
+      ! 7) mise a jour de Schur locale. En anticipation, des que la colonne
+      !    K+1 est a jour, le bloc (K+1,K+1) est factorise et diffuse sans
+      !    bloquer ; les autres colonnes de grille postent leur reception
+      !    avant leur Schur.
+      IF (LA .AND. K .LT. NBLK) THEN
+        IF (GRID%MYCOL .NE. BLR_COL_OWNER(A_BLR%CMAP, K+1, GRID)) CALL POST_NEXT_DIAG(K+1)
+      END IF
       DO lj = 1, A_BLR%NBLKC_LOC
         J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
         IF (J .LE. K) CYCLE
@@ -1014,14 +1210,31 @@ CONTAINS
           TT0 = MPI_WTIME()
           IF (I .EQ. J) THEN
             CALL SCHUR_UPDATE_BLOCK(MI, NJ, KW, LRECV(li), URECV(lj), A_BLR%DIAGBLK(I)%D, MI)
+            ! travail estime du bloc diagonal : MI x NJ x rang du panneau (dense : KW)
+            IF (WORK_COUNT) THEN
+              WUPD = DBLE(MI)*DBLE(NJ)*DBLE(MERGE(LRECV(li)%RANK, KW, LRECV(li)%IS_LOWRANK))
+              SCHUR_WORK = SCHUR_WORK + WUPD
+              IF (DUMPW) WRITE(UDW) K, I, J, WUPD
+            END IF
             TB(5) = TB(5) + (MPI_WTIME() - TT0)
           ELSE
+            WUPD = SCHUR_WORK
             CALL SCHUR_UPDATE_BLR_BLOCK(A_BLR%OFFBLK(li,lj), MI, NJ, KW, LRECV(li), URECV(lj), TOL, WS, &
                                          USE_MOVE_ALLOC=USE_MOVE_ALLOC)
+            IF (DUMPW) WRITE(UDW) K, I, J, SCHUR_WORK - WUPD
             TB(6) = TB(6) + (MPI_WTIME() - TT0)
           END IF
         END DO
+        IF (LA .AND. J .EQ. K+1) CALL POST_NEXT_DIAG(K+1)
       END DO
+
+      STEPT(1,K) = (TB(5) + TB(6)) - (TB0(5) + TB0(6))
+      STEPT(2,K) = TB(4) - TB0(4)
+      STEPT(3,K) = MPI_WTIME() - TSTEP0
+      STEPT(4,K) = SCHUR_WORK - W0
+      STEPT(5,K) = DBLE(BCAST_NCALL - NC0)
+      STEPT(6,K) = DBLE(BCAST_ELEMS - NE0)
+      IF (FACT_MEM_PROF) CALL MEMPROF_STEP()
 
       ! Panneaux recus des blocs-lignes / blocs-colonnes deja traites (I, J
       ! <= K+1) : plus jamais lus, liberes a chaque etape (voir le LDLt).
@@ -1047,7 +1260,10 @@ CONTAINS
     TB(7) = MPI_WTIME() - TLOOP0
     IF (PRESENT(T_BREAKDOWN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN, 7, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
 
-    DEALLOCATE(LRECV, URECV)
+    IF (TRACE) CALL FACT_TRACE_REPORT(GRID, A_BLR%N, NBLK, STEPT, TW)
+    IF (DUMPW) CLOSE(UDW)
+    DEALLOCATE(LRECV, URECV, STEPT)
+    IF (ALLOCATED(IBUF_N)) DEALLOCATE(IBUF_N, DKN_N)
     CALL BLR_WORKSPACE_FREE(WS)
     ! T_FACTOR est un vrai MAX sur GRID%COMM, jamais la valeur locale du
     ! rang appelant -- coherent avec T_DIAG/T_TRSM/etc. de MPI_BLR_MATRIX_
@@ -1069,6 +1285,85 @@ CONTAINS
     ! a partir de SA PROPRE copie de IPIV_K, diffusee identique a tous via
     ! GRID%COMM ci-dessus) -- aucune reduction necessaire, juste le lire.
     IF (PRESENT(N_SWAPS)) N_SWAPS = NS_LOCAL
+
+  CONTAINS
+
+    ! Profil memoire de l'etape K (FACT_MEM_PROF), voir l'en-tete du module.
+    SUBROUTINE MEMPROF_STEP()
+      INTEGER(8) :: V(8), VM(8), BL, BU
+      INTEGER :: LIP, LJP, IERRP
+      BL = 0_8; BU = 0_8
+      DO LIP = 1, A_BLR%NBLKR_LOC
+        IF ((LIP-1)*GRID%PR + GRID%MYROW + 1 .GT. K) BL = BL + BLR_BLOCK_BYTES(LRECV(LIP))
+      END DO
+      DO LJP = 1, A_BLR%NBLKC_LOC
+        IF (BLR_COL_GLOBAL(A_BLR%CMAP, LJP, GRID) .GT. K) BU = BU + BLR_BLOCK_BYTES(URECV(LJP))
+      END DO
+      V(1) = INT(K,8)
+      V(2) = MEMPROF_HWM_KB()*1024_8
+      V(3) = GET_RSS_KB()*1024_8
+      V(4) = MEMPROF_ALLOC_BYTES()
+      V(5) = MPI_BLR_MATRIX_MEMORY_BYTES(A_BLR)
+      V(6) = BL; V(7) = BU
+      V(8) = BLR_WORKSPACE_BYTES(WS)
+      CALL MPI_REDUCE(V, VM, 8, MPI_INTEGER8, MPI_MAX, 0, GRID%COMM, IERRP)
+      IF (GRID%MYID .EQ. 0) WRITE(6,'(A,I4,7F9.1)') ' [MEMFACT] ', INT(VM(1)), REAL(VM(2:8),8)/1.0D6
+    END SUBROUTINE MEMPROF_STEP
+
+    ! Anticipation : factorise (proprietaire) le bloc KN deja a jour et
+    ! lance les diffusions non bloquantes de (INFO, IPIV) sur la grille et
+    ! du bloc factorise sur la colonne de grille PCOL_KN. Cette colonne
+    ! attend ensuite le bloc et traite tout de suite son panneau L(I,KN)
+    ! (TRSM), qui sort ainsi du chemin critique. Appelee une fois par etape
+    ! par CHAQUE processus, dans le meme ordre relatif aux autres
+    ! collectives de chaque communicateur.
+    SUBROUTINE POST_NEXT_DIAG(KN)
+      INTEGER, INTENT(IN) :: KN
+      INTEGER :: KWN, PRN, PCN, IERRN, LIN, IN, LJN, IINFON
+      COMPLEX(WP), ALLOCATABLE :: DKN(:,:)
+      DOUBLE PRECISION :: TF0
+      KWN = A_BLR%BEND(KN) - A_BLR%BSTART(KN) + 1
+      PRN = MOD(KN-1, GRID%PR)
+      PCN = BLR_COL_OWNER(A_BLR%CMAP, KN, GRID)
+      IF (GRID%MYROW.EQ.PRN .AND. GRID%MYCOL.EQ.PCN) THEN
+        TF0 = MPI_WTIME()
+        IBUF_N(0) = 0
+        CALL CGETRF(KWN, KWN, A_BLR%DIAGBLK(KN)%D, KWN, IBUF_N(1:KWN), IINFON)
+        IF (IINFON .NE. 0) IBUF_N(0) = A_BLR%BSTART(KN) - 1 + IINFON
+        DKN_N(1:KWN*KWN) = RESHAPE(A_BLR%DIAGBLK(KN)%D, [KWN*KWN])
+        TB(1) = TB(1) + (MPI_WTIME() - TF0)
+      END IF
+      CALL MPI_IBCAST(IBUF_N, KWN+1, MPI_INTEGER, PRN*GRID%PC + PCN, GRID%COMM, REQ(1), IERRN)
+      NREQ = 1
+      IF (GRID%MYCOL .EQ. PCN) THEN
+        CALL MPI_IBCAST(DKN_N, KWN*KWN, MPI_COMPLEX, PRN, GRID%COL_COMM, REQ(2), IERRN)
+        NREQ = 2
+        TF0 = MPI_WTIME()
+        CALL MPI_WAITALL(NREQ, REQ, MPI_STATUSES_IGNORE, IERRN)
+        TDW = MPI_WTIME() - TF0; TB(4) = TB(4) + TDW; TW(4) = TW(4) + TDW
+        IF (IBUF_N(0) .EQ. 0) THEN
+          TF0 = MPI_WTIME()
+          ALLOCATE(DKN(KWN,KWN))
+          DKN = RESHAPE(DKN_N(1:KWN*KWN), [KWN,KWN])
+          LJN = BLR_COL_LOCAL(A_BLR%CMAP, KN, GRID)
+          DO LIN = 1, A_BLR%NBLKR_LOC
+            IN = (LIN-1)*GRID%PR + GRID%MYROW + 1
+            IF (IN .LE. KN) CYCLE
+            CALL BLR_TRSM_RIGHT_UPPER_NONUNIT(A_BLR%OFFBLK(LIN,LJN), DKN, KWN)
+            NO_LOCAL = NO_LOCAL + 1
+            IF (A_BLR%OFFBLK(LIN,LJN)%IS_LOWRANK) THEN
+              NC_LOCAL = NC_LOCAL + 1
+              RS_LOCAL = RS_LOCAL + A_BLR%OFFBLK(LIN,LJN)%RANK
+            ELSE
+              RS_LOCAL = RS_LOCAL + MIN(A_BLR%OFFBLK(LIN,LJN)%M, A_BLR%OFFBLK(LIN,LJN)%N)
+            END IF
+          END DO
+          DEALLOCATE(DKN)
+          TB(3) = TB(3) + (MPI_WTIME() - TF0)
+        END IF
+      END IF
+      PENDING = .TRUE.
+    END SUBROUTINE POST_NEXT_DIAG
   END SUBROUTINE MPI_BLR_MATRIX_LU_FACTOR_PIVOT
 
   !-----------------------------------------------------------------------
