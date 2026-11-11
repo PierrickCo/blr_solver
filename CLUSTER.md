@@ -372,3 +372,46 @@ processus, `BLR_TRACE_FACT=1`) :
 
 **Suite possible :** rendre ces deux appels non bloquants, pour que le
 panneau de l'étape suivante parte pendant les mises à jour de Schur.
+
+## 9. Résolution LU distribuée (`DESCENT_MODE`, `BLR_LU_SOLVE_MODE`)
+
+**Avant.** En LU, à chaque étape de la descente et de la remontée, une
+seule colonne de la grille calculait : elle rassemblait le bloc de solution
+en pleine largeur, appliquait L ou U pour tous les seconds membres, puis
+redistribuait. Le LDLᵀ avait déjà un schéma distribué.
+
+**Maintenant.** `MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D` a les deux mêmes schémas
+que le LDLᵀ, par l'argument optionnel `DESCENT_MODE` :
+- `1` : l'ancien schéma ;
+- `2` : chaque processus reçoit sa tranche du bloc de solution le long de
+  sa colonne de grille, et la colonne K de L (ou de U) le long de sa ligne
+  de grille, compressée et en un envoi groupé (`BCAST_BLR_PANEL`). Il
+  l'applique à ses propres seconds membres ;
+- `0` (défaut) : schéma 2 si NRHS > 1,5 × la largeur effective des facteurs
+  (`LU_EFFECTIVE_WIDTH`), même règle que le LDLᵀ.
+
+Sans l'argument, `BLR_LU_SOLVE_MODE=1` ou `2` force le schéma.
+
+**Mesures** (grille 2×2, schémas alternés) :
+
+| Cas | Seconds membres | Schéma 1 | Schéma 2 | Gain |
+|---|---|---|---|---|
+| Matrice de test, N = 12 000 | 1 | 0,015 s | 0,013 s | égal |
+| | 8 | 0,020-0,023 s | 0,018-0,021 s | égal |
+| | 32 | 0,046 s | 0,028 s | ×1,6 |
+| | 128 | 0,215 s | 0,066-0,071 s | ×3,1 |
+| | 1 024 | 1,93-2,03 s | 0,67 s | ×2,9 |
+| Sphère impédante BEM, N = 6 816 | 364, par paquets de 182 | 0,20-0,23 s | 0,14-0,16 s | ×1,5 |
+| Cornet BEM, N = 12 291 | 364, par paquets de 182 | 0,74-0,78 s | 0,66-0,70 s | ×1,1 |
+
+- **Le gain dépend de la compression.** La matrice de test se compresse
+  très bien ; sur les matrices BEM, la largeur effective est plus grande et
+  le gain plus faible.
+- **Choix automatique :** schéma 2 dès 8 seconds membres sur la matrice de
+  test et sur la sphère ; schéma 1 gardé sur le cornet, où le schéma 2
+  n'aurait gagné que 13 %.
+- **Résultat :** identique à l'arrondi près (écart relatif maximal 5,7e-7
+  en simple précision sur le cornet). Pas identique au bit près : le
+  produit est appliqué directement au second membre.
+- **Tests :** trois cas ajoutés à `run_all_tests.sh` ; six grilles
+  vérifiées avec les bornes, dont 2×3 avec 2 seconds membres.

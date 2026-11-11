@@ -119,6 +119,11 @@ run_test test_mpi_lu_pivot         mpirun -np 4 "$BINDIR/test_mpi_lu_pivot" 2 2 
 run_test test_mpi_lu_solve_2d      mpirun -np 4 "$BINDIR/test_mpi_lu_solve_2d" 2 2 500 50 20
 run_test test_mpi_blr_matrix       mpirun -np 4 "$BINDIR/test_mpi_blr_matrix" 2 2 1000 100 20 1e-4
 run_test test_mpi_blr_matrix_pivot mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 20 1e-4
+# Resolution LU distribuee (DESCENT_MODE=2) forcee, puis ancien schema force ;
+# grille 2x3 avec moins de seconds membres que de colonnes de grille.
+run_test lu_resol_distribuee      env BLR_LU_SOLVE_MODE=2 mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 20 1e-4
+run_test lu_resol_colonne         env BLR_LU_SOLVE_MODE=1 mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot" 2 2 1000 100 20 1e-4
+run_test lu_resol_distribuee_2x3  env BLR_LU_SOLVE_MODE=2 mpirun -np 6 "$BINDIR/test_mpi_blr_matrix_pivot" 2 3 1500 125 2 1e-4
 run_test test_mpi_blr_matrix_pivot_arena mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot_arena" 2 2 1000 100 20 1e-4
 run_test test_mpi_blr_matrix_pivot_ooc mpirun -np 4 "$BINDIR/test_mpi_blr_matrix_pivot_ooc" 2 2 1000 100 20 1e-4 8 7 "$BINDIR/blr_ooc_scratch_ci"
 # Compression a l'assemblage par SVD randomisee adaptative (USE_RSVD=1, dernier

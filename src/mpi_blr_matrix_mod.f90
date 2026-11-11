@@ -1285,6 +1285,37 @@ CONTAINS
   END SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_2D
 
   !-----------------------------------------------------------------------
+  ! Largeur effective des facteurs LU : stockage des blocs hors diagonale
+  ! (rang x (M+N) en basse-rang, M x N en dense) rapporte au nombre de
+  ! lignes de ces blocs. C'est le volume diffuse par ligne de matrice et
+  ! par etape en resolution distribuee (DESCENT_MODE = 2), a comparer a
+  ! NRHS, volume du mode 1. Valeur identique sur tous les processus.
+  !-----------------------------------------------------------------------
+  REAL(WP) FUNCTION LU_EFFECTIVE_WIDTH(GRID, A_BLR)
+    INCLUDE 'mpif.h'
+    TYPE(GRID_T), INTENT(IN)           :: GRID
+    TYPE(MPI_BLR_MATRIX_T), INTENT(IN) :: A_BLR
+    INTEGER :: li, lj, I, J, IERR
+    DOUBLE PRECISION :: LOC(2), GLOB(2)
+    LOC = 0.0D0
+    DO li = 1, A_BLR%NBLKR_LOC
+      I = (li-1)*GRID%PR + GRID%MYROW + 1
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
+        IF (I .EQ. J) CYCLE
+        IF (A_BLR%OFFBLK(li,lj)%IS_LOWRANK) THEN
+          LOC(1) = LOC(1) + DBLE(A_BLR%OFFBLK(li,lj)%RANK)*DBLE(A_BLR%OFFBLK(li,lj)%M + A_BLR%OFFBLK(li,lj)%N)
+        ELSE
+          LOC(1) = LOC(1) + DBLE(A_BLR%OFFBLK(li,lj)%M)*DBLE(A_BLR%OFFBLK(li,lj)%N)
+        END IF
+        LOC(2) = LOC(2) + DBLE(A_BLR%OFFBLK(li,lj)%M)
+      END DO
+    END DO
+    CALL MPI_ALLREDUCE(LOC, GLOB, 2, MPI_DOUBLE_PRECISION, MPI_SUM, GRID%COMM, IERR)
+    LU_EFFECTIVE_WIDTH = REAL(GLOB(1)/MAX(GLOB(2),1.0D0), WP)
+  END FUNCTION LU_EFFECTIVE_WIDTH
+
+  !-----------------------------------------------------------------------
   ! Identique a MPI_BLR_MATRIX_LU_SOLVE_2D, pour une matrice factorisee par
   ! MPI_BLR_MATRIX_LU_FACTOR_PIVOT -- SEULE difference : "P*B" n'est plus
   ! l'identite (etape 0 du commentaire de la version sans pivot). Applique,
@@ -1295,7 +1326,7 @@ CONTAINS
   ! pivot (U*X=Y ne depend pas de P -- convention standard P*A=L*U).
   !-----------------------------------------------------------------------
   SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D(GRID, A_BLR, NRHS, NRHS_LOC, B_LOCAL, LDB, SHOW_PROGRESS, &
-                                               PROGRESS_CALLBACK)
+                                               PROGRESS_CALLBACK, DESCENT_MODE)
     INCLUDE 'mpif.h'
     TYPE(GRID_T), INTENT(IN)           :: GRID
     TYPE(MPI_BLR_MATRIX_T), INTENT(IN) :: A_BLR
@@ -1307,12 +1338,32 @@ CONTAINS
     ! meme remarque que pour MPI_BLR_MATRIX_LU_FACTOR_PIVOT. Absent par
     ! defaut, aucun surcout si non fourni.
     PROCEDURE(STAGE_PROGRESS_CALLBACK_IFACE), OPTIONAL :: PROGRESS_CALLBACK
+    ! DESCENT_MODE (optionnel, defaut 0 = automatique) : schema de la
+    ! descente L et de la remontee U (meme principe que le LDLt).
+    !   1 = "colonne" : X_K rassemble en pleine largeur sur la colonne de
+    !       grille PCOL_K, qui calcule seule L(I,K)*X_K (ou U(I,K)*X_K) pour
+    !       tous les seconds membres, puis disperse le long des lignes.
+    !   2 = "distribuee" : X_K (tranche locale de seconds membres) diffuse le
+    !       long de la colonne de grille ; la colonne K de L (ou de U) de mes
+    !       lignes diffusee compressee le long de la ligne de grille
+    !       (BCAST_BLR_PANEL) ; chaque processus l'applique a SES seconds
+    !       membres. Toutes les colonnes de grille calculent.
+    !   0 = automatique : mode 2 si NRHS > 1.5 x largeur effective des
+    !       facteurs (LU_EFFECTIVE_WIDTH), seuil mesure pour le LDLt.
+    ! Sans l'argument, la variable d'environnement BLR_LU_SOLVE_MODE (1 ou
+    ! 2) force le schema (comparaisons).
+    INTEGER, INTENT(IN), OPTIONAL :: DESCENT_MODE
 
     COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:), XK_LOC(:,:), XK_FULL(:,:), CONTRIB(:,:), CONTRIB_LOC(:,:)
     INTEGER, ALLOCATABLE :: RSTARTS(:), RLOCS(:), RCOUNTS(:), RDISPLS(:)
     INTEGER :: NBLK, K, li, lj, I, KW, MI, RS, RE, NROWTRAIL, C, IERR
     INTEGER :: PROW_K, PCOL_K, STEP, NSTEPS, PBAR_STATE
+    INTEGER :: DMODE, NPB
+    INTEGER, ALLOCATABLE :: PIX(:), PRT(:), PMS(:), PNS(:)
+    TYPE(BLR_BLOCK_T), ALLOCATABLE :: CB(:)
+    COMPLEX(WP), ALLOCATABLE :: XK(:,:)
+    CHARACTER(LEN=8) :: ENVM
     LOGICAL :: PROGRESS
 
     ! Une seule barre pour toute la resolution (substitution avant PUIS
@@ -1325,6 +1376,22 @@ CONTAINS
     PBAR_STATE = -1
 
     NBLK = A_BLR%NBLK
+    DMODE = 0
+    IF (PRESENT(DESCENT_MODE)) THEN
+      DMODE = DESCENT_MODE
+    ELSE
+      CALL GET_ENVIRONMENT_VARIABLE('BLR_LU_SOLVE_MODE', ENVM)
+      IF (TRIM(ENVM) .EQ. '1') DMODE = 1
+      IF (TRIM(ENVM) .EQ. '2') DMODE = 2
+    END IF
+    IF (DMODE .NE. 1 .AND. DMODE .NE. 2) THEN
+      DMODE = 1
+      IF (REAL(NRHS,WP) .GT. 1.5_WP*LU_EFFECTIVE_WIDTH(GRID, A_BLR)) DMODE = 2
+    END IF
+    IF (DMODE .EQ. 2) THEN
+      NPB = MAX(A_BLR%NBLKR_LOC, 1)
+      ALLOCATE(PIX(NPB), PRT(NPB), PMS(NPB), PNS(NPB), CB(NPB))
+    END IF
     ! tailles des tampons de seconds membres (pleine largeur) en entier 32 bits
     CALL BLR_CHECK_COUNT32('lignes locales x seconds membres', MAX(LDB,1), NRHS, GRID%COMM)
     CALL BLR_CHECK_COUNT32('taille de bloc x seconds membres', A_BLR%NB, NRHS, GRID%COMM)
@@ -1373,6 +1440,11 @@ CONTAINS
                       CONE, DKK, KW, B_LOCAL(RS,1), LDB)
         END IF
         DEALLOCATE(DKK)
+      END IF
+      IF (DMODE .EQ. 2) THEN
+        CALL DIST_STEP(K, .TRUE.)
+      ELSE
+      IF (GRID%MYROW .EQ. PROW_K) THEN
         ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
         IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
       END IF
@@ -1448,6 +1520,7 @@ CONTAINS
         DEALLOCATE(CONTRIB, CONTRIB_LOC)
       END IF
       DEALLOCATE(XK_FULL)
+      END IF
       STEP = STEP + 1
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Resolution (pivot)', STEP, NSTEPS, PBAR_STATE)
       IF (PRESENT(PROGRESS_CALLBACK)) THEN
@@ -1472,6 +1545,11 @@ CONTAINS
                       CONE, DKK, KW, B_LOCAL(RS,1), LDB)
         END IF
         DEALLOCATE(DKK)
+      END IF
+      IF (DMODE .EQ. 2) THEN
+        CALL DIST_STEP(K, .FALSE.)
+      ELSE
+      IF (GRID%MYROW .EQ. PROW_K) THEN
         ALLOCATE(XK_LOC(KW,MAX(NRHS_LOC,1)))
         IF (NRHS_LOC .GT. 0) XK_LOC = B_LOCAL(RS:RS+KW-1,1:NRHS_LOC)
       END IF
@@ -1536,6 +1614,7 @@ CONTAINS
         DEALLOCATE(CONTRIB, CONTRIB_LOC)
       END IF
       DEALLOCATE(XK_FULL)
+      END IF
       STEP = STEP + 1
       IF (PROGRESS) CALL PRINT_PROGRESS_BAR('3) Resolution (pivot)', STEP, NSTEPS, PBAR_STATE)
       IF (PRESENT(PROGRESS_CALLBACK)) THEN
@@ -1544,6 +1623,51 @@ CONTAINS
     END DO
 
     DEALLOCATE(RSTARTS, RLOCS, RCOUNTS, RDISPLS)
+  CONTAINS
+
+    ! Etape K de la descente (LOWER : blocs I > K, colonne K de L) ou de la
+    ! remontee (blocs I < K, colonne K de U) en mode distribue, apres la
+    ! resolution du bloc diagonal sur la ligne de grille PROW_K.
+    SUBROUTINE DIST_STEP(KS, LOWER)
+      INTEGER, INTENT(IN) :: KS
+      LOGICAL, INTENT(IN) :: LOWER
+      INTEGER :: LIS, IS, MIS, RSS, LJS, B, IERRS
+      ! X_K : ma tranche de seconds membres, le long de ma colonne de grille.
+      IF (NRHS_LOC .GT. 0) THEN
+        ALLOCATE(XK(KW,NRHS_LOC))
+        IF (GRID%MYROW .EQ. PROW_K) THEN
+          RSS = LOCAL_ROW_OFFSET(A_BLR, GRID, KS)
+          XK = B_LOCAL(RSS:RSS+KW-1,1:NRHS_LOC)
+        END IF
+        CALL MPI_BCAST(XK, KW*NRHS_LOC, MPI_COMPLEX, PROW_K, GRID%COL_COMM, IERRS)
+      END IF
+      ! Colonne K des facteurs, pour mes lignes : un envoi groupe le long de
+      ! la ligne de grille, depuis une copie chez le proprietaire.
+      LJS = BLR_COL_LOCAL(A_BLR%CMAP, KS, GRID)
+      NPB = 0
+      DO LIS = 1, A_BLR%NBLKR_LOC
+        IS = (LIS-1)*GRID%PR + GRID%MYROW + 1
+        IF (IS .EQ. KS .OR. ((IS .GT. KS) .NEQV. LOWER)) CYCLE
+        NPB = NPB + 1
+        PIX(NPB) = LIS; PRT(NPB) = PCOL_K
+        PMS(NPB) = A_BLR%BEND(IS)-A_BLR%BSTART(IS)+1; PNS(NPB) = KW
+        IF (GRID%MYCOL .EQ. PCOL_K) CB(LIS) = A_BLR%OFFBLK(LIS,LJS)
+      END DO
+      CALL BCAST_BLR_PANEL(GRID%ROW_COMM, NPB, PIX, PRT, PMS, PNS, CB)
+      ! B_I <- B_I - bloc(I,K) * X_K sur mes seconds membres.
+      RSS = 1; B = 0
+      DO LIS = 1, A_BLR%NBLKR_LOC
+        IS = (LIS-1)*GRID%PR + GRID%MYROW + 1
+        MIS = A_BLR%BEND(IS)-A_BLR%BSTART(IS)+1
+        IF (IS .NE. KS .AND. ((IS .GT. KS) .EQV. LOWER)) THEN
+          IF (NRHS_LOC .GT. 0) CALL BLR_BLOCK_APPLY(CB(LIS), NRHS_LOC, -CONE, XK, KW, CONE, B_LOCAL(RSS,1), LDB)
+          CALL BLR_BLOCK_RELEASE(CB(LIS))
+        END IF
+        RSS = RSS + MIS
+      END DO
+      IF (ALLOCATED(XK)) DEALLOCATE(XK)
+    END SUBROUTINE DIST_STEP
+
   END SUBROUTINE MPI_BLR_MATRIX_LU_SOLVE_PIVOT_2D
 
   !-----------------------------------------------------------------------
