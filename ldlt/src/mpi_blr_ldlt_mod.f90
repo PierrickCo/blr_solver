@@ -818,7 +818,10 @@ CONTAINS
     INTEGER :: NPG, IPG
     INTEGER(8) :: NC0, NE0
     CHARACTER(LEN=8) :: ENVT
-    LOGICAL :: TRACE
+    LOGICAL :: TRACE, DUMPW
+    INTEGER :: UDW
+    DOUBLE PRECISION :: WUPD
+    CHARACTER(LEN=64) :: FDW
     COMPLEX(WP) :: WQUERY(1)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: WRECV(:), LTRECV(:)
     TYPE(BLR_BLOCK_T) :: TMPB
@@ -875,6 +878,17 @@ CONTAINS
     CALL GET_ENVIRONMENT_VARIABLE('BLR_TRACE_FACT', ENVT)
     TRACE = FACT_STEP_TRACE .OR. (TRIM(ENVT) .EQ. '1')
     IF (TRACE) WORK_COUNT = .TRUE.
+    ! BLR_DUMP_WORK=1 : chaque processus ecrit blr_work_rank<id>.bin (flux
+    ! binaire, enregistrements K, I, J en INTEGER(4) puis travail estime en
+    ! REAL(8)) : une ligne par mise a jour de Schur (I = J : bloc diagonal).
+    ! Independant de la grille : entree de tools/blr_sim/simulate.py.
+    CALL GET_ENVIRONMENT_VARIABLE('BLR_DUMP_WORK', ENVT)
+    DUMPW = (TRIM(ENVT) .EQ. '1')
+    IF (DUMPW) THEN
+      WORK_COUNT = .TRUE.
+      WRITE(FDW,'(A,I0,A)') 'blr_work_rank', GRID%MYID, '.bin'
+      OPEN(NEWUNIT=UDW, FILE=TRIM(FDW), ACCESS='STREAM', FORM='UNFORMATTED', STATUS='REPLACE', ACTION='WRITE')
+    END IF
     ALLOCATE(STEPT(6,NBLK))
     STEPT = 0.0D0
     IF (FACT_MEM_PROF .AND. GRID%MYID .EQ. 0) WRITE(6,'(A)') ' [MEMFACT]  K   pic_etape   RSS  alloue  matrice  '// &
@@ -1035,10 +1049,18 @@ CONTAINS
           TT0 = MPI_WTIME()
           IF (I .EQ. J) THEN
             CALL SYM_PACKED_SCHUR_UPDATE(MI, A%DIAGP(I)%AP, KW, WRECV(li), LTRECV(lj), DWORK, A%NB)
+            ! travail estime du bloc diagonal : MI^2 x rang du panneau (dense : KW)
+            IF (WORK_COUNT) THEN
+              WUPD = DBLE(MI)*DBLE(MI)*DBLE(MERGE(WRECV(li)%RANK, KW, WRECV(li)%IS_LOWRANK))
+              SCHUR_WORK = SCHUR_WORK + WUPD
+              IF (DUMPW) WRITE(UDW) K, I, J, WUPD
+            END IF
             TB(5) = TB(5) + (MPI_WTIME() - TT0)
           ELSE
+            WUPD = SCHUR_WORK
             CALL SCHUR_UPDATE_BLR_BLOCK(A%OFFBLK(li,lj), MI, NJ, KW, WRECV(li), LTRECV(lj), TOL, WS, &
                                         USE_MOVE_ALLOC=USE_MOVE_ALLOC)
+            IF (DUMPW) WRITE(UDW) K, I, J, SCHUR_WORK - WUPD
             TB(6) = TB(6) + (MPI_WTIME() - TT0)
           END IF
         END DO
@@ -1115,6 +1137,7 @@ CONTAINS
       END IF
       DEALLOCATE(STEPG, TWG)
     END IF
+    IF (DUMPW) CLOSE(UDW)
     DEALLOCATE(STEPT)
     IF (PRESENT(T_BREAKDOWN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN, 7, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
     IF (PRESENT(T_BREAKDOWN_MIN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN_MIN, 7, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, &

@@ -274,3 +274,51 @@ sens) :
 taille de bloc × seconds membres, colonne de L diffusée) dépasse 2³¹−1 :
 réduire alors le lot de seconds membres. La factorisation elle-même n'a pas
 de compteur à risque (blocs au plus NB × NB).
+
+## 7. Simulateur de répartition (`tools/blr_sim/simulate.py`)
+
+`BLR_DUMP_WORK=1` fait écrire par chaque processus un relevé
+`blr_work_rank<id>.bin` : étape K, bloc (I, J) et travail estimé de chaque
+mise à jour de Schur. Ce relevé ne dépend pas de la grille du calcul. Le
+simulateur rejoue ensuite la charge de chaque processus pour n'importe
+quelle grille et n'importe quelle règle de répartition, en quelques
+secondes et sans MPI :
+
+```bash
+BLR_DUMP_WORK=1 mpirun -np 4 ldlt/bin_noomp_nocheck_fast/bench_steps LDLT 2 2 28600 100 4 1 1e-4 5000 4 2
+python3 tools/blr_sim/simulate.py . --grilles 8x8,16x16,32x32,44x45 --repartitions actuel,cyclique,pondere
+```
+
+**Validation.** Avec un relevé pris en 2×2 (N = 12 000, 80 blocs), le
+simulateur retrouve exactement les indicateurs mesurés directement :
+- en 4×4 : 7,3 % de déséquilibre, 7,1 % de synchronisation, borne 13,9 ;
+- en 8×8 : 21,1 %, 13,0 %, borne 46,8.
+
+**Étude à 286 blocs.** C'est le nombre de blocs attendu à N = 1 000 000
+avec NB = 3 500. La matrice de test utilisée (N = 28 600, NB = 100) a la
+bonne structure, mais pas les rangs d'un vrai problème à un million.
+
+| Grille | Répartition | Déséquilibre | Synchronisation | Borne d'accélération | Diffusions par processus | Si regroupées |
+|---|---|---|---|---|---|---|
+| 8 × 8 | actuelle | 5,2 % | 6,0 % | 57 / 64 | 20 378 | 1 124 |
+| 10 × 10 | actuelle | 7,8 % | 7,3 % | 87 / 100 | 16 302 | 1 121 |
+| 16 × 16 | actuelle | 17,4 % | 8,7 % | 201 / 256 | 10 189 | 1 108 |
+| 16 × 16 | pondérée | 8,6 % | 46,7 % | 161 / 256 | | |
+| 32 × 32 | actuelle | 46,7 % | 7,5 % | 649 / 1 024 | 5 094 | 1 076 |
+| 32 × 32 | pondérée | 20,2 % | 78,1 % | 478 / 1 024 | | |
+| 44 × 45 | actuelle | 69,9 % | 6,3 % | 1 096 / 1 980 | 3 664 | 1 053 |
+| 44 × 45 | pondérée | 46,9 % | 120 % | 612 / 1 980 | | |
+
+**Lecture :**
+- **La répartition actuelle** (cyclique décalée) reste la meilleure. La
+  cyclique simple donne la même borne à 1 % près.
+- **Une répartition pondérée par le coût total fait pire.** Elle réduit le
+  déséquilibre global mais regroupe le travail dans les mêmes étapes, et la
+  perte de synchronisation explose. Il faut équilibrer étape par étape, ce
+  que le cyclique fait naturellement.
+- **L'efficacité de la charge baisse avec la grille** : 90 % à 64
+  processus, 78 % à 256, 63 % à 1 024, 55 % à 1 980. La cause est la
+  granularité : 6 à 9 blocs par ligne de grille. Les remèdes sont plus de
+  blocs (NB plus petit) ou moins de processus avec des threads.
+- **Regrouper les diffusions par panneau** divise le nombre d'appels par 18
+  en 8×8 et par 3,5 en 44×45.
