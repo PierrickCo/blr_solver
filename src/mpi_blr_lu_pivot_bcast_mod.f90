@@ -49,6 +49,11 @@ MODULE MPI_BLR_LU_PIVOT_BCAST_MOD
   USE MPI_LU_PIVOT_MOD, ONLY: SWAP_ROWS_RANGE
   IMPLICIT NONE
 
+  ! Compteurs des diffusions de blocs (BCAST_BLR_BLOCK) vues par ce
+  ! processus, emetteur ou recepteur : appels MPI_BCAST et elements
+  ! complexes transportes (diagnostic).
+  INTEGER(8) :: BCAST_NCALL = 0_8, BCAST_ELEMS = 0_8
+
 CONTAINS
 
   !-----------------------------------------------------------------------
@@ -89,6 +94,7 @@ CONTAINS
     END IF
     IF (PRESENT(T_MPICALL)) TT0 = MPI_WTIME()
     CALL MPI_BCAST(HEADER, 2, MPI_INTEGER, ROOT, COMM, IERR)
+    BCAST_NCALL = BCAST_NCALL + 1
     IF (PRESENT(T_MPICALL)) T_MPICALL = T_MPICALL + (MPI_WTIME() - TT0)
 
     IF (MYID .NE. ROOT) THEN
@@ -129,6 +135,7 @@ CONTAINS
         END IF
         IF (PRESENT(T_MPICALL)) TT0 = MPI_WTIME()
         CALL MPI_BCAST(BUF, NTOT, MPI_COMPLEX, ROOT, COMM, IERR)
+        BCAST_NCALL = BCAST_NCALL + 1; BCAST_ELEMS = BCAST_ELEMS + NTOT
         IF (PRESENT(T_MPICALL)) T_MPICALL = T_MPICALL + (MPI_WTIME() - TT0)
         IF (MYID .NE. ROOT) THEN
           IF (NU .GT. 0) BLK%UFAC = RESHAPE(BUF(1:NU),      [M,BLK%RANK])
@@ -140,6 +147,7 @@ CONTAINS
       IF (M*N .GT. 0) THEN
         IF (PRESENT(T_MPICALL)) TT0 = MPI_WTIME()
         CALL MPI_BCAST(BLK%DENSE, M*N, MPI_COMPLEX, ROOT, COMM, IERR)
+        BCAST_NCALL = BCAST_NCALL + 1; BCAST_ELEMS = BCAST_ELEMS + INT(M,8)*INT(N,8)
         IF (PRESENT(T_MPICALL)) T_MPICALL = T_MPICALL + (MPI_WTIME() - TT0)
       END IF
     END IF

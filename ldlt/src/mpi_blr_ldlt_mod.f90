@@ -64,10 +64,10 @@ MODULE MPI_BLR_LDLT_MOD
   USE BLR_KINDS_MOD, ONLY: WP
   USE MPI_GRID_MOD
   USE BLR_COMPRESS_MOD
-  USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
+  USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK, BCAST_NCALL, BCAST_ELEMS
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE
   USE MPI_BLR_MATRIX_MOD, ONLY: BLOCK_NUMROC, BLR_COL_OWNER, BLR_COL_LOCAL, BLR_COL_GLOBAL, BLR_NBLKC_LOC, &
-                                 STAGE_PROGRESS_CALLBACK_IFACE, STAGE_PROGRESS_SHOULD_FIRE, &
+                                 STAGE_PROGRESS_CALLBACK_IFACE, STAGE_PROGRESS_SHOULD_FIRE, BLR_CHECK_COUNT32, &
                                 RHS_LOCAL_RANGE_MBM, RHS_NUMROC_MBM
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB, BLR_TRIM_HEAP
@@ -86,6 +86,14 @@ MODULE MPI_BLR_LDLT_MOD
   ! LTRECV), de la copie des L(I,K) chez le proprietaire de la colonne K
   ! et des espaces de travail (WS, DWORK). Affiche par le rang 0.
   LOGICAL :: FACT_MEM_PROF = .FALSE.
+
+  ! Trace des attentes MPI de la factorisation (diagnostic, FACT_STEP_TRACE) :
+  ! par processus, temps de communication ventile (1 debut d'etape : pivots
+  ! et bloc diagonal, 2 panneaux le long des lignes comme emetteur, 3
+  ! panneaux le long des colonnes, 4 anticipation, 5 panneaux le long des
+  ! lignes comme recepteur), et par etape le Schur et les communications
+  ! de chaque processus. Affiche par le rang 0.
+  LOGICAL :: FACT_STEP_TRACE = .FALSE.
 
   TYPE :: MPI_BLR_SYM_T
     INTEGER :: N = 0, NB = 0, NBLK = 0, NBLKR_LOC = 0, NBLKC_LOC = 0
@@ -805,6 +813,12 @@ CONTAINS
     INTEGER :: REQ(3), NREQ
     LOGICAL :: LA, PENDING
     DOUBLE PRECISION :: TB(7), TT0, TLOOP0
+    DOUBLE PRECISION :: TW(5), TDW, TB0(7), TSTEP0, W0, WSYNC, WMAXT, WMOY, WDIAG
+    DOUBLE PRECISION, ALLOCATABLE :: STEPT(:,:), STEPG(:,:,:), TWG(:,:)
+    INTEGER :: NPG, IPG
+    INTEGER(8) :: NC0, NE0
+    CHARACTER(LEN=8) :: ENVT
+    LOGICAL :: TRACE
     COMPLEX(WP) :: WQUERY(1)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: WRECV(:), LTRECV(:)
     TYPE(BLR_BLOCK_T) :: TMPB
@@ -855,10 +869,19 @@ CONTAINS
     TB = 0.0D0
     TLOOP0 = MPI_WTIME()
 
+    TW = 0.0D0
+    ! trace demandee par FACT_STEP_TRACE ou par la variable d'environnement
+    ! BLR_TRACE_FACT=1 (tout pilote : bench_steps, exemples, bem_solve)
+    CALL GET_ENVIRONMENT_VARIABLE('BLR_TRACE_FACT', ENVT)
+    TRACE = FACT_STEP_TRACE .OR. (TRIM(ENVT) .EQ. '1')
+    IF (TRACE) WORK_COUNT = .TRUE.
+    ALLOCATE(STEPT(6,NBLK))
+    STEPT = 0.0D0
     IF (FACT_MEM_PROF .AND. GRID%MYID .EQ. 0) WRITE(6,'(A)') ' [MEMFACT]  K   pic_etape   RSS  alloue  matrice  '// &
          'W_recus  Lt_recus  copie_L  WS  DWORK  (Mo, max par processus)'
     DO K = 1, NBLK
       IF (FACT_MEM_PROF) CALL MEMPROF_RESET_HWM()
+      TB0 = TB; TSTEP0 = MPI_WTIME(); W0 = SCHUR_WORK; NC0 = BCAST_NCALL; NE0 = BCAST_ELEMS
       KW = A%BEND(K) - A%BSTART(K) + 1
       PROW_K = MOD(K-1, GRID%PR)
       PCOL_K = BLR_COL_OWNER(A%CMAP, K, GRID)
@@ -876,7 +899,7 @@ CONTAINS
       IF (PENDING) THEN
         TT0 = MPI_WTIME()
         CALL MPI_WAITALL(NREQ, REQ, MPI_STATUSES_IGNORE, IERR)
-        TB(4) = TB(4) + (MPI_WTIME() - TT0)
+        TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(1) = TW(1) + TDW
         PENDING = .FALSE.
         INFO_STEP = IBUF_N(0)
         IPIV_K = IBUF_N(1:KW)
@@ -893,7 +916,7 @@ CONTAINS
           CALL MPI_BCAST(IPIV_K, KW, MPI_INTEGER, ROOT_K, GRID%COMM, IERR)
           CALL MPI_BCAST(DBUF, 2*KW, MPI_COMPLEX, ROOT_K, GRID%COMM, IERR)
         END IF
-        TB(4) = TB(4) + (MPI_WTIME() - TT0)
+        TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(1) = TW(1) + TDW
       END IF
       IF (INFO_STEP .NE. 0) THEN
         INFO = INFO_STEP
@@ -926,7 +949,7 @@ CONTAINS
       IF (GRID%MYCOL .EQ. PCOL_K .AND. .NOT. (LA .AND. K .GT. 1)) THEN
         TT0 = MPI_WTIME()
         CALL BCAST_DIAG_LOWER(A, K, KW, OWNER, PROW_K, GRID%COL_COMM, DKK)
-        TB(4) = TB(4) + (MPI_WTIME() - TT0)
+        TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(1) = TW(1) + TDW
         DO li = 1, A%NBLKR_LOC
           I = (li-1)*GRID%PR + GRID%MYROW + 1
           IF (I .LE. K) CYCLE
@@ -948,7 +971,7 @@ CONTAINS
           IF (I .LE. K) CYCLE
           TT0 = MPI_WTIME()
           CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A%BEND(I)-A%BSTART(I)+1, KW, A%OFFBLK(li,lj_K))
-          TB(4) = TB(4) + (MPI_WTIME() - TT0)
+          TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(2) = TW(2) + TDW
           TT0 = MPI_WTIME()
           WRECV(li) = A%OFFBLK(li,lj_K)
           CALL BLR_BLOCK_DINV_RIGHT(A%OFFBLK(li,lj_K), KW, IPIV_K, A%DDIAG(1:KW,K), A%DSUB(1:KW,K))
@@ -967,7 +990,7 @@ CONTAINS
           IF (I .LE. K) CYCLE
           TT0 = MPI_WTIME()
           CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A%BEND(I)-A%BSTART(I)+1, KW, WRECV(li))
-          TB(4) = TB(4) + (MPI_WTIME() - TT0)
+          TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(5) = TW(5) + TDW
         END DO
       END IF
 
@@ -990,7 +1013,7 @@ CONTAINS
         END IF
         TT0 = MPI_WTIME()
         CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_J, KW, NJ, LTRECV(lj))
-        TB(4) = TB(4) + (MPI_WTIME() - TT0)
+        TDW = MPI_WTIME() - TT0; TB(4) = TB(4) + TDW; TW(3) = TW(3) + TDW
       END DO
 
       ! 6) Schur, triangle inferieur : A(I,J) -= W(I,K)*L(J,K)^T, I>=J>K.
@@ -1022,6 +1045,12 @@ CONTAINS
         IF (LA .AND. J .EQ. K+1) CALL POST_NEXT_DIAG(K+1)
       END DO
 
+      STEPT(1,K) = (TB(5) + TB(6)) - (TB0(5) + TB0(6))
+      STEPT(2,K) = TB(4) - TB0(4)
+      STEPT(3,K) = MPI_WTIME() - TSTEP0
+      STEPT(4,K) = SCHUR_WORK - W0
+      STEPT(5,K) = DBLE(BCAST_NCALL - NC0)
+      STEPT(6,K) = DBLE(BCAST_ELEMS - NE0)
       IF (FACT_MEM_PROF) CALL MEMPROF_STEP()
       ! Panneaux recus des blocs-lignes / blocs-colonnes deja traites (I, J
       ! <= K+1) : plus jamais lus. Liberes a chaque etape plutot qu'en fin de
@@ -1044,6 +1073,49 @@ CONTAINS
     END DO
     IF (RSS_TRACE) WRITE(6,'(A,F8.1,A)') '     [RSS trace] MAX observe pendant la factorisation = ', RSS_MAX_MB, ' Mo'
     TB(7) = MPI_WTIME() - TLOOP0
+    IF (TRACE) THEN
+      NPG = GRID%PR*GRID%PC
+      ALLOCATE(STEPG(6,NBLK,MERGE(NPG,1,GRID%MYID.EQ.0)), TWG(5,MERGE(NPG,1,GRID%MYID.EQ.0)))
+      CALL MPI_GATHER(STEPT, 6*NBLK, MPI_DOUBLE_PRECISION, STEPG, 6*NBLK, MPI_DOUBLE_PRECISION, 0, GRID%COMM, IERR)
+      CALL MPI_GATHER(TW, 5, MPI_DOUBLE_PRECISION, TWG, 5, MPI_DOUBLE_PRECISION, 0, GRID%COMM, IERR)
+      IF (GRID%MYID .EQ. 0) THEN
+        ! Resume independant des temps : travail estime du Schur (WORK_COUNT)
+        ! et diffusions de blocs par processus.
+        WSYNC = 0.0D0; WMAXT = 0.0D0; WMOY = 0.0D0
+        DO K = 1, NBLK
+          WSYNC = WSYNC + MAXVAL(STEPG(4,K,:))
+        END DO
+        DO IPG = 1, NPG
+          WMAXT = MAX(WMAXT, SUM(STEPG(4,:,IPG)))
+          WMOY = WMOY + SUM(STEPG(4,:,IPG))/DBLE(NPG)
+        END DO
+        WRITE(6,'(A,I0,A,I0,A,I0,A,I0)') ' [TRACE] grille ', GRID%PR, ' x ', GRID%PC, ', N = ', A%N, ', blocs = ', NBLK
+        WRITE(6,'(A,ES10.3,A,ES10.3,A,ES10.3)') ' [TRACE] travail du Schur par processus : moyenne ', WMOY, &
+             ', maximum ', WMAXT, ', somme des maximums par etape ', WSYNC
+        WRITE(6,'(A,F6.1,A,F6.1,A,F6.1,A)') ' [TRACE] efficacite : desequilibre global ', 100.0D0*(WMAXT/MAX(WMOY,1.0D-30) &
+             - 1.0D0), ' %, synchronisation par etape ', 100.0D0*(WSYNC/MAX(WMAXT,1.0D-30) - 1.0D0), &
+             ' %, borne d''acceleration ', DBLE(NPG)*WMOY/MAX(WSYNC,1.0D-30), ' (ideal = nombre de processus)'
+        WRITE(6,'(A,F10.0,A,F10.0,A,ES10.3,A)') ' [TRACE] diffusions de blocs par processus : moyenne ', &
+             SUM(STEPG(5,:,:))/DBLE(NPG), ' appels, maximum ', MAXVAL(SUM(STEPG(5,:,:), DIM=1)), ' ; ', &
+             SUM(STEPG(6,:,:))/DBLE(NPG), ' elements en moyenne'
+        WDIAG = WMOY/MAX(SUM(STEPG(5,:,:))/DBLE(NPG), 1.0D0)
+        WRITE(6,'(A,ES10.3)') ' [TRACE] travail du Schur par appel de diffusion (moyenne) : ', WDIAG
+        IF (NPG .LE. 8) THEN
+          WRITE(6,'(A)') ' [TRACE] communications par processus (s) : debut d''etape, lignes (emetteur), colonnes, '// &
+               'anticipation, lignes (recepteur) ; total Schur ; total communications'
+          DO IPG = 1, NPG
+            WRITE(6,'(A,I3,A,I0,A,I0,A,5F8.2,A,F8.2,A,F8.2)') ' [TRACE] proc', IPG-1, ' (', (IPG-1)/GRID%PC, ',', &
+                 MOD(IPG-1,GRID%PC), ')', TWG(:,IPG), ' ;', SUM(STEPG(1,:,IPG)), ' ;', SUM(STEPG(2,:,IPG))
+          END DO
+          WRITE(6,'(A)') ' [TRACE]   K  duree | Schur par processus | communications par processus'
+          DO K = 1, NBLK
+            WRITE(6,'(A,I4,F7.2,A,*(F7.2))') ' [TRACE] ', K, MAXVAL(STEPG(3,K,:)), ' |', STEPG(1,K,:), STEPG(2,K,:)
+          END DO
+        END IF
+      END IF
+      DEALLOCATE(STEPG, TWG)
+    END IF
+    DEALLOCATE(STEPT)
     IF (PRESENT(T_BREAKDOWN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN, 7, MPI_DOUBLE_PRECISION, MPI_MAX, GRID%COMM, IERR)
     IF (PRESENT(T_BREAKDOWN_MIN)) CALL MPI_ALLREDUCE(TB, T_BREAKDOWN_MIN, 7, MPI_DOUBLE_PRECISION, MPI_MIN, GRID%COMM, &
                                                      IERR)
@@ -1143,7 +1215,7 @@ CONTAINS
         NREQ = 3
         TF0 = MPI_WTIME()
         CALL MPI_WAITALL(NREQ, REQ, MPI_STATUSES_IGNORE, IERRN)
-        TB(4) = TB(4) + (MPI_WTIME() - TF0)
+        TDW = MPI_WTIME() - TF0; TB(4) = TB(4) + TDW; TW(4) = TW(4) + TDW
         IF (IBUF_N(0) .EQ. 0) THEN
           ALLOCATE(SWPN(KWN), DKN(KWN,KWN))
           SWPN = ABS(IBUF_N(1:KWN))
@@ -1271,6 +1343,9 @@ CONTAINS
     NBLK = A%NBLK
     NSTEPS = 2*NBLK
     MLOC = MPI_BLR_SYM_MLOC(A, GRID)
+    ! tailles des tampons de seconds membres (pleine largeur) en entier 32 bits
+    CALL BLR_CHECK_COUNT32('lignes locales x seconds membres', MAX(MLOC,1), NRHS, GRID%COMM)
+    CALL BLR_CHECK_COUNT32('taille de bloc x seconds membres', A%NB, NRHS, GRID%COMM)
     ALLOCATE(RSTARTS(0:GRID%PC-1), RLOCS(0:GRID%PC-1), RCOUNTS(0:GRID%PC-1), RDISPLS(0:GRID%PC-1))
     DO C = 0, GRID%PC-1
       CALL RHS_LOCAL_RANGE_MBM(NRHS, GRID%PC, C, RSTARTS(C), RLOCS(C))
@@ -1581,6 +1656,11 @@ CONTAINS
             END IF
           END ASSOCIATE
         END DO
+      END IF
+      IF (NTOT8 .GT. INT(HUGE(1),8)) THEN
+        WRITE(6,'(A,I0,A)') ' ERREUR BLR : colonne de L diffusee (', NTOT8, &
+             ' elements) au-dela de 2^31-1 : utiliser DESCENT_MODE = 1 ou une grille a plus de lignes.'
+        CALL MPI_ABORT(GRID%COMM, 3, IERRD)
       END IF
       IF (NTOT8 .GT. 0) CALL MPI_BCAST(LBUF, INT(NTOT8), MPI_COMPLEX, PCOL_K, GRID%ROW_COMM, IERRD)
     END SUBROUTINE BCAST_LCOL

@@ -229,3 +229,48 @@ par étape, taux de compression, décomposition de la RSS) :
 mpirun -np 4 ldlt/bin_noomp_nocheck_fast/bench_steps LDLT 2 2 40000 500 500 3 1e-4 5000 4
 ```
 
+## 6. Préparer un passage sur cluster sans cluster (trace et compteurs)
+
+`BLR_TRACE_FACT=1` (variable d'environnement, tout pilote du LDLᵀ :
+`bench_steps`, exemples, `bem_solve`) fait imprimer par la factorisation
+LDLᵀ un résumé **indépendant des temps**, donc valable même avec plus de
+processus que de cœurs :
+
+- **Travail du Schur par processus**, estimé en opérations
+  (`WORK_COUNT`, `SCHUR_WORK`) : moyenne, maximum, et somme des maximums
+  par étape.
+- **Trois indicateurs** :
+  - le déséquilibre global, maximum / moyenne ;
+  - la perte de synchronisation par étape, somme des maximums par étape /
+    maximum des totaux ;
+  - une borne de l'accélération, P × moyenne / somme des maximums.
+- **Diffusions de blocs par processus** : nombre d'appels et éléments
+  transportés (`BCAST_NCALL`, `BCAST_ELEMS`).
+
+Jusqu'à 8 processus s'ajoute le détail des temps : communications
+ventilées par processus, puis Schur et communications à chaque étape.
+
+Émulation sur un portable à 4 cœurs (matrice de test, N = 12 000, NB = 150,
+80 blocs ; `I_MPI_WAIT_MODE=1 I_MPI_PIN=off`, les temps n'ont alors pas de
+sens) :
+
+| Grille | Déséquilibre global | Synchronisation par étape | Borne d'accélération | Diffusions par processus | Travail par diffusion |
+|---|---|---|---|---|---|
+| 2 × 2 | 2,3 % | 2,4 % | 3,8 / 4 | 6 320 | 5,2e6 |
+| 4 × 4 | 7,7 % | 7,4 % | 13,8 / 16 | 3 160 | 2,6e6 |
+| 6 × 6 | 14,9 % | 10,0 % | 28,5 / 36 | 2 107 | 1,7e6 |
+| 8 × 8 | 25,9 % | 12,3 % | 45,3 / 64 | 1 580 | 1,3e6 |
+
+**Lecture :**
+- **Déséquilibre.** À 64 processus sur 80 blocs, le déséquilibre global
+  est la première perte (26 %), devant la synchronisation (12 %).
+- **Messages.** Le nombre de diffusions par processus ne décroît que comme
+  1/√P : le travail utile par message est divisé par 4 de 2×2 à 8×8.
+- **Limite.** Ces chiffres dépendent du nombre de blocs par ligne de
+  grille (10 ici en 8×8). À refaire à la taille visée.
+
+**Entiers 32 bits.** Les résolutions LU et LDLᵀ s'arrêtent avec un message
+(`BLR_CHECK_COUNT32`) si un compteur MPI (lignes locales × seconds membres,
+taille de bloc × seconds membres, colonne de L diffusée) dépasse 2³¹−1 :
+réduire alors le lot de seconds membres. La factorisation elle-même n'a pas
+de compteur à risque (blocs au plus NB × NB).

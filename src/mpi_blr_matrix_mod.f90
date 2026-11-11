@@ -1103,6 +1103,9 @@ CONTAINS
     LOGICAL :: PROGRESS
 
     NBLK = A_BLR%NBLK
+    ! tailles des tampons de seconds membres (pleine largeur) en entier 32 bits
+    CALL BLR_CHECK_COUNT32('lignes locales x seconds membres', MAX(LDB,1), NRHS, GRID%COMM)
+    CALL BLR_CHECK_COUNT32('taille de bloc x seconds membres', A_BLR%NB, NRHS, GRID%COMM)
     PROGRESS = .FALSE.
     IF (PRESENT(SHOW_PROGRESS)) PROGRESS = SHOW_PROGRESS .AND. (GRID%MYID.EQ.0)
     STEP = 0
@@ -1330,6 +1333,9 @@ CONTAINS
     PBAR_STATE = -1
 
     NBLK = A_BLR%NBLK
+    ! tailles des tampons de seconds membres (pleine largeur) en entier 32 bits
+    CALL BLR_CHECK_COUNT32('lignes locales x seconds membres', MAX(LDB,1), NRHS, GRID%COMM)
+    CALL BLR_CHECK_COUNT32('taille de bloc x seconds membres', A_BLR%NB, NRHS, GRID%COMM)
     NSTEPS = 2 * NBLK
     ALLOCATE(RSTARTS(0:GRID%PC-1), RLOCS(0:GRID%PC-1), RCOUNTS(0:GRID%PC-1), RDISPLS(0:GRID%PC-1))
     DO C = 0, GRID%PC-1
@@ -1553,6 +1559,20 @@ CONTAINS
   ! de mpi_lu_solve_2d_mod.f90 -- duplique ici pour eviter de dependre du
   ! module de resolution DENSE dans ce module BLR ; meme formule).
   !-----------------------------------------------------------------------
+  ! Garde-fou des compteurs MPI et des tailles en entier 32 bits : arrete
+  ! tous les processus avec un message si NA*NB_ depasse HUGE(1) (au lieu
+  ! d'un debordement silencieux). QUOI : grandeur concernee, pour le message.
+  SUBROUTINE BLR_CHECK_COUNT32(QUOI, NA, NB_, COMM)
+    INCLUDE 'mpif.h'
+    CHARACTER(LEN=*), INTENT(IN) :: QUOI
+    INTEGER, INTENT(IN) :: NA, NB_, COMM
+    INTEGER :: IERR
+    IF (INT(NA,8)*INT(NB_,8) .LE. INT(HUGE(1),8)) RETURN
+    WRITE(6,'(A,A,A,I0,A,I0,A)') ' ERREUR BLR : ', QUOI, ' = ', NA, ' x ', NB_, &
+         ' depasse 2^31-1 elements (compteur MPI 32 bits) : reduire le nombre de seconds membres par lot.'
+    CALL MPI_ABORT(COMM, 3, IERR)
+  END SUBROUTINE BLR_CHECK_COUNT32
+
   SUBROUTINE RHS_LOCAL_RANGE_MBM(NRHS, PC, C, RSTART, RLOC)
     INTEGER, INTENT(IN)  :: NRHS, PC, C
     INTEGER, INTENT(OUT) :: RSTART, RLOC

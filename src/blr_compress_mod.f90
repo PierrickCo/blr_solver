@@ -95,6 +95,14 @@ MODULE BLR_COMPRESS_MOD
   ! Recompression incrementale des blocs ORTHO (FAST_RECOMPRESS_ORTHO) ;
   ! .FALSE. : recompression complete a chaque mise a jour (comparaison).
   LOGICAL :: ORTHO_RECOMP = .TRUE.
+
+  ! Travail estime des mises a jour de Schur hors-diagonale (WORK_COUNT),
+  ! en operations complexes : (MI+NJ)*(RA+RP)^2 pour une recompression,
+  ! MI*NJ*rang pour une mise a jour dense. Independant de la machine :
+  ! sert a comparer la charge des processus quand les temps ne sont pas
+  ! fiables (plus de processus que de coeurs).
+  LOGICAL :: WORK_COUNT = .FALSE.
+  DOUBLE PRECISION :: SCHUR_WORK = 0.0D0
   INTEGER(8) :: SPROF_N(4) = 0_8, SPROF_R(3) = 0_8, SPROF_NO = 0_8   ! SPROF_NO : recompressions incrementales
   INTEGER(8) :: SPROF_RK(2) = 0_8   ! sommes des rangs des residus (lignes, colonnes) des recompressions incrementales
   DOUBLE PRECISION :: SPROF_T(4) = 0.0D0, SPROF_TR(4) = 0.0D0, SPROF_TP = 0.0D0
@@ -1199,6 +1207,15 @@ CONTAINS
     IF (SCHUR_PROF) SPROF_TP = SPROF_TP + (BLR_WALLTIME() - TS0)
     ICASE = 1
     IF (ABLK%IS_LOWRANK) ICASE = MERGE(3, 4, PBLK%IS_LOWRANK)
+    IF (WORK_COUNT) THEN
+      IF (ABLK%IS_LOWRANK .AND. PBLK%IS_LOWRANK) THEN
+        SCHUR_WORK = SCHUR_WORK + DBLE(MI+NJ)*DBLE(ABLK%RANK+PBLK%RANK)**2
+      ELSE IF (PBLK%IS_LOWRANK) THEN
+        SCHUR_WORK = SCHUR_WORK + DBLE(MI)*DBLE(NJ)*DBLE(PBLK%RANK)
+      ELSE
+        SCHUR_WORK = SCHUR_WORK + DBLE(MI)*DBLE(NJ)*DBLE(KW)
+      END IF
+    END IF
 
     IF (ABLK%IS_LOWRANK .AND. PBLK%IS_LOWRANK) THEN
       ! cas 2 : A et L*U basse-rang -> tenter de rester en low-rank
