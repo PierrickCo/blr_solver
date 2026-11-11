@@ -52,7 +52,7 @@ MODULE MPI_BLR_MATRIX_MOD
   USE MPI_GRID_MOD
   USE BLR_COMPRESS_MOD
   USE BLR_OOC_MOD
-  USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK
+  USE MPI_BLR_LU_PIVOT_BCAST_MOD, ONLY: BCAST_BLR_BLOCK, BCAST_BLR_PANEL
   USE BLR_MATRIX_MOD, ONLY: GET_BLOCK_IFACE, DENSE_PANEL_T
   USE PROGRESS_BAR_MOD, ONLY: PRINT_PROGRESS_MILESTONE, PRINT_PROGRESS_BAR
   USE BENCH_UTILS_MOD, ONLY: GET_RSS_KB, BLR_TRIM_HEAP
@@ -586,6 +586,9 @@ CONTAINS
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
+    ! Liste des blocs d'un panneau a diffuser (BCAST_BLR_PANEL).
+    INTEGER, ALLOCATABLE :: PIX(:), PRT(:), PMS(:), PNS(:)
+    INTEGER :: NPB
     TYPE(BLR_WORKSPACE_T) :: WS
     INTEGER :: NBLK, K, li, lj, I, J, KW, MI, NJ, IINFO, INFO_STEP
     INTEGER :: PROW_K, PCOL_K, IERR, NC_LOCAL, NO_LOCAL, LAST_PCT
@@ -606,6 +609,8 @@ CONTAINS
     INFO = 0
     NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8
     ALLOCATE(LRECV(MAX(A_BLR%NBLKR_LOC,1)), URECV(MAX(A_BLR%NBLKC_LOC,1)))
+    NPB = MAX(A_BLR%NBLKR_LOC, A_BLR%NBLKC_LOC, 1)
+    ALLOCATE(PIX(NPB), PRT(NPB), PMS(NPB), PNS(NPB))
     CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB, FACT_WORKSPACE_RANK(A_BLR%NB))
 
     DO K = 1, NBLK
@@ -686,39 +691,29 @@ CONTAINS
       !    lignes-bloc locales pour tous les processus de cette ligne).
       !    Symetriquement pour U(K,:) le long de COL_COMM.
       TT0 = MPI_WTIME()
-      IF (GRID%MYCOL .EQ. PCOL_K) THEN
-        DO li = 1, A_BLR%NBLKR_LOC
-          I = (li-1)*GRID%PR + GRID%MYROW + 1
-          IF (I .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, &
-                                A_BLR%OFFBLK(li,BLR_COL_LOCAL(A_BLR%CMAP, K, GRID)), T_ALLOC_L, T_MPICALL_L)
-          LRECV(li) = A_BLR%OFFBLK(li,BLR_COL_LOCAL(A_BLR%CMAP, K, GRID))
-        END DO
-      ELSE
-        DO li = 1, A_BLR%NBLKR_LOC
-          I = (li-1)*GRID%PR + GRID%MYROW + 1
-          IF (I .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, LRECV(li), &
-                                T_ALLOC_L, T_MPICALL_L)
-        END DO
-      END IF
+      ! Un envoi groupe par panneau (BCAST_BLR_PANEL) : la racine copie
+      ! d'abord ses blocs dans LRECV/URECV et diffuse depuis cette copie.
+      NPB = 0
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        IF (I .LE. K) CYCLE
+        NPB = NPB + 1
+        PIX(NPB) = li; PRT(NPB) = PCOL_K
+        PMS(NPB) = A_BLR%BEND(I)-A_BLR%BSTART(I)+1; PNS(NPB) = KW
+        IF (GRID%MYCOL .EQ. PCOL_K) LRECV(li) = A_BLR%OFFBLK(li,BLR_COL_LOCAL(A_BLR%CMAP, K, GRID))
+      END DO
+      CALL BCAST_BLR_PANEL(GRID%ROW_COMM, NPB, PIX, PRT, PMS, PNS, LRECV, T_ALLOC_L, T_MPICALL_L)
 
-      IF (GRID%MYROW .EQ. PROW_K) THEN
-        DO lj = 1, A_BLR%NBLKC_LOC
-          J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
-          IF (J .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, &
-                                A_BLR%OFFBLK((K-1)/GRID%PR+1,lj), T_ALLOC_L, T_MPICALL_L)
-          URECV(lj) = A_BLR%OFFBLK((K-1)/GRID%PR+1,lj)
-        END DO
-      ELSE
-        DO lj = 1, A_BLR%NBLKC_LOC
-          J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
-          IF (J .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj), &
-                                T_ALLOC_L, T_MPICALL_L)
-        END DO
-      END IF
+      NPB = 0
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
+        IF (J .LE. K) CYCLE
+        NPB = NPB + 1
+        PIX(NPB) = lj; PRT(NPB) = PROW_K
+        PMS(NPB) = KW; PNS(NPB) = A_BLR%BEND(J)-A_BLR%BSTART(J)+1
+        IF (GRID%MYROW .EQ. PROW_K) URECV(lj) = A_BLR%OFFBLK((K-1)/GRID%PR+1,lj)
+      END DO
+      CALL BCAST_BLR_PANEL(GRID%COL_COMM, NPB, PIX, PRT, PMS, PNS, URECV, T_ALLOC_L, T_MPICALL_L)
       T_BCASTPANEL_L = T_BCASTPANEL_L + (MPI_WTIME() - TT0)
 
       ! 6) mise a jour de Schur locale, bloc par bloc, en gardant chaque
@@ -847,6 +842,9 @@ CONTAINS
 
     COMPLEX(WP), ALLOCATABLE :: DKK(:,:)
     TYPE(BLR_BLOCK_T), ALLOCATABLE :: LRECV(:), URECV(:)
+    ! Liste des blocs d'un panneau a diffuser (BCAST_BLR_PANEL).
+    INTEGER, ALLOCATABLE :: PIX(:), PRT(:), PMS(:), PNS(:)
+    INTEGER :: NPB
     TYPE(BLR_WORKSPACE_T) :: WS
     INTEGER, ALLOCATABLE :: IPIV_K(:)
     INTEGER :: NBLK, K, li, lj, I, J, KW, MI, NJ, IINFO, INFO_STEP
@@ -872,6 +870,8 @@ CONTAINS
     INFO = 0
     NC_LOCAL = 0; NO_LOCAL = 0; RS_LOCAL = 0_8; NS_LOCAL = 0
     ALLOCATE(LRECV(MAX(A_BLR%NBLKR_LOC,1)), URECV(MAX(A_BLR%NBLKC_LOC,1)))
+    NPB = MAX(A_BLR%NBLKR_LOC, A_BLR%NBLKC_LOC, 1)
+    ALLOCATE(PIX(NPB), PRT(NPB), PMS(NPB), PNS(NPB))
     ALLOCATE(A_BLR%IPIV(A_BLR%NB, NBLK))
     A_BLR%IPIV = 0
     CALL BLR_WORKSPACE_ALLOC(WS, A_BLR%NB, FACT_WORKSPACE_RANK(A_BLR%NB))
@@ -976,38 +976,30 @@ CONTAINS
       TB(3) = TB(3) + (MPI_WTIME() - TT0)
       TT0 = MPI_WTIME()
 
-      ! 6) diffusion des panneaux L/U DEJA COMPRESSES -- inchange.
-      IF (GRID%MYCOL .EQ. PCOL_K) THEN
-        DO li = 1, A_BLR%NBLKR_LOC
-          I = (li-1)*GRID%PR + GRID%MYROW + 1
-          IF (I .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, &
-                                A_BLR%OFFBLK(li,BLR_COL_LOCAL(A_BLR%CMAP, K, GRID)))
-          LRECV(li) = A_BLR%OFFBLK(li,BLR_COL_LOCAL(A_BLR%CMAP, K, GRID))
-        END DO
-      ELSE
-        DO li = 1, A_BLR%NBLKR_LOC
-          I = (li-1)*GRID%PR + GRID%MYROW + 1
-          IF (I .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%ROW_COMM, PCOL_K, A_BLR%BEND(I)-A_BLR%BSTART(I)+1, KW, LRECV(li))
-        END DO
-      END IF
+      ! 6) diffusion des panneaux L/U DEJA COMPRESSES : un envoi groupe par
+      !    panneau (BCAST_BLR_PANEL) ; la racine copie d'abord ses blocs
+      !    dans LRECV/URECV et diffuse depuis cette copie.
+      NPB = 0
+      DO li = 1, A_BLR%NBLKR_LOC
+        I = (li-1)*GRID%PR + GRID%MYROW + 1
+        IF (I .LE. K) CYCLE
+        NPB = NPB + 1
+        PIX(NPB) = li; PRT(NPB) = PCOL_K
+        PMS(NPB) = A_BLR%BEND(I)-A_BLR%BSTART(I)+1; PNS(NPB) = KW
+        IF (GRID%MYCOL .EQ. PCOL_K) LRECV(li) = A_BLR%OFFBLK(li,BLR_COL_LOCAL(A_BLR%CMAP, K, GRID))
+      END DO
+      CALL BCAST_BLR_PANEL(GRID%ROW_COMM, NPB, PIX, PRT, PMS, PNS, LRECV)
 
-      IF (GRID%MYROW .EQ. PROW_K) THEN
-        DO lj = 1, A_BLR%NBLKC_LOC
-          J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
-          IF (J .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, &
-                                A_BLR%OFFBLK((K-1)/GRID%PR+1,lj))
-          URECV(lj) = A_BLR%OFFBLK((K-1)/GRID%PR+1,lj)
-        END DO
-      ELSE
-        DO lj = 1, A_BLR%NBLKC_LOC
-          J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
-          IF (J .LE. K) CYCLE
-          CALL BCAST_BLR_BLOCK(GRID%COL_COMM, PROW_K, KW, A_BLR%BEND(J)-A_BLR%BSTART(J)+1, URECV(lj))
-        END DO
-      END IF
+      NPB = 0
+      DO lj = 1, A_BLR%NBLKC_LOC
+        J = BLR_COL_GLOBAL(A_BLR%CMAP, lj, GRID)
+        IF (J .LE. K) CYCLE
+        NPB = NPB + 1
+        PIX(NPB) = lj; PRT(NPB) = PROW_K
+        PMS(NPB) = KW; PNS(NPB) = A_BLR%BEND(J)-A_BLR%BSTART(J)+1
+        IF (GRID%MYROW .EQ. PROW_K) URECV(lj) = A_BLR%OFFBLK((K-1)/GRID%PR+1,lj)
+      END DO
+      CALL BCAST_BLR_PANEL(GRID%COL_COMM, NPB, PIX, PRT, PMS, PNS, URECV)
       TB(4) = TB(4) + (MPI_WTIME() - TT0)
 
       ! 7) mise a jour de Schur locale -- inchange.

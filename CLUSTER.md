@@ -322,3 +322,53 @@ bonne structure, mais pas les rangs d'un vrai problème à un million.
   blocs (NB plus petit) ou moins de processus avec des threads.
 - **Regrouper les diffusions par panneau** divise le nombre d'appels par 18
   en 8×8 et par 3,5 en 44×45.
+
+## 8. Diffusion groupée des panneaux (`BCAST_BLR_PANEL`)
+
+**Avant.** Chaque bloc d'un panneau partait en deux appels collectifs :
+un en-tête, puis ses données. Le nombre d'appels par étape croissait avec
+le nombre de blocs du panneau.
+
+**Maintenant.** Tous les blocs d'un panneau, vus d'un communicateur de
+ligne ou de colonne, partent en deux appels : les en-têtes, puis les
+données empilées.
+- Panneau à une seule racine (W le long des lignes en LDLᵀ, L et U en
+  LU) : deux `MPI_BCAST`.
+- Panneau à plusieurs racines (Lᵀ le long des colonnes en LDLᵀ) : un
+  `MPI_ALLREDUCE` pour les en-têtes, un `MPI_ALLGATHERV` pour les données.
+- Les envois restent bloquants. Les octets transportés sont les mêmes :
+  le résultat est identique au bit près.
+
+**Routines concernées :** `MPI_BLR_SYM_LDLT_FACTOR` (classique),
+`MPI_BLR_MATRIX_LU_FACTOR_PIVOT` et `MPI_BLR_MATRIX_LU_FACTOR_NOPIV`. Les
+variantes arène, hors mémoire et capacité fixe diffusent encore bloc par
+bloc.
+
+**Garde-fous.**
+- Si un panneau empilé dépasse 2³¹−1 éléments, la routine revient à la
+  diffusion bloc par bloc.
+- `BLR_PANEL_PACK=0` force la diffusion bloc par bloc, pour comparer.
+
+**Mesures** (`bem_solver`, LDLᵀ, grille 2×2, appels de diffusion par
+processus, `BLR_TRACE_FACT=1`) :
+
+| Cas | Bloc par bloc | Groupée | Solution |
+|---|---|---|---|
+| 6 816 inconnues, 2×2 | 552 | 90 | identique au bit près |
+| 6 816 inconnues, 4×1 et 1×4 | 690 | 89 | identique au bit près |
+| 40 230 inconnues, 2×2 | 3 306 | 226 | identique au bit près |
+
+- **Éléments transportés inchangés** (9,345e7 par processus à 40k).
+- **Temps de factorisation à 40k inchangé sur le portable** : 28,1 / 28,7 /
+  31,8 s bloc par bloc, 28,4 / 28,7 / 33,9 s groupée, passes alternées.
+  Avec 4 processus en mémoire partagée, un appel collectif ne coûte presque
+  rien ; le gain est attendu sur un réseau, quand la grille grandit.
+- **Pic mémoire à 40k inchangé** : 366-368 Mo par processus groupée,
+  369-373 bloc par bloc. Le tampon empilé d'un panneau est transitoire.
+- **LU avec pivot** (3 cas de 6 816 à 12 291 inconnues) : solutions
+  identiques au bit près.
+- `run_all_tests.sh intel-noomp` : tous les tests passent, bornes
+  vérifiées.
+
+**Suite possible :** rendre ces deux appels non bloquants, pour que le
+panneau de l'étape suivante parte pendant les mises à jour de Schur.
