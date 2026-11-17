@@ -1,0 +1,1654 @@
+!===============================================================================
+! Bibliotheque d'algebre lineaire par blocs full/low-rank : primitives de
+! compression basse-rang d'un bloc dense (complexe simple precision) et
+! catalogue complet des operations BLR/LU qui s'appuient dessus.
+!
+! METHODE DE COMPRESSION : SVD tronquee (CGESVD), pas QR avec pivotage de
+! colonnes (ce que font MUMPS/STRUMPACK en production, plus rapide) --
+! choix delibere : la SVD donne directement le rang numerique (a une
+! tolerance donnee) sans bookkeeping de permutation de colonnes a gerer.
+!
+! REPRESENTATION : un bloc M x N est stocke soit dense (tel quel), soit
+! basse-rang comme A ~= UFAC * VFAC avec UFAC (MxR) et VFAC (RxN) -- le
+! facteur singulier Sigma est absorbe dans VFAC (VFAC(i,:) = S(i)*Vh(i,:)),
+! donc UFAC*VFAC reconstruit directement l'approximation tronquee, sans
+! manipulation supplementaire.
+!
+! SEUIL DE RANG : la compression n'a lieu que si le rang numerique trouve
+! (a la tolerance TOL, relative a la plus grande valeur singuliere) est
+! significativement plus petit que MIN(M,N) -- sinon elle n'apporte rien
+! (voire coute plus cher a exploiter qu'un GEMM dense direct) et le bloc
+! reste dense.
+!
+! ROLE DE CE MODULE : point d'entree unique pour l'algebre bloc full/low-
+! rank du solveur -- chaque routine choisit systematiquement le chemin de
+! calcul le moins cher selon que ses operandes sont denses ou basse-rang,
+! et s'appuie sur les memes noyaux BLAS3/LAPACK threades par MKL (CGEMM,
+! CTRSM, CGESVD, CGEQRF/CUNGQR) -- aucune reimplementation "maison" de ces
+! operations, uniquement de la logique de dispatch et de recombinaison des
+! facteurs low-rank autour d'elles. Les routines partagees entre plusieurs
+! solveurs (BLOCK_PARTITION, taille memoire d'un bloc, LU sans pivot, TRSM
+! applique a un facteur low-rank seul) sont consolidees ici : tout module
+! qui fait "USE BLR_COMPRESS_MOD" les recoit automatiquement.
+!
+! PISTES MKL NON ADOPTEES ICI (documentees, pas implementees -- eviter la
+! sur-ingenierie tant que le besoin n'est pas mesure) : CGEMM3M (variante
+! MKL de CGEMM, parfois plus rapide sur gros GEMM complexes via l'algorithme
+! 3M) pourrait remplacer CGEMM en un seul point (ici) si un profilage futur
+! le justifie ; le "batching" de petits GEMM (CGEMM_BATCH) pourrait accelerer
+! les tres nombreuses petites operations de rang faible pendant une
+! factorisation BLR, mais demande une refonte des boucles appelantes pour
+! grouper les appels, hors scope de cette generalisation.
+MODULE BLR_COMPRESS_MOD
+  USE BLR_KINDS_MOD, ONLY: WP, BLR_WALLTIME
+  IMPLICIT NONE
+
+  ! Fraction de MIN(M,N) en-dessous de laquelle la compression est jugee
+  ! "rentable". Expose en PARAMETER modifiable si besoin de retuner plus
+  ! tard sans casser l'interface des routines.
+  !
+  ! 0.5 = seuil d'EQUILIBRE MEMOIRE bas-rang/dense (stockage bas-rang =
+  ! R*(M+N), dense = M*N ; egaux pour R = M*N/(M+N), soit M/2 pour un
+  ! bloc carre -- voir blr_compress_mod.f90/SCHUR_UPDATE_BLR_BLOCK_ARENA,
+  ! meme raisonnement deja applique au plafond de croissance de l'arena).
+  ! Un plafond a 0.8 (choix tune calcul : un GEMM bas-rang a rang R coute
+  ! O(M*N*R), toujours moins cher qu'un GEMM dense O(M*N*NB) tant que
+  ! R<NB, donc accepter un rang plus eleve que le seuil memoire reste, en
+  ! theorie, un gain FLOPs) a ete mesure (bench/sweep_compressibility.sh)
+  ! moins bon en pratique : la zone de compressibilite marginale (rang
+  ! final proche de l'ancien RMAX, ex. ~121 sur 200) est la plus lente de
+  ! tout le balayage (16.3s, plus de 2x le cas totalement dense ~7-8s) --
+  ! l'algorithme tente la QR+SVD complete de FAST_RECOMPRESS pour un
+  ! resultat qui, une fois accepte, coute de toute facon plus de memoire
+  ! que le repli dense (R>M/2). 0.5 evite ce "pire des deux mondes" : le
+  ! test rapide RTOT.GT.RMAX (avant la QR+SVD couteuse) rejette plus tot
+  ! les blocs qui n'auraient de toute facon pas ete memoire-rentables.
+  ! Variable de module (PAS PARAMETER) : valeur par defaut utilisee par
+  ! TOUS les appelants existants (tous les benchmarks/tests, sauf
+  ! test/bench_blr_mpi_pivot_ratio.f90 qui la surcharge explicitement pour
+  ! son propre balayage), modifiable a l'execution via
+  ! SET_COMPRESS_WORTHWHILE_RATIO ci-dessous.
+  !
+  ! 1/3 (mesure via bench/sweep_compress_ratio.sh au point marginal
+  ! EPS=1e-6) : plus prudent que 0.5 (l'equilibre memoire bas-rang/dense
+  ! strict, R=MIN(M,N)/2) -- accepte un rang encore plus bas avant de
+  ! basculer en dense, ce qui reste dans le plateau "rapide" du temps de
+  ! factorisation (~3.7-3.9s mesures, RATIO 0.1-0.5) au lieu de s'approcher
+  ! de la zone ou le temps commence deja a grimper (~4.6s a 0.6, ~12.7-20s
+  ! a 0.8-0.9) -- marge de securite deliberee sur le temps, au prix de
+  ! quelques opportunites de compression memoire-rentables (rang entre M/3
+  ! et M/2) rejetees.
+  REAL(WP) :: COMPRESS_WORTHWHILE_RATIO = 1.0_WP/3.0_WP
+
+  ! Profil des mises a jour de Schur hors-diagonale (diagnostic, actif si
+  ! SCHUR_PROF ; sequentiel : ne pas activer sous OpenMP). Par cas :
+  !   1 cible dense ; 2 cible et produit bas-rang, recompression reussie ;
+  !   3 cible et produit bas-rang, repli dense ; 4 cible bas-rang, produit
+  !   dense (repli dense).
+  ! SPROF_N nombre de mises a jour, SPROF_T temps total (s), SPROF_TP temps
+  ! des produits L*U ; SPROF_TR temps de FAST_RECOMPRESS : (1) copie + QR de
+  ! [UA|-PU], (2) QR de [VA;PV]^T, (3) coeur (produit + SVD), (4) facteurs
+  ! finaux ; SPROF_R sommes des rangs RA, RP et du rang recompresse (cas 2).
+  LOGICAL :: SCHUR_PROF = .FALSE.
+
+  ! Recompression incrementale des blocs ORTHO (FAST_RECOMPRESS_ORTHO) ;
+  ! .FALSE. : recompression complete a chaque mise a jour (comparaison).
+  LOGICAL :: ORTHO_RECOMP = .TRUE.
+
+  ! Travail estime des mises a jour de Schur hors-diagonale (WORK_COUNT),
+  ! en operations complexes : (MI+NJ)*(RA+RP)^2 pour une recompression,
+  ! MI*NJ*rang pour une mise a jour dense. Independant de la machine :
+  ! sert a comparer la charge des processus quand les temps ne sont pas
+  ! fiables (plus de processus que de coeurs).
+  LOGICAL :: WORK_COUNT = .FALSE.
+  DOUBLE PRECISION :: SCHUR_WORK = 0.0D0
+  INTEGER(8) :: SPROF_N(4) = 0_8, SPROF_R(3) = 0_8, SPROF_NO = 0_8   ! SPROF_NO : recompressions incrementales
+  INTEGER(8) :: SPROF_RK(2) = 0_8   ! sommes des rangs des residus (lignes, colonnes) des recompressions incrementales
+  DOUBLE PRECISION :: SPROF_T(4) = 0.0D0, SPROF_TR(4) = 0.0D0, SPROF_TP = 0.0D0
+
+  TYPE :: BLR_BLOCK_T
+    LOGICAL :: IS_LOWRANK = .FALSE.
+    INTEGER :: M = 0, N = 0, RANK = 0
+    COMPLEX(WP), ALLOCATABLE :: DENSE(:,:)         ! si IS_LOWRANK = .FALSE.
+    COMPLEX(WP), ALLOCATABLE :: UFAC(:,:), VFAC(:,:)  ! si IS_LOWRANK = .TRUE.
+    ! ORTHO : bloc issu d'une recompression, UFAC a colonnes orthonormees
+    ! et VFAC = diag(SV) * W^T, W a colonnes orthonormees (W^H W = I), SV
+    ! valeurs singulieres (RANK). Permet la recompression incrementale
+    ! (FAST_RECOMPRESS_ORTHO) a la mise a jour de Schur suivante. Remis a
+    ! .FALSE. par toute operation qui modifie les facteurs autrement que par
+    ! une permutation (TRSM, D^-1, reception MPI).
+    LOGICAL :: ORTHO = .FALSE.
+    REAL(WP), ALLOCATABLE :: SV(:)
+  END TYPE BLR_BLOCK_T
+
+  !-----------------------------------------------------------------------
+  ! REUTILISATION DES TABLEAUX DE TRAVAIL TRANSITOIRES : reduit
+  ! l'allocation/desallocation repetee des scratch buffers de
+  ! COMPRESS_BLOCK/FAST_RECOMPRESS (SVD, QR) au lieu d'un ALLOCATE/
+  ! DEALLOCATE a chaque appel. Toutes les matrices 2D sont dimensionnees
+  ! UNE FOIS a (MAXDIM,MAXDIM) (MAXDIM = plus grande taille de bloc/rang
+  ! total attendue, typiquement NB) et REUTILISEES telles quelles via leur
+  ! parametre LDA/LDU/LDVT (convention LAPACK standard : LDA >= M, on peut
+  ! passer un buffer plus grand que la sous-partie logiquement utilisee)
+  ! -- AUCUNE copie de section n'est faite (on passe le tableau ENTIER, pas
+  ! une tranche WS%X(1:M,1:N), qui forcerait une copie temporaire pour un
+  ! tableau non contigu). Le WORK complexe (LWORK) est dimensionne une fois
+  ! au pire cas (MAXDIM,MAXDIM) : LAPACK accepte un LWORK plus grand que le
+  ! minimum requis pour un probleme plus petit (documente, sans erreur).
+  !
+  ! THREAD-SAFETY : UNE instance de ce type ne doit JAMAIS etre partagee
+  ! entre taches concurrentes (threads OpenMP) -- chaque tache (ou
+  ! processus MPI, naturellement isole en memoire) doit avoir SA PROPRE
+  ! instance. Voir BLR_WORKSPACE_ALLOC.
+  !-----------------------------------------------------------------------
+  TYPE :: BLR_WORKSPACE_T
+    INTEGER :: MAXDIM = 0
+    ! LDR : rang total maximal des recompressions, dimension des petits
+    ! tableaux (RU ... SVWH) et nombre de colonnes de UCAT, VCATT, BCOPY,
+    ! UFULL, VTFULL. Egal a MAXDIM dans la variante complete ; plus petit
+    ! dans la variante "factorisation" (BLR_WORKSPACE_ALLOC avec MAXRANK).
+    INTEGER :: LDR = 0
+    ! -- COMPRESS_BLOCK (SVD tronquee) --
+    COMPLEX(WP), ALLOCATABLE :: BCOPY(:,:), UFULL(:,:), VTFULL(:,:), CWORK1(:)
+    REAL(WP), ALLOCATABLE    :: S1(:), RWORK1(:)
+    ! -- FAST_RECOMPRESS (QR + petite SVD) --
+    COMPLEX(WP), ALLOCATABLE :: UCAT(:,:), VCATT(:,:), TAUU(:), TAUV(:)
+    COMPLEX(WP), ALLOCATABLE :: RU(:,:), RV(:,:), WMAT(:,:), UW(:,:), VWH(:,:), SVWH(:,:)
+    COMPLEX(WP), ALLOCATABLE :: CWORK2(:)
+    REAL(WP), ALLOCATABLE    :: SW(:), RWORK2(:)
+  END TYPE BLR_WORKSPACE_T
+
+CONTAINS
+
+  !-----------------------------------------------------------------------
+  ! Surcharge COMPRESS_WORTHWHILE_RATIO (voir sa declaration ci-dessus) --
+  ! a appeler AVANT assemblage/factorisation pour un run donne (ex. un
+  ! benchmark qui balaie ce ratio, voir bench/sweep_compress_ratio.sh). Ne
+  ! touche a AUCUN autre etat -- un run qui n'appelle jamais cette
+  ! routine garde la valeur par defaut, comportement IDENTIQUE a avant
+  ! que COMPRESS_WORTHWHILE_RATIO devienne modifiable.
+  !-----------------------------------------------------------------------
+  SUBROUTINE SET_COMPRESS_WORTHWHILE_RATIO(R)
+    REAL(WP), INTENT(IN) :: R
+    COMPRESS_WORTHWHILE_RATIO = R
+  END SUBROUTINE SET_COMPRESS_WORTHWHILE_RATIO
+
+  !-----------------------------------------------------------------------
+  ! Alloue un workspace reutilisable pour des blocs de taille au plus
+  ! MAXDIM x MAXDIM (typiquement NB, la taille de bloc du solveur
+  ! appelant). Le LWORK complexe est determine UNE FOIS via les requetes
+  ! standard (LWORK=-1) de CGESVD/CGEQRF/CUNGQR au pire cas (MAXDIM,MAXDIM),
+  ! puis reutilise pour tous les appels ulterieurs quelle que soit leur
+  ! taille reelle (toujours <= MAXDIM).
+  !-----------------------------------------------------------------------
+  !
+  ! MAXRANK (optionnel) : variante "factorisation", pour les seules mises
+  ! a jour de Schur (FAST_RECOMPRESS, FAST_RECOMPRESS_ORTHO) dont le rang
+  ! total ne depasse jamais RMAX (voir FACT_WORKSPACE_RANK) : tableaux
+  ! MAXDIM x MAXRANK et MAXRANK x MAXRANK au lieu de MAXDIM x MAXDIM (NB =
+  ! 702 : 44 -> 10 Mo). COMPRESS_BLOCK ne doit pas recevoir cet espace.
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_WORKSPACE_ALLOC(WS, MAXDIM, MAXRANK)
+    TYPE(BLR_WORKSPACE_T), INTENT(OUT) :: WS
+    INTEGER, INTENT(IN) :: MAXDIM
+    INTEGER, INTENT(IN), OPTIONAL :: MAXRANK
+    INTEGER :: LWORK, INFO, MD, LR
+    COMPLEX(WP) :: WQ(1)
+
+    WS%MAXDIM = MAX(MAXDIM, 1)
+    IF (PRESENT(MAXRANK)) THEN
+      MD = WS%MAXDIM
+      LR = MIN(MD, MAX(MAXRANK, 1))
+      WS%LDR = LR
+      ALLOCATE(WS%BCOPY(MD,LR), WS%UFULL(MD,LR), WS%VTFULL(MD,LR))
+      ALLOCATE(WS%S1(1), WS%RWORK1(1))
+      ALLOCATE(WS%UCAT(MD,LR), WS%VCATT(MD,LR))
+      ALLOCATE(WS%TAUU(MD), WS%TAUV(MD))
+      ALLOCATE(WS%RU(LR,LR), WS%RV(LR,LR), WS%WMAT(LR,LR))
+      ALLOCATE(WS%UW(LR,LR), WS%VWH(LR,LR), WS%SVWH(LR,LR))
+      ALLOCATE(WS%SW(LR), WS%RWORK2(5*LR))
+      LWORK = 1
+      CALL CGEQRF(MD, LR, WS%UCAT, MD, WS%TAUU, WQ, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+      CALL CUNGQR(MD, LR, LR, WS%UCAT, MD, WS%TAUU, WQ, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+      CALL CGESVD('S', 'S', LR, LR, WS%WMAT, LR, WS%SW, WS%UW, LR, WS%VWH, LR, WQ, -1, WS%RWORK2, INFO)
+      LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+      LWORK = MAX(LWORK, LR*LR + 3*LR)          ! CGESDD (JOBZ = 'S') de FAST_RECOMPRESS_ORTHO
+      ALLOCATE(WS%CWORK1(1), WS%CWORK2(LWORK))
+      RETURN
+    END IF
+    WS%LDR = WS%MAXDIM
+
+    ALLOCATE(WS%BCOPY(WS%MAXDIM,WS%MAXDIM), WS%UFULL(WS%MAXDIM,WS%MAXDIM), WS%VTFULL(WS%MAXDIM,WS%MAXDIM))
+    ALLOCATE(WS%S1(WS%MAXDIM), WS%RWORK1(5*WS%MAXDIM))
+
+    ALLOCATE(WS%UCAT(WS%MAXDIM,WS%MAXDIM), WS%VCATT(WS%MAXDIM,WS%MAXDIM))
+    ALLOCATE(WS%TAUU(WS%MAXDIM), WS%TAUV(WS%MAXDIM))
+    ALLOCATE(WS%RU(WS%MAXDIM,WS%MAXDIM), WS%RV(WS%MAXDIM,WS%MAXDIM), WS%WMAT(WS%MAXDIM,WS%MAXDIM))
+    ALLOCATE(WS%UW(WS%MAXDIM,WS%MAXDIM), WS%VWH(WS%MAXDIM,WS%MAXDIM), WS%SVWH(WS%MAXDIM,WS%MAXDIM))
+    ALLOCATE(WS%SW(WS%MAXDIM), WS%RWORK2(5*WS%MAXDIM))
+
+    LWORK = 1
+    CALL CGESVD('S', 'S', WS%MAXDIM, WS%MAXDIM, WS%BCOPY, WS%MAXDIM, WS%S1, &
+                 WS%UFULL, WS%MAXDIM, WS%VTFULL, WS%MAXDIM, WQ, -1, WS%RWORK1, INFO)
+    LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+    CALL CGEQRF(WS%MAXDIM, WS%MAXDIM, WS%UCAT, WS%MAXDIM, WS%TAUU, WQ, -1, INFO)
+    LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+    CALL CUNGQR(WS%MAXDIM, WS%MAXDIM, WS%MAXDIM, WS%UCAT, WS%MAXDIM, WS%TAUU, WQ, -1, INFO)
+    LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+    CALL CGESVD('S', 'S', WS%MAXDIM, WS%MAXDIM, WS%WMAT, WS%MAXDIM, WS%SW, &
+                 WS%UW, WS%MAXDIM, WS%VWH, WS%MAXDIM, WQ, -1, WS%RWORK2, INFO)
+    LWORK = MAX(LWORK, INT(REAL(WQ(1))))
+
+    ALLOCATE(WS%CWORK1(LWORK), WS%CWORK2(LWORK))
+  END SUBROUTINE BLR_WORKSPACE_ALLOC
+
+  ! Octets occupes par un espace de travail (diagnostic memoire).
+  FUNCTION BLR_WORKSPACE_BYTES(WS) RESULT(NB)
+    TYPE(BLR_WORKSPACE_T), INTENT(IN) :: WS
+    INTEGER(8) :: NB
+    NB = 0_8
+    IF (ALLOCATED(WS%BCOPY))  NB = NB + 8_8*SIZE(WS%BCOPY,KIND=8)
+    IF (ALLOCATED(WS%UFULL))  NB = NB + 8_8*SIZE(WS%UFULL,KIND=8)
+    IF (ALLOCATED(WS%VTFULL)) NB = NB + 8_8*SIZE(WS%VTFULL,KIND=8)
+    IF (ALLOCATED(WS%CWORK1)) NB = NB + 8_8*SIZE(WS%CWORK1,KIND=8)
+    IF (ALLOCATED(WS%CWORK2)) NB = NB + 8_8*SIZE(WS%CWORK2,KIND=8)
+    IF (ALLOCATED(WS%UCAT))   NB = NB + 8_8*SIZE(WS%UCAT,KIND=8)
+    IF (ALLOCATED(WS%VCATT))  NB = NB + 8_8*SIZE(WS%VCATT,KIND=8)
+    IF (ALLOCATED(WS%RU))     NB = NB + 8_8*SIZE(WS%RU,KIND=8)
+    IF (ALLOCATED(WS%RV))     NB = NB + 8_8*SIZE(WS%RV,KIND=8)
+    IF (ALLOCATED(WS%WMAT))   NB = NB + 8_8*SIZE(WS%WMAT,KIND=8)
+    IF (ALLOCATED(WS%UW))     NB = NB + 8_8*SIZE(WS%UW,KIND=8)
+    IF (ALLOCATED(WS%VWH))    NB = NB + 8_8*SIZE(WS%VWH,KIND=8)
+    IF (ALLOCATED(WS%SVWH))   NB = NB + 8_8*SIZE(WS%SVWH,KIND=8)
+    IF (ALLOCATED(WS%TAUU))   NB = NB + 8_8*SIZE(WS%TAUU,KIND=8)
+    IF (ALLOCATED(WS%TAUV))   NB = NB + 8_8*SIZE(WS%TAUV,KIND=8)
+    IF (ALLOCATED(WS%S1))     NB = NB + 4_8*SIZE(WS%S1,KIND=8)
+    IF (ALLOCATED(WS%RWORK1)) NB = NB + 4_8*SIZE(WS%RWORK1,KIND=8)
+    IF (ALLOCATED(WS%SW))     NB = NB + 4_8*SIZE(WS%SW,KIND=8)
+    IF (ALLOCATED(WS%RWORK2)) NB = NB + 4_8*SIZE(WS%RWORK2,KIND=8)
+  END FUNCTION BLR_WORKSPACE_BYTES
+
+  ! Rang total maximal d'une recompression de Schur pour des blocs de taille
+  ! au plus NB (RMAX de SCHUR_UPDATE_BLR_BLOCK, + 1) : MAXRANK de l'espace
+  ! de travail de factorisation.
+  INTEGER FUNCTION FACT_WORKSPACE_RANK(NB)
+    INTEGER, INTENT(IN) :: NB
+    FACT_WORKSPACE_RANK = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(NB,WP))) + 1
+  END FUNCTION FACT_WORKSPACE_RANK
+
+  ! Libere tous les tableaux d'un bloc et le remet a l'etat vide.
+  SUBROUTINE BLR_BLOCK_RELEASE(BLK)
+    TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
+    IF (ALLOCATED(BLK%DENSE)) DEALLOCATE(BLK%DENSE)
+    IF (ALLOCATED(BLK%UFAC))  DEALLOCATE(BLK%UFAC)
+    IF (ALLOCATED(BLK%VFAC))  DEALLOCATE(BLK%VFAC)
+    IF (ALLOCATED(BLK%SV))    DEALLOCATE(BLK%SV)
+    BLK%IS_LOWRANK = .FALSE.; BLK%ORTHO = .FALSE.
+    BLK%M = 0; BLK%N = 0; BLK%RANK = 0
+  END SUBROUTINE BLR_BLOCK_RELEASE
+
+  SUBROUTINE BLR_WORKSPACE_FREE(WS)
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT) :: WS
+    IF (ALLOCATED(WS%BCOPY))  DEALLOCATE(WS%BCOPY)
+    IF (ALLOCATED(WS%UFULL))  DEALLOCATE(WS%UFULL)
+    IF (ALLOCATED(WS%VTFULL)) DEALLOCATE(WS%VTFULL)
+    IF (ALLOCATED(WS%CWORK1)) DEALLOCATE(WS%CWORK1)
+    IF (ALLOCATED(WS%S1))     DEALLOCATE(WS%S1)
+    IF (ALLOCATED(WS%RWORK1)) DEALLOCATE(WS%RWORK1)
+    IF (ALLOCATED(WS%UCAT))   DEALLOCATE(WS%UCAT)
+    IF (ALLOCATED(WS%VCATT))  DEALLOCATE(WS%VCATT)
+    IF (ALLOCATED(WS%TAUU))   DEALLOCATE(WS%TAUU)
+    IF (ALLOCATED(WS%TAUV))   DEALLOCATE(WS%TAUV)
+    IF (ALLOCATED(WS%RU))     DEALLOCATE(WS%RU)
+    IF (ALLOCATED(WS%RV))     DEALLOCATE(WS%RV)
+    IF (ALLOCATED(WS%WMAT))   DEALLOCATE(WS%WMAT)
+    IF (ALLOCATED(WS%UW))     DEALLOCATE(WS%UW)
+    IF (ALLOCATED(WS%VWH))    DEALLOCATE(WS%VWH)
+    IF (ALLOCATED(WS%SVWH))   DEALLOCATE(WS%SVWH)
+    IF (ALLOCATED(WS%CWORK2)) DEALLOCATE(WS%CWORK2)
+    IF (ALLOCATED(WS%SW))     DEALLOCATE(WS%SW)
+    IF (ALLOCATED(WS%RWORK2)) DEALLOCATE(WS%RWORK2)
+    WS%MAXDIM = 0
+  END SUBROUTINE BLR_WORKSPACE_FREE
+
+  !-----------------------------------------------------------------------
+  ! Compresse le bloc dense B (M x N) en BLK, a la tolerance relative TOL
+  ! (TOL=0 force le mode dense ; typiquement TOL~1e-4 a 1e-6 en simple
+  ! precision). B n'est PAS modifie (copie interne avant SVD, qui est
+  ! destructive).
+  !-----------------------------------------------------------------------
+  ! WS (optionnel) : workspace pre-alloue (BLR_WORKSPACE_ALLOC) reutilise
+  ! pour BCOPY/UFULL/VTFULL/CWORK1/S1/RWORK1 -- AUCUNE allocation dans cette
+  ! routine si fourni (M,N doivent etre <= WS%MAXDIM). Absent : comportement
+  ! d'origine (allocation/desallocation locale a chaque appel).
+  SUBROUTINE COMPRESS_BLOCK(M, N, B, LDB, TOL, BLK, WS)
+    INTEGER, INTENT(IN)          :: M, N, LDB
+    COMPLEX(WP), INTENT(IN)      :: B(LDB,N)
+    REAL(WP), INTENT(IN)         :: TOL
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: BLK
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
+
+    COMPLEX(WP), ALLOCATABLE, TARGET :: BCOPY_LOC(:,:), UFULL_LOC(:,:), VTFULL_LOC(:,:), CWORK_LOC(:)
+    REAL(WP), ALLOCATABLE, TARGET :: S_LOC(:), RWORK_LOC(:)
+    COMPLEX(WP), POINTER :: BCOPY(:,:), UFULL(:,:), VTFULL(:,:), CWORK(:)
+    REAL(WP), POINTER :: S(:), RWORK(:)
+    INTEGER :: MN, LDW, LDV, LWORK, INFO, R, I
+    REAL(WP) :: THRESH
+
+    BLK%M = M
+    BLK%N = N
+    MN = MIN(M,N)
+
+    IF (TOL .LE. 0.0_WP .OR. MN .EQ. 0) THEN
+      BLK%IS_LOWRANK = .FALSE.
+      ALLOCATE(BLK%DENSE(M,N))
+      IF (M.GT.0 .AND. N.GT.0) BLK%DENSE = B(1:M,1:N)
+      RETURN
+    END IF
+
+    IF (PRESENT(WS)) THEN
+      LDW = WS%MAXDIM
+      LDV = WS%MAXDIM
+      BCOPY  => WS%BCOPY
+      UFULL  => WS%UFULL
+      VTFULL => WS%VTFULL
+      S      => WS%S1
+      RWORK  => WS%RWORK1
+      CWORK  => WS%CWORK1
+      LWORK  = SIZE(CWORK)
+    ELSE
+      LDW = M
+      LDV = MN
+      ALLOCATE(BCOPY_LOC(M,N), UFULL_LOC(M,MN), VTFULL_LOC(MN,N), S_LOC(MN), RWORK_LOC(5*MN))
+      BCOPY => BCOPY_LOC; UFULL => UFULL_LOC; VTFULL => VTFULL_LOC; S => S_LOC; RWORK => RWORK_LOC
+      ALLOCATE(CWORK_LOC(1))
+      LWORK = -1
+      CALL CGESVD('S', 'S', M, N, BCOPY, LDW, S, UFULL, LDW, VTFULL, LDV, CWORK_LOC, LWORK, RWORK, INFO)
+      LWORK = INT(REAL(CWORK_LOC(1)))
+      DEALLOCATE(CWORK_LOC)
+      ALLOCATE(CWORK_LOC(MAX(LWORK,1)))
+      CWORK => CWORK_LOC
+    END IF
+
+    BCOPY(1:M,1:N) = B(1:M,1:N)
+    CALL CGESVD('S', 'S', M, N, BCOPY, LDW, S, UFULL, LDW, VTFULL, LDV, &
+                 CWORK, LWORK, RWORK, INFO)
+
+    IF (INFO .NE. 0) THEN
+      ! SVD non convergee (rarissime) : repli securise sur le mode dense
+      BLK%IS_LOWRANK = .FALSE.
+      ALLOCATE(BLK%DENSE(M,N))
+      BLK%DENSE = B(1:M,1:N)
+      IF (.NOT. PRESENT(WS)) DEALLOCATE(BCOPY_LOC, UFULL_LOC, VTFULL_LOC, S_LOC, RWORK_LOC, CWORK_LOC)
+      RETURN
+    END IF
+
+    THRESH = TOL * MAX(S(1), TINY(1.0_WP))
+    R = 0
+    DO I = 1, MN
+      IF (S(I) .GT. THRESH) R = R + 1
+    END DO
+    R = MAX(R, 1)
+
+    IF (REAL(R,WP) .LT. COMPRESS_WORTHWHILE_RATIO*REAL(MN,WP)) THEN
+      BLK%IS_LOWRANK = .TRUE.
+      BLK%RANK = R
+      ALLOCATE(BLK%UFAC(M,R), BLK%VFAC(R,N))
+      BLK%UFAC = UFULL(1:M,1:R)
+      DO I = 1, R
+        BLK%VFAC(I,1:N) = S(I) * VTFULL(I,1:N)
+      END DO
+    ELSE
+      BLK%IS_LOWRANK = .FALSE.
+      ALLOCATE(BLK%DENSE(M,N))
+      BLK%DENSE = B(1:M,1:N)
+    END IF
+
+    IF (.NOT. PRESENT(WS)) DEALLOCATE(BCOPY_LOC, UFULL_LOC, VTFULL_LOC, S_LOC, RWORK_LOC, CWORK_LOC)
+  END SUBROUTINE COMPRESS_BLOCK
+
+  !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- orthonormalise en place les COLONNES de A (ROWS x COLS,
+  ! ROWS>=COLS) via CGEQRF+CUNGQR. Appelee a CHAQUE demi-etape de RSVD_
+  ! RANGE_SVD (pas seulement a la fin) -- voir son commentaire pour
+  ! pourquoi c'est necessaire en simple precision des que NPOWER>1.
+  !-----------------------------------------------------------------------
+  SUBROUTINE ORTHONORMALIZE_COLS(A, ROWS, COLS)
+    INTEGER, INTENT(IN)          :: ROWS, COLS
+    COMPLEX(WP), INTENT(INOUT)   :: A(ROWS,COLS)
+    COMPLEX(WP), ALLOCATABLE :: TAU(:), CWORK(:)
+    INTEGER :: INFO, LWORK
+
+    ALLOCATE(TAU(COLS))
+    ALLOCATE(CWORK(1)); LWORK = -1
+    CALL CGEQRF(ROWS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    LWORK = INT(REAL(CWORK(1))); DEALLOCATE(CWORK); ALLOCATE(CWORK(MAX(LWORK,1)))
+    CALL CGEQRF(ROWS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    DEALLOCATE(CWORK); ALLOCATE(CWORK(1)); LWORK = -1
+    CALL CUNGQR(ROWS, COLS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    LWORK = INT(REAL(CWORK(1))); DEALLOCATE(CWORK); ALLOCATE(CWORK(MAX(LWORK,1)))
+    CALL CUNGQR(ROWS, COLS, COLS, A, ROWS, TAU, CWORK, LWORK, INFO)
+    DEALLOCATE(CWORK, TAU)
+  END SUBROUTINE ORTHONORMALIZE_COLS
+
+  !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- coeur PARTAGE de la SVD randomisee (schema Halko-
+  ! Martinsson-Tropp : projection aleatoire + iterations de puissance +
+  ! QR + petite SVD), factorise ICI pour etre appele soit UNE FOIS a taille
+  ! de sous-espace L FIXE (COMPRESS_BLOCK_RSVD, rang cible connu), soit EN
+  ! BOUCLE a L CROISSANT (COMPRESS_BLOCK_RSVD_ADAPTIVE, rang inconnu) --
+  ! une seule implementation des GEMM/QR/SVD, aucune duplication entre les
+  ! deux routines publiques.
+  !
+  ! ALGORITHME (L colonnes de sous-espace) :
+  !   1) Omega (N x L) matrice ALEATOIRE (parties reelle/imaginaire
+  !      uniformes independantes, PAS besoin de gaussien strict pour un
+  !      bon sous-espace d'echantillonnage en pratique).
+  !   2) Y = B*Omega (M x L), puis NPOWER iterations de puissance
+  !      Y <- B*(B^H*Y) (ameliore la qualite quand les valeurs
+  !      singulieres decroissent lentement -- coute 2 GEMM(M,N,L)
+  !      supplementaires par iteration).
+  !   3) Q = orthonormalisation de Y (CGEQRF+CUNGQR) -- base du sous-
+  !      espace image approxime de B.
+  !   4) B_proj = Q^H*B (L x N, PETIT) -- SVD COMPLETE de B_proj (CGESVD)
+  !      coute O(L*N*L) au lieu de O(M*N*min(M,N)) pour B directement :
+  !      c'est le remplacement du cout domine, PROPORTIONNEL a L/min(M,N).
+  !   5) UFULL = Q*Uhat (M x L) -- S(1:L) et VTHAT(1:L,:) approximent les L
+  !      premieres valeurs/vecteurs singuliers de B (de plus en plus mal
+  !      approximes en approchant l'indice L, d'ou la marge d'echantillon-
+  !      nage OVERSAMPLE consommee par les appelants).
+  !-----------------------------------------------------------------------
+  SUBROUTINE RSVD_RANGE_SVD(M, N, B, LDB, L, NPOWER, S, UFULL, VTHAT)
+    INTEGER, INTENT(IN)         :: M, N, LDB, L, NPOWER
+    COMPLEX(WP), INTENT(IN)     :: B(LDB,N)
+    REAL(WP), INTENT(OUT)       :: S(L)
+    COMPLEX(WP), INTENT(OUT)    :: UFULL(M,L), VTHAT(L,N)
+
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: OMEGA(:,:), Y(:,:), Z(:,:), BPROJ(:,:)
+    COMPLEX(WP), ALLOCATABLE :: UHAT(:,:), CWORK(:)
+    REAL(WP), ALLOCATABLE    :: RWORK(:), RE_PART(:,:), IM_PART(:,:)
+    INTEGER :: IP, INFO, LWORK
+
+    ! 1) Omega (N x L) aleatoire, parties reelle/imaginaire uniformes sur
+    ! [-1,1) independantes.
+    ALLOCATE(OMEGA(N,L), RE_PART(N,L), IM_PART(N,L))
+    CALL RANDOM_NUMBER(RE_PART)
+    CALL RANDOM_NUMBER(IM_PART)
+    OMEGA = CMPLX(2.0_WP*RE_PART-1.0_WP, 2.0_WP*IM_PART-1.0_WP, KIND=WP)
+    DEALLOCATE(RE_PART, IM_PART)
+
+    ! 2) Y = B*Omega, orthonormalise immediatement (voir ORTHONORMALIZE_
+    ! COLS), puis NPOWER iterations de puissance -- chaque demi-iteration
+    ! (Z=B^H*Y puis Y=B*Z) est re-orthonormalisee aussitot, jamais
+    ! seulement a la toute fin. Cette re-orthonormalisation intermediaire
+    ! est necessaire : sans elle, la plage dynamique de Y/Z explose au fil
+    ! des iterations (le rapport des valeurs singulieres extremes est
+    ! porte a la puissance 2*IP+1), ce qui degrade catastrophiquement la
+    ! precision en simple precision (WP) des qu'on depasse NPOWER=1
+    ! (erreur relative x30 pire entre NPOWER=1 et NPOWER=3 sur un cas reel,
+    ! voir test/bench_rsvd_compress.f90) plutot que de l'ameliorer comme
+    ! prevu par la theorie (qui suppose une arithmetique a precision
+    ! infinie ou re-orthonormalisee a chaque etape).
+    ALLOCATE(Y(M,L))
+    CALL CGEMM('No transpose', 'No transpose', M, L, N, CONE, B, LDB, OMEGA, N, CZERO, Y, M)
+    DEALLOCATE(OMEGA)
+    CALL ORTHONORMALIZE_COLS(Y, M, L)
+    DO IP = 1, NPOWER
+      ALLOCATE(Z(N,L))
+      CALL CGEMM('Conjugate transpose', 'No transpose', N, L, M, CONE, B, LDB, Y, M, CZERO, Z, N)
+      CALL ORTHONORMALIZE_COLS(Z, N, L)
+      CALL CGEMM('No transpose', 'No transpose', M, L, N, CONE, B, LDB, Z, N, CZERO, Y, M)
+      CALL ORTHONORMALIZE_COLS(Y, M, L)
+      DEALLOCATE(Z)
+    END DO
+    ! Y contient maintenant Q (M x L), colonnes orthonormees (par
+    ! construction : derniere operation de la boucle, ou de l'etape
+    ! initiale si NPOWER=0).
+
+    ! 4) B_proj = Q^H*B (L x N, PETIT) -- SVD COMPLETE de ce petit systeme.
+    ALLOCATE(BPROJ(L,N))
+    CALL CGEMM('Conjugate transpose', 'No transpose', L, N, M, CONE, Y, M, B, LDB, CZERO, BPROJ, L)
+
+    ALLOCATE(UHAT(L,L), RWORK(5*L))
+    ALLOCATE(CWORK(1)); LWORK = -1
+    CALL CGESVD('S', 'S', L, N, BPROJ, L, S, UHAT, L, VTHAT, L, CWORK, LWORK, RWORK, INFO)
+    LWORK = INT(REAL(CWORK(1))); DEALLOCATE(CWORK); ALLOCATE(CWORK(MAX(LWORK,1)))
+    CALL CGESVD('S', 'S', L, N, BPROJ, L, S, UHAT, L, VTHAT, L, CWORK, LWORK, RWORK, INFO)
+    DEALLOCATE(CWORK, BPROJ, RWORK)
+
+    ! 5) UFULL = Q*Uhat (M x L).
+    CALL CGEMM('No transpose', 'No transpose', M, L, L, CONE, Y, M, UHAT, L, CZERO, UFULL, M)
+    DEALLOCATE(Y, UHAT)
+  END SUBROUTINE RSVD_RANGE_SVD
+
+  !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- SVD randomisee a RANG CIBLE FIXE, PREMIERE PASSE
+  ! demandee explicitement pour mesurer l'ordre de grandeur du gain face a
+  ! COMPRESS_BLOCK (CGESVD complet, mesure : ~90-95% du temps d'assemblage
+  ! a N=20000, voir bench/bench_blr_mpi_pivot_ooc_compare.f90) -- RANK_
+  ! TARGET choisi par l'APPELANT (typiquement en copiant le rang deja
+  ! trouve par COMPRESS_BLOCK pour une comparaison a rang EGAL). Voir
+  ! COMPRESS_BLOCK_RSVD_ADAPTIVE ci-dessous pour la version SANS rang
+  ! connu a l'avance (le cas d'usage reel). Routine INDEPENDANTE de
+  ! COMPRESS_BLOCK, n'affecte AUCUN code existant.
+  !
+  ! GARANTIE : PROBABILISTE, pas deterministe (contrairement a CGESVD) --
+  ! l'erreur d'approximation depend du tirage aleatoire d'Omega ET de la
+  ! decroissance reelle des valeurs singulieres de B. Ne PAS utiliser tel
+  ! quel en production sans validation de la marge d'erreur (voir
+  ! test/bench_rsvd_compress.f90 pour la mesure temps ET precision).
+  !-----------------------------------------------------------------------
+  SUBROUTINE COMPRESS_BLOCK_RSVD(M, N, B, LDB, RANK_TARGET, OVERSAMPLE, NPOWER, BLK)
+    INTEGER, INTENT(IN)            :: M, N, LDB, RANK_TARGET, OVERSAMPLE, NPOWER
+    COMPLEX(WP), INTENT(IN)        :: B(LDB,N)
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: BLK
+
+    COMPLEX(WP), ALLOCATABLE :: UFULL(:,:), VTHAT(:,:)
+    REAL(WP), ALLOCATABLE    :: S(:)
+    INTEGER :: L, R, I
+
+    L = MIN(RANK_TARGET + OVERSAMPLE, MIN(M,N))
+    R = MIN(RANK_TARGET, L)
+    BLK%M = M; BLK%N = N
+
+    ALLOCATE(UFULL(M,L), VTHAT(L,N), S(L))
+    CALL RSVD_RANGE_SVD(M, N, B, LDB, L, NPOWER, S, UFULL, VTHAT)
+
+    BLK%IS_LOWRANK = .TRUE.
+    BLK%RANK = R
+    ALLOCATE(BLK%UFAC(M,R), BLK%VFAC(R,N))
+    BLK%UFAC = UFULL(1:M,1:R)
+    DO I = 1, R
+      BLK%VFAC(I,1:N) = S(I) * VTHAT(I,1:N)
+    END DO
+    DEALLOCATE(UFULL, VTHAT, S)
+  END SUBROUTINE COMPRESS_BLOCK_RSVD
+
+  !-----------------------------------------------------------------------
+  ! EXPERIMENTAL -- SVD randomisee ADAPTATIVE : rang PAS connu a l'avance,
+  ! decouvert en faisant CROITRE la taille du sous-espace d'echantillon
+  ! (doublement) jusqu'a ce qu'un CRITERE D'ARRET base sur la marge de
+  ! sur-echantillonnage restante indique une confiance suffisante -- voir
+  ! COMPRESS_BLOCK_RSVD ci-dessus pour la version a rang deja connu.
+  !
+  ! CRITERE D'ARRET (heuristique PRATIQUE, PAS le critere probabiliste
+  ! rigoureux de Halko-Martinsson-Tropp Algorithme 4.2, qui necessiterait
+  ! un Gram-Schmidt incremental colonne par colonne avec estimateur
+  ! d'erreur par vecteurs de sondage supplementaires -- plus complexe a
+  ! implementer correctement, laisse comme etape ulterieure si celui-ci
+  ! s'avere insuffisant en pratique) : a sous-espace de taille L, on compte
+  ! R = nombre de valeurs singulieres approximees S(1:L) au-dessus du
+  ! seuil TOL*S(1) (MEME regle que COMPRESS_BLOCK). Si R <= L-OVERSAMPLE,
+  ! il reste une marge de sur-echantillonnage NON consommee -- signe que
+  ! le sous-espace est assez grand pour avoir capture toutes les
+  ! directions significatives (les L-R dernieres colonnes, dans la zone de
+  ! marge, ont ete jugees NON significatives). Si R depasse ce seuil, la
+  ! marge est "epuisee" -- signe qu'il pourrait exister des directions
+  ! significatives AU-DELA de L qu'on n'a pas encore vues : on DOUBLE L et
+  ! on recommence. Arret aussi si L atteint LCAP (= seuil COMPRESS_
+  ! WORTHWHILE_RATIO*min(M,N), le MEME plafond que COMPRESS_BLOCK utilise
+  ! pour son repli dense -- au-dela, la compression ne vaudrait de toute
+  ! facon pas le coup) : reste alors DENSE, comme COMPRESS_BLOCK.
+  !
+  ! GARANTIE : PROBABILISTE ET HEURISTIQUE (le critere d'arret lui-meme
+  ! n'a pas de borne de confiance formelle, contrairement au vrai
+  ! algorithme adaptatif HMT). MESURE (test/bench_rsvd_compress.f90, cas
+  ! limite volontairement difficile -- rang juste en-dessous du seuil de
+  ! COMPRESS_WORTHWHILE_RATIO) : le rang trouve correspond EXACTEMENT au
+  ! rang de reference (COMPRESS_BLOCK) et l'erreur de reconstruction est
+  ! QUASI IDENTIQUE (ratio 1.00), y compris avec un OVERSAMPLE reduit a 2
+  ! (2 doublements de sous-espace necessaires dans ce cas). Ce resultat
+  ! depend d'un point CRITIQUE (voir RSVD_RANGE_SVD/ORTHONORMALIZE_COLS) :
+  ! chaque demi-etape d'iteration de puissance doit etre RE-orthonormalisee
+  ! immediatement -- un bogue initial (orthonormalisation UNIQUEMENT en
+  ! fin de calcul) donnait une erreur x30 a x2000 PIRE des que NPOWER>1 en
+  ! simple precision, corrige depuis. Reste malgre tout une garantie
+  ! HEURISTIQUE, pas une preuve -- valider par mesure sur le cas d'usage
+  ! reel avant tout usage en production.
+  !-----------------------------------------------------------------------
+  SUBROUTINE COMPRESS_BLOCK_RSVD_ADAPTIVE(M, N, B, LDB, TOL, BLK, OVERSAMPLE, NPOWER, N_GROWTHS)
+    INTEGER, INTENT(IN)            :: M, N, LDB
+    COMPLEX(WP), INTENT(IN)        :: B(LDB,N)
+    REAL(WP), INTENT(IN)           :: TOL
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: BLK
+    INTEGER, INTENT(IN), OPTIONAL  :: OVERSAMPLE, NPOWER
+    ! N_GROWTHS (optionnel, INTENT(OUT)) : nombre de doublements de L avant
+    ! arret -- diagnostic pratique pour juger si le critere d'arret
+    ! converge vite (0-1 doublement, cas courant) ou tatonne (plusieurs
+    ! doublements, signe que le sous-espace initial etait mal dimensionne).
+    INTEGER, INTENT(OUT), OPTIONAL :: N_GROWTHS
+
+    COMPLEX(WP), ALLOCATABLE :: UFULL(:,:), VTHAT(:,:)
+    REAL(WP), ALLOCATABLE    :: S(:)
+    INTEGER :: OVS, NPOW, MN, L, LCAP, LNEW, R, I, IGROW
+    REAL(WP) :: THRESH
+    LOGICAL :: MARGIN_OK
+
+    OVS = 10; IF (PRESENT(OVERSAMPLE)) OVS = OVERSAMPLE
+    NPOW = 1; IF (PRESENT(NPOWER)) NPOW = NPOWER
+    MN = MIN(M,N)
+    BLK%M = M; BLK%N = N
+
+    ! Meme plafond que COMPRESS_BLOCK (blr_arena_mod-like RMAX) : au-dela,
+    ! la compression n'est de toute facon pas rentable, inutile de faire
+    ! grossir le sous-espace plus loin.
+    LCAP = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(MN,WP)) - 1)
+    LCAP = MAX(LCAP, OVS+1)   ! garde-fou : LCAP doit rester > OVS pour que le critere d'arret ait un sens
+
+    ! ZONE MORTE CARACTERISEE (mesure sur bloc a spectre PRESCRIT, rang
+    ! exact connu par construction, voir test/bench_rsvd_compress.f90
+    ! RANK_WANT) : pour tout rang REEL dans (LCAP-OVERSAMPLE, seuil reel de
+    ! COMPRESS_BLOCK] (ex. M=N=400, OVERSAMPLE=10 -> rangs 123 a 133), la
+    ! marge R<=L-OVERSAMPLE ne peut JAMAIS etre satisfaite avant que L
+    ! n'atteigne LCAP (L ne grossit jamais au-dela) -- l'adaptatif abandonne
+    ! et replie SYSTEMATIQUEMENT en dense (0/20 tirages, PAS une question de
+    ! chance), alors que COMPRESS_BLOCK compresserait correctement ces
+    ! blocs. Repli dense = reconstruction EXACTE, donc pas de corruption,
+    ! seulement une occasion de gain RSVD manquee sur cette bande etroite
+    ! (~OVERSAMPLE valeurs de rang, pres du seuil COMPRESS_WORTHWHILE_
+    ! RATIO). Comportement accepte tel quel (pas de correctif demande) --
+    ! reduire OVERSAMPLE reduirait cette bande mais aussi la marge de
+    ! securite statistique du critere d'arret ailleurs.
+
+    ! MARGIN_OK distingue explicitement "la marge R<=L-OVERSAMPLE a ete
+    ! satisfaite" (rang digne de confiance) de "le plafond LCAP/MN a ete
+    ! atteint sans jamais satisfaire la marge" (la boucle a simplement
+    ! abandonne, R n'a alors aucune valeur probante) : comme R est de
+    ! toute facon toujours <= LCAP < RATIO*MN par construction, un test
+    ! final qui se contenterait de R < RATIO*MN serait toujours vrai des
+    ! qu'on atteint le plafond, meme pour un bloc franchement plein rang,
+    ! et inventerait un rang = LCAP au lieu du repli dense correct.
+    ! MARGIN_OK trace donc explicitement laquelle des deux conditions
+    ! d'arret a declenche la sortie de boucle, pour que la decision finale
+    ! s'appuie dessus plutot que sur une relecture de R seul.
+    L = MIN(2*OVS, MN, LCAP)
+    IGROW = 0
+    MARGIN_OK = .FALSE.
+    DO
+      IF (ALLOCATED(UFULL)) DEALLOCATE(UFULL, VTHAT, S)
+      ALLOCATE(UFULL(M,L), VTHAT(L,N), S(L))
+      CALL RSVD_RANGE_SVD(M, N, B, LDB, L, NPOW, S, UFULL, VTHAT)
+
+      THRESH = TOL * MAX(S(1), TINY(1.0_WP))
+      R = 0
+      DO I = 1, L
+        IF (S(I) .GT. THRESH) R = R + 1
+      END DO
+
+      IF (R .LE. L-OVS) THEN
+        MARGIN_OK = .TRUE.
+        EXIT
+      END IF
+      IF (L .GE. LCAP .OR. L .GE. MN) EXIT   ! plafond atteint, marge JAMAIS satisfaite -- abandon
+      LNEW = MIN(2*L, MN, LCAP)
+      IF (LNEW .LE. L) EXIT   ! plus de marge de croissance possible
+      L = LNEW
+      IGROW = IGROW + 1
+    END DO
+    IF (PRESENT(N_GROWTHS)) N_GROWTHS = IGROW
+
+    IF (MARGIN_OK) THEN
+      ! Rang DIGNE DE CONFIANCE (marge de sur-echantillonnage non
+      ! consommee) -- R est de toute facon <= L <= LCAP < RATIO*MN a ce
+      ! stade, la compression est automatiquement rentable.
+      BLK%IS_LOWRANK = .TRUE.
+      BLK%RANK = R
+      ALLOCATE(BLK%UFAC(M,R), BLK%VFAC(R,N))
+      BLK%UFAC = UFULL(1:M,1:R)
+      DO I = 1, R
+        BLK%VFAC(I,1:N) = S(I) * VTHAT(I,1:N)
+      END DO
+    ELSE
+      ! Repli dense, EXACTEMENT comme COMPRESS_BLOCK -- pas de SVD
+      ! supplementaire : soit la marge n'a jamais ete satisfaite avant le
+      ! plafond (bloc pas assez compressible, R n'est PAS fiable), soit le
+      ! bloc est trop petit pour meme atteindre LCAP.
+      BLK%IS_LOWRANK = .FALSE.
+      ALLOCATE(BLK%DENSE(M,N))
+      BLK%DENSE = B(1:M,1:N)
+    END IF
+    DEALLOCATE(UFULL, VTHAT, S)
+  END SUBROUTINE COMPRESS_BLOCK_RSVD_ADAPTIVE
+
+  !-----------------------------------------------------------------------
+  ! Reconstruit la forme dense d'un bloc (compresse ou non) -- utilise pour
+  ! les tests et pour EXPAND explicite si besoin.
+  !-----------------------------------------------------------------------
+  SUBROUTINE EXPAND_BLOCK(BLK, OUT, LDOUT)
+    TYPE(BLR_BLOCK_T), INTENT(IN) :: BLK
+    INTEGER, INTENT(IN)           :: LDOUT
+    COMPLEX(WP), INTENT(OUT)      :: OUT(LDOUT,BLK%N)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, BLK%N, BLK%RANK, &
+                  CONE, BLK%UFAC, BLK%M, BLK%VFAC, BLK%RANK, CZERO, OUT, LDOUT)
+    ELSE
+      OUT(1:BLK%M,1:BLK%N) = BLK%DENSE
+    END IF
+  END SUBROUTINE EXPAND_BLOCK
+
+  !-----------------------------------------------------------------------
+  ! Mise a jour de Schur d'un bloc de la sous-matrice restante :
+  !     A22 <- A22 - L*U
+  ! avec L (MI x KW, decrit par LBLK) et U (KW x NJ, decrit par UBLK),
+  ! chacun dense OU basse-rang -- 4 cas geres explicitement, chacun choisi
+  ! pour minimiser le nombre d'operations quand un ou deux facteurs sont
+  ! basse-rang (c'est le coeur du gain de performance BLR).
+  !-----------------------------------------------------------------------
+  SUBROUTINE SCHUR_UPDATE_BLOCK(MI, NJ, KW, LBLK, UBLK, A22, LDA)
+    INTEGER, INTENT(IN)             :: MI, NJ, KW, LDA
+    TYPE(BLR_BLOCK_T), INTENT(IN)   :: LBLK, UBLK
+    COMPLEX(WP), INTENT(INOUT)      :: A22(LDA,NJ)
+
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: T(:,:), T1(:,:), T2(:,:)
+
+    IF (MI.EQ.0 .OR. NJ.EQ.0 .OR. KW.EQ.0) RETURN
+
+    IF (.NOT.LBLK%IS_LOWRANK .AND. .NOT.UBLK%IS_LOWRANK) THEN
+      ! Dense x Dense : GEMM classique (identique a l'etape 1)
+      CALL CGEMM('No transpose', 'No transpose', MI, NJ, KW, -CONE, &
+                  LBLK%DENSE, MI, UBLK%DENSE, KW, CONE, A22, LDA)
+
+    ELSE IF (LBLK%IS_LOWRANK .AND. .NOT.UBLK%IS_LOWRANK) THEN
+      ! (UL*VL) x U_dense : T = VL*U_dense (RxNJ), A22 -= UL*T
+      ALLOCATE(T(LBLK%RANK,NJ))
+      CALL CGEMM('No transpose', 'No transpose', LBLK%RANK, NJ, KW, &
+                  CONE, LBLK%VFAC, LBLK%RANK, UBLK%DENSE, KW, CZERO, T, LBLK%RANK)
+      CALL CGEMM('No transpose', 'No transpose', MI, NJ, LBLK%RANK, &
+                  -CONE, LBLK%UFAC, MI, T, LBLK%RANK, CONE, A22, LDA)
+      DEALLOCATE(T)
+
+    ELSE IF (.NOT.LBLK%IS_LOWRANK .AND. UBLK%IS_LOWRANK) THEN
+      ! L_dense x (UU*VU) : T = L_dense*UU (MIxR), A22 -= T*VU
+      ALLOCATE(T(MI,UBLK%RANK))
+      CALL CGEMM('No transpose', 'No transpose', MI, UBLK%RANK, KW, &
+                  CONE, LBLK%DENSE, MI, UBLK%UFAC, KW, CZERO, T, MI)
+      CALL CGEMM('No transpose', 'No transpose', MI, NJ, UBLK%RANK, &
+                  -CONE, T, MI, UBLK%VFAC, UBLK%RANK, CONE, A22, LDA)
+      DEALLOCATE(T)
+
+    ELSE
+      ! (UL*VL) x (UU*VU) : T1 = VL*UU (R1xR2, PETIT), T2 = T1*VU (R1xNJ),
+      ! A22 -= UL*T2 -- jamais de matrice KW-large formee explicitement.
+      ALLOCATE(T1(LBLK%RANK,UBLK%RANK), T2(LBLK%RANK,NJ))
+      CALL CGEMM('No transpose', 'No transpose', LBLK%RANK, UBLK%RANK, KW, &
+                  CONE, LBLK%VFAC, LBLK%RANK, UBLK%UFAC, KW, CZERO, T1, LBLK%RANK)
+      CALL CGEMM('No transpose', 'No transpose', LBLK%RANK, NJ, UBLK%RANK, &
+                  CONE, T1, LBLK%RANK, UBLK%VFAC, UBLK%RANK, CZERO, T2, LBLK%RANK)
+      CALL CGEMM('No transpose', 'No transpose', MI, NJ, LBLK%RANK, &
+                  -CONE, LBLK%UFAC, MI, T2, LBLK%RANK, CONE, A22, LDA)
+      DEALLOCATE(T1, T2)
+    END IF
+  END SUBROUTINE SCHUR_UPDATE_BLOCK
+
+  !-----------------------------------------------------------------------
+  ! OPTIMISATION (suite au constat des ~835s de factorisation a N=10000
+  ! dans blr_matrix_mod.f90, causees par ~NBLK^3/3 SVD MIxNJ COMPLETES --
+  ! une par mise a jour de Schur hors-diagonale, via l'ancien schema
+  ! EXPAND -> SCHUR_UPDATE_BLOCK -> COMPRESS_BLOCK systematique) :
+  !
+  ! PRINCIPE : le produit L*U (L=LBLK MIxKW, U=UBLK KWxNJ) admet DEJA une
+  ! representation basse-rang bon marche, SANS jamais former le MIxNJ
+  ! complet, des que L OU U est basse-rang (COMPUTE_LU_PRODUCT -- seul le
+  ! cas dense x dense force un produit plein, cout MIxKWxNJ inevitable).
+  ! Si en plus le bloc A cible est LUI-MEME basse-rang, alors
+  ! A - L*U = concatenation de deux termes basse-rang (rang RA+RP), qu'on
+  ! recompresse a bas cout via QR + SVD du "coeur" (RA+RP)x(RA+RP) SEUL
+  ! (FAST_RECOMPRESS) -- jamais de SVD MIxNJ.
+  !
+  ! DEUX CAS geres par SCHUR_UPDATE_BLR_BLOCK, comme demande :
+  !   1) A OU L*U non basse-rang (ou rang recompresse trop grand par
+  !      rapport a MIN(MI,NJ), voir FAST_RECOMPRESS/RMAX) -> bascule en
+  !      dense (expand + soustraction, LR-aware quand possible cote
+  !      SUBTRACT_PRODUCT_DENSE).
+  !   2) A ET L*U basse-rang -> reste en low-rank (concatenation des
+  !      facteurs + compression rapide).
+  !-----------------------------------------------------------------------
+  SUBROUTINE COMPUTE_LU_PRODUCT(MI, NJ, KW, LBLK, UBLK, PBLK)
+    INTEGER, INTENT(IN)             :: MI, NJ, KW
+    TYPE(BLR_BLOCK_T), INTENT(IN)   :: LBLK, UBLK
+    TYPE(BLR_BLOCK_T), INTENT(OUT)  :: PBLK
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: T(:,:)
+
+    PBLK%M = MI
+    PBLK%N = NJ
+
+    IF (.NOT.LBLK%IS_LOWRANK .AND. .NOT.UBLK%IS_LOWRANK) THEN
+      ! dense x dense : produit force dense (GEMM plein, cout inevitable)
+      PBLK%IS_LOWRANK = .FALSE.
+      ALLOCATE(PBLK%DENSE(MI,NJ))
+      CALL CGEMM('No transpose', 'No transpose', MI, NJ, KW, CONE, &
+                  LBLK%DENSE, MI, UBLK%DENSE, KW, CZERO, PBLK%DENSE, MI)
+
+    ELSE IF (LBLK%IS_LOWRANK .AND. .NOT.UBLK%IS_LOWRANK) THEN
+      ! (UL*VL) x U_dense : produit basse-rang de rang RL, T=VL*U_dense
+      PBLK%IS_LOWRANK = .TRUE.
+      PBLK%RANK = LBLK%RANK
+      ALLOCATE(PBLK%UFAC(MI,LBLK%RANK), PBLK%VFAC(LBLK%RANK,NJ))
+      PBLK%UFAC = LBLK%UFAC
+      CALL CGEMM('No transpose', 'No transpose', LBLK%RANK, NJ, KW, CONE, &
+                  LBLK%VFAC, LBLK%RANK, UBLK%DENSE, KW, CZERO, PBLK%VFAC, LBLK%RANK)
+
+    ELSE IF (.NOT.LBLK%IS_LOWRANK .AND. UBLK%IS_LOWRANK) THEN
+      ! L_dense x (UU*VU) : produit basse-rang de rang RU, T=L_dense*UU
+      PBLK%IS_LOWRANK = .TRUE.
+      PBLK%RANK = UBLK%RANK
+      ALLOCATE(PBLK%UFAC(MI,UBLK%RANK), PBLK%VFAC(UBLK%RANK,NJ))
+      CALL CGEMM('No transpose', 'No transpose', MI, UBLK%RANK, KW, CONE, &
+                  LBLK%DENSE, MI, UBLK%UFAC, KW, CZERO, PBLK%UFAC, MI)
+      PBLK%VFAC = UBLK%VFAC
+
+    ELSE
+      ! (UL*VL) x (UU*VU) : produit basse-rang, rang = min(RL,RU) choisi
+      ! pour minimiser le cout (jamais de matrice KW-large formee)
+      PBLK%IS_LOWRANK = .TRUE.
+      ALLOCATE(T(LBLK%RANK,UBLK%RANK))
+      CALL CGEMM('No transpose', 'No transpose', LBLK%RANK, UBLK%RANK, KW, CONE, &
+                  LBLK%VFAC, LBLK%RANK, UBLK%UFAC, KW, CZERO, T, LBLK%RANK)
+      IF (LBLK%RANK .LE. UBLK%RANK) THEN
+        PBLK%RANK = LBLK%RANK
+        ALLOCATE(PBLK%UFAC(MI,LBLK%RANK), PBLK%VFAC(LBLK%RANK,NJ))
+        PBLK%UFAC = LBLK%UFAC
+        CALL CGEMM('No transpose', 'No transpose', LBLK%RANK, NJ, UBLK%RANK, CONE, &
+                    T, LBLK%RANK, UBLK%VFAC, UBLK%RANK, CZERO, PBLK%VFAC, LBLK%RANK)
+      ELSE
+        PBLK%RANK = UBLK%RANK
+        ALLOCATE(PBLK%UFAC(MI,UBLK%RANK), PBLK%VFAC(UBLK%RANK,NJ))
+        PBLK%VFAC = UBLK%VFAC
+        CALL CGEMM('No transpose', 'No transpose', MI, UBLK%RANK, LBLK%RANK, CONE, &
+                    LBLK%UFAC, MI, T, LBLK%RANK, CZERO, PBLK%UFAC, MI)
+      END IF
+      DEALLOCATE(T)
+    END IF
+  END SUBROUTINE COMPUTE_LU_PRODUCT
+
+  !-----------------------------------------------------------------------
+  ! Applique a BLK la MEME sequence de permutations de lignes que celle
+  ! produite par un CGETRF sur les KW premieres lignes de son bloc-ligne
+  ! (convention LAPACK/CLASWP : pour I=1..KW, si IPIV(I).NE.I, echanger la
+  ! ligne I et la ligne IPIV(I) -- PAS un vecteur de permutation a appliquer
+  ! d'un coup, une SEQUENCE ordonnee de swaps).
+  !
+  ! POURQUOI CA RESTE BON MARCHE EN BLR (le point cle qui rend le pivot
+  ! confine au bloc diagonal compatible avec la compression) : permuter
+  ! des lignes d'un bloc bas-rang A~=UFAC*VFAC ne touche que UFAC (VFAC
+  ! n'a aucune notion de ligne) -- cout O(rang) par swap, jamais de
+  ! decompression. Cas dense : swap direct sur DENSE, cout O(N) par swap
+  ! (standard).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_BLOCK_ROW_SWAP(BLK, KW, IPIV)
+    TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
+    INTEGER, INTENT(IN) :: KW, IPIV(KW)
+    INTEGER :: I
+    IF (BLK%M .EQ. 0 .OR. BLK%N .EQ. 0) RETURN
+    IF (BLK%IS_LOWRANK) THEN
+      DO I = 1, KW
+        IF (IPIV(I) .NE. I) CALL CSWAP(BLK%RANK, BLK%UFAC(I,1), KW, BLK%UFAC(IPIV(I),1), KW)
+      END DO
+    ELSE
+      DO I = 1, KW
+        IF (IPIV(I) .NE. I) CALL CSWAP(BLK%N, BLK%DENSE(I,1), KW, BLK%DENSE(IPIV(I),1), KW)
+      END DO
+    END IF
+  END SUBROUTINE BLR_BLOCK_ROW_SWAP
+
+  !-----------------------------------------------------------------------
+  ! A(MIxNJ) -= PBLK (dense ou basse-rang) -- jamais besoin d'expanser
+  ! PBLK si low-rank (CGEMM direct avec ses facteurs).
+  !-----------------------------------------------------------------------
+  SUBROUTINE SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, A)
+    INTEGER, INTENT(IN)           :: MI, NJ
+    TYPE(BLR_BLOCK_T), INTENT(IN) :: PBLK
+    COMPLEX(WP), INTENT(INOUT)    :: A(MI,NJ)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+
+    IF (PBLK%IS_LOWRANK) THEN
+      CALL CGEMM('No transpose', 'No transpose', MI, NJ, PBLK%RANK, -CONE, &
+                  PBLK%UFAC, MI, PBLK%VFAC, PBLK%RANK, CONE, A, MI)
+    ELSE
+      A = A - PBLK%DENSE
+    END IF
+  END SUBROUTINE SUBTRACT_PRODUCT_DENSE
+
+  !-----------------------------------------------------------------------
+  ! Recompresse C = UA*VA - PU*PV (MIxNJ, rang RA+RP en entree) SANS
+  ! jamais former le MIxNJ complet : QR de [UA|-PU] (MIx(RA+RP)) et QR de
+  ! la transposee de [VA;PV] (NJx(RA+RP)), puis SVD COMPLETE du "coeur"
+  ! (RA+RP)x(RA+RP) SEULEMENT -- typiquement quelques dizaines de lignes/
+  ! colonnes, donc bien moins cher qu'une SVD MIxNJ complete.
+  !
+  ! Note sur la transposee : Vcat = [VA;PV] n'est jamais formee comme
+  ! telle -- on construit directement VCATT = transpose(Vcat) (NJxRTOT),
+  ! on en prend la QR (VCATT = QV*RV), d'ou Vcat = RV^T * QV^T par simple
+  ! transposition de l'egalite -- transposee ORDINAIRE (CGEMM 'Transpose'),
+  ! PAS conjuguee, puisqu'aucune conjugaison n'intervient dans cette
+  ! derivation purement algebrique.
+  !
+  ! OK=.FALSE. si le rang tronque a TOL depasse RMAX (l'appelant doit
+  ! alors passer le bloc en dense) OU si RA+RP >= MIN(MI,NJ) (recompression
+  ! sans objet -- sortie immediate avant tout calcul).
+  !-----------------------------------------------------------------------
+  ! WS (optionnel) : workspace pre-alloue reutilise pour TOUS les tableaux
+  ! de travail (QR + petite SVD) -- AUCUNE allocation dans cette routine si
+  ! fourni (RA+RP doivent etre <= WS%MAXDIM, deja garanti par le test RMAX
+  ! ci-dessous des lors que RMAX <= WS%MAXDIM). Absent : comportement
+  ! d'origine (allocation/desallocation locale a chaque appel).
+  SUBROUTINE FAST_RECOMPRESS(MI, NJ, RA, UA, VA, RP, PU, PV, TOL, RMAX, NEWBLK, OK, WS)
+    INTEGER, INTENT(IN)            :: MI, NJ, RA, RP, RMAX
+    COMPLEX(WP), INTENT(IN)        :: UA(MI,RA), VA(RA,NJ), PU(MI,RP), PV(RP,NJ)
+    REAL(WP), INTENT(IN)           :: TOL
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: NEWBLK
+    LOGICAL, INTENT(OUT)           :: OK
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
+
+    INTEGER :: RTOT, R, I, LWORK, INFO, LDU, LDVQ, LDSQ, LDSV
+    COMPLEX(WP), ALLOCATABLE, TARGET :: UCAT_LOC(:,:), VCATT_LOC(:,:), TAUU_LOC(:), TAUV_LOC(:)
+    COMPLEX(WP), ALLOCATABLE, TARGET :: RU_LOC(:,:), RV_LOC(:,:), W_LOC(:,:), UW_LOC(:,:), VWH_LOC(:,:)
+    COMPLEX(WP), ALLOCATABLE, TARGET :: SVWH_LOC(:,:), CWORK_LOC(:)
+    REAL(WP), ALLOCATABLE, TARGET    :: SW_LOC(:), RWORK_LOC(:)
+    COMPLEX(WP), POINTER :: UCAT(:,:), VCATT(:,:), TAUU(:), TAUV(:)
+    COMPLEX(WP), POINTER :: RU(:,:), RV(:,:), WMAT(:,:), UW(:,:), VWH(:,:), SVWH(:,:), CWORK(:)
+    REAL(WP), POINTER :: SW(:), RWORK(:)
+    REAL(WP) :: THRESH
+    DOUBLE PRECISION :: TP0
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+
+    RTOT = RA + RP
+    IF (RTOT .GE. MIN(MI,NJ) .OR. RTOT .GT. RMAX) THEN
+      OK = .FALSE.
+      RETURN
+    END IF
+
+    IF (PRESENT(WS)) THEN
+      IF (RTOT .GT. WS%LDR) THEN          ! espace de factorisation trop petit : repli dense
+        OK = .FALSE.
+        RETURN
+      END IF
+      LDU = WS%MAXDIM; LDVQ = WS%MAXDIM; LDSQ = WS%LDR
+      UCAT => WS%UCAT; VCATT => WS%VCATT; TAUU => WS%TAUU; TAUV => WS%TAUV
+      RU => WS%RU; RV => WS%RV; WMAT => WS%WMAT; UW => WS%UW; VWH => WS%VWH
+      SW => WS%SW; RWORK => WS%RWORK2; CWORK => WS%CWORK2
+      LWORK = SIZE(CWORK)
+    ELSE
+      LDU = MI; LDVQ = NJ; LDSQ = RTOT
+      ALLOCATE(UCAT_LOC(MI,RTOT), VCATT_LOC(NJ,RTOT), TAUU_LOC(RTOT), TAUV_LOC(RTOT))
+      ALLOCATE(RU_LOC(RTOT,RTOT), RV_LOC(RTOT,RTOT), W_LOC(RTOT,RTOT), UW_LOC(RTOT,RTOT), VWH_LOC(RTOT,RTOT))
+      ALLOCATE(SW_LOC(RTOT), RWORK_LOC(5*RTOT))
+      UCAT => UCAT_LOC; VCATT => VCATT_LOC; TAUU => TAUU_LOC; TAUV => TAUV_LOC
+      RU => RU_LOC; RV => RV_LOC; WMAT => W_LOC; UW => UW_LOC; VWH => VWH_LOC
+      SW => SW_LOC; RWORK => RWORK_LOC
+      ALLOCATE(CWORK_LOC(1))
+      LWORK = -1
+      CALL CGEQRF(MI, RTOT, UCAT, LDU, TAUU, CWORK_LOC, LWORK, INFO)
+      LWORK = INT(REAL(CWORK_LOC(1)))
+      CALL CUNGQR(MI, RTOT, RTOT, UCAT, LDU, TAUU, CWORK_LOC, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      CALL CGEQRF(NJ, RTOT, VCATT, LDVQ, TAUV, CWORK_LOC, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      CALL CUNGQR(NJ, RTOT, RTOT, VCATT, LDVQ, TAUV, CWORK_LOC, -1, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      CALL CGESVD('S', 'S', RTOT, RTOT, WMAT, LDSQ, SW, UW, LDSQ, VWH, LDSQ, CWORK_LOC, -1, RWORK, INFO)
+      LWORK = MAX(LWORK, INT(REAL(CWORK_LOC(1))))
+      DEALLOCATE(CWORK_LOC)
+      ALLOCATE(CWORK_LOC(MAX(LWORK,1)))
+      CWORK => CWORK_LOC
+    END IF
+
+    IF (SCHUR_PROF) TP0 = BLR_WALLTIME()
+    UCAT(1:MI,1:RA)      = UA
+    UCAT(1:MI,RA+1:RTOT) = -PU
+
+    DO I = 1, RA
+      VCATT(1:NJ,I) = VA(I,1:NJ)
+    END DO
+    DO I = 1, RP
+      VCATT(1:NJ,RA+I) = PV(I,1:NJ)
+    END DO
+
+    ! QR de UCAT -> QU (ecrase UCAT), RU
+    CALL CGEQRF(MI, RTOT, UCAT, LDU, TAUU, CWORK, LWORK, INFO)
+    RU(1:RTOT,1:RTOT) = CZERO
+    DO I = 1, RTOT
+      RU(1:I,I) = UCAT(1:I,I)
+    END DO
+    CALL CUNGQR(MI, RTOT, RTOT, UCAT, LDU, TAUU, CWORK, LWORK, INFO)
+    ! UCAT contient maintenant QU (MI x RTOT)
+    IF (SCHUR_PROF) CALL PROF_LAP(1, TP0)
+
+    ! QR de VCATT -> QV (ecrase VCATT), RV
+    CALL CGEQRF(NJ, RTOT, VCATT, LDVQ, TAUV, CWORK, LWORK, INFO)
+    RV(1:RTOT,1:RTOT) = CZERO
+    DO I = 1, RTOT
+      RV(1:I,I) = VCATT(1:I,I)
+    END DO
+    CALL CUNGQR(NJ, RTOT, RTOT, VCATT, LDVQ, TAUV, CWORK, LWORK, INFO)
+    ! VCATT contient maintenant QV (NJ x RTOT)
+    IF (SCHUR_PROF) CALL PROF_LAP(2, TP0)
+
+    ! W = RU * RV^T (transposee ORDINAIRE -- voir note ci-dessus)
+    CALL CGEMM('No transpose', 'Transpose', RTOT, RTOT, RTOT, CONE, &
+                RU, LDSQ, RV, LDSQ, CZERO, WMAT, LDSQ)
+
+    CALL CGESVD('S', 'S', RTOT, RTOT, WMAT, LDSQ, SW, UW, LDSQ, VWH, LDSQ, CWORK, LWORK, RWORK, INFO)
+    IF (SCHUR_PROF) CALL PROF_LAP(3, TP0)
+
+    IF (INFO .NE. 0) THEN
+      OK = .FALSE.
+      IF (.NOT. PRESENT(WS)) DEALLOCATE(UCAT_LOC, VCATT_LOC, TAUU_LOC, TAUV_LOC, RU_LOC, RV_LOC, &
+                                         W_LOC, UW_LOC, VWH_LOC, SW_LOC, RWORK_LOC, CWORK_LOC)
+      RETURN
+    END IF
+
+    THRESH = TOL * MAX(SW(1), TINY(1.0_WP))
+    R = 0
+    DO I = 1, RTOT
+      IF (SW(I) .GT. THRESH) R = R + 1
+    END DO
+    R = MAX(R, 1)
+
+    IF (R .GT. RMAX) THEN
+      OK = .FALSE.
+    ELSE
+      OK = .TRUE.
+      NEWBLK%IS_LOWRANK = .TRUE.
+      NEWBLK%M = MI; NEWBLK%N = NJ; NEWBLK%RANK = R
+      ALLOCATE(NEWBLK%UFAC(MI,R), NEWBLK%VFAC(R,NJ))
+      CALL CGEMM('No transpose', 'No transpose', MI, R, RTOT, CONE, &
+                  UCAT, LDU, UW, LDSQ, CZERO, NEWBLK%UFAC, MI)
+
+      IF (PRESENT(WS)) THEN
+        LDSV = WS%LDR
+        SVWH => WS%SVWH
+      ELSE
+        LDSV = R
+        ALLOCATE(SVWH_LOC(R,RTOT))
+        SVWH => SVWH_LOC
+      END IF
+      DO I = 1, R
+        SVWH(I,1:RTOT) = SW(I) * VWH(I,1:RTOT)
+      END DO
+      CALL CGEMM('No transpose', 'Transpose', R, NJ, RTOT, CONE, &
+                  SVWH, LDSV, VCATT, LDVQ, CZERO, NEWBLK%VFAC, R)
+      ! UFAC = QU*UW et VFAC = diag(SW)*(VWH*QV^T) : bases orthonormees.
+      NEWBLK%ORTHO = .TRUE.
+      ALLOCATE(NEWBLK%SV(R))
+      NEWBLK%SV = SW(1:R)
+      IF (.NOT. PRESENT(WS)) DEALLOCATE(SVWH_LOC)
+      IF (SCHUR_PROF) THEN
+        CALL PROF_LAP(4, TP0)
+        SPROF_R(1) = SPROF_R(1) + RA; SPROF_R(2) = SPROF_R(2) + RP; SPROF_R(3) = SPROF_R(3) + R
+      END IF
+    END IF
+
+    IF (.NOT. PRESENT(WS)) DEALLOCATE(UCAT_LOC, VCATT_LOC, TAUU_LOC, TAUV_LOC, RU_LOC, RV_LOC, &
+                                       W_LOC, UW_LOC, VWH_LOC, SW_LOC, RWORK_LOC, CWORK_LOC)
+  END SUBROUTINE FAST_RECOMPRESS
+
+  !-----------------------------------------------------------------------
+  ! Point d'entree : ABLK <- ABLK - L*U, ABLK restant COMPRESSE si possible
+  ! (voir le commentaire de tete de bloc ci-dessus pour les 2 cas geres).
+  !
+  ! T_PRODUCT/T_RECOMP (optionnels, INTENT(INOUT), CUMULES par l'appelant --
+  ! initialiser a 0 avant la premiere boucle) : instrumentation demandee
+  ! pour distinguer, a l'interieur d'UNE mise a jour de Schur, le temps
+  ! passe a CALCULER le produit L*U ("Schur sans compression" -- inclut
+  ! aussi le repli dense EXPAND_BLOCK/SUBTRACT_PRODUCT_DENSE quand il a
+  ! lieu) du temps passe a le RECOMPRESSER (FAST_RECOMPRESS seul). Non
+  ! fournis (defaut) : zero surcout, comportement inchange -- sans danger
+  ! pour les appelants existants (blr_matrix_mod.f90 sous !$OMP PARALLEL DO,
+  ! qui ne les passe pas).
+  !-----------------------------------------------------------------------
+  ! USE_MOVE_ALLOC (optionnel, defaut .FALSE. = comportement INCHANGE) :
+  ! DIAGNOSTIC/OPTIMISATION EN COURS D'EVALUATION (voir la memoire du
+  ! projet -- ecart RSS-vs-theorique de MPI_BLR_MATRIX_LU_FACTOR_PIVOT).
+  ! Par defaut, "ABLK = NEWBLK" (assignation Fortran de type derive a
+  ! composantes ALLOCATABLE) declenche une REALLOCATION IMPLICITE de
+  ! ABLK%UFAC/VFAC a la forme de NEWBLK PUIS une COPIE -- meme si NEWBLK
+  ! vient d'etre alloue a la bonne taille, c'est un DEUXIEME cycle
+  ! allocation/copie en plus du premier (dans FAST_RECOMPRESS). Avec
+  ! USE_MOVE_ALLOC=.TRUE., on desalloue explicitement l'ancien contenu de
+  ! ABLK puis on TRANSFERE la propriete des tableaux de NEWBLK/DENSE_TMP
+  ! vers ABLK via MOVE_ALLOC (aucune copie, aucune reallocation
+  ! supplementaire) -- resultat numerique IDENTIQUE, seul le nombre de
+  ! cycles allocate/deallocate change.
+  SUBROUTINE SCHUR_UPDATE_BLR_BLOCK(ABLK, MI, NJ, KW, LBLK, UBLK, TOL, WS, T_PRODUCT, T_RECOMP, USE_MOVE_ALLOC)
+    TYPE(BLR_BLOCK_T), INTENT(INOUT) :: ABLK
+    INTEGER, INTENT(IN)              :: MI, NJ, KW
+    TYPE(BLR_BLOCK_T), INTENT(IN)    :: LBLK, UBLK
+    REAL(WP), INTENT(IN)             :: TOL
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT), OPTIONAL, TARGET :: WS
+    DOUBLE PRECISION, INTENT(INOUT), OPTIONAL :: T_PRODUCT, T_RECOMP
+    LOGICAL, INTENT(IN), OPTIONAL     :: USE_MOVE_ALLOC
+
+    TYPE(BLR_BLOCK_T) :: PBLK, NEWBLK, DENSEBLK
+    COMPLEX(WP), ALLOCATABLE :: DENSE_TMP(:,:)
+    INTEGER :: RMAX, ICASE
+    LOGICAL :: OK, MOVEALLOC_ON
+    DOUBLE PRECISION :: TT0, TS0
+
+    IF (MI.EQ.0 .OR. NJ.EQ.0 .OR. KW.EQ.0) RETURN
+    IF (SCHUR_PROF) TS0 = BLR_WALLTIME()
+
+    MOVEALLOC_ON = .FALSE.
+    IF (PRESENT(USE_MOVE_ALLOC)) MOVEALLOC_ON = USE_MOVE_ALLOC
+
+    IF (PRESENT(T_PRODUCT)) TT0 = BLR_WALLTIME()
+    CALL COMPUTE_LU_PRODUCT(MI, NJ, KW, LBLK, UBLK, PBLK)
+    IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (BLR_WALLTIME() - TT0)
+    IF (SCHUR_PROF) SPROF_TP = SPROF_TP + (BLR_WALLTIME() - TS0)
+    ICASE = 1
+    IF (ABLK%IS_LOWRANK) ICASE = MERGE(3, 4, PBLK%IS_LOWRANK)
+    IF (WORK_COUNT) THEN
+      IF (ABLK%IS_LOWRANK .AND. PBLK%IS_LOWRANK) THEN
+        SCHUR_WORK = SCHUR_WORK + DBLE(MI+NJ)*DBLE(ABLK%RANK+PBLK%RANK)**2
+      ELSE IF (PBLK%IS_LOWRANK) THEN
+        SCHUR_WORK = SCHUR_WORK + DBLE(MI)*DBLE(NJ)*DBLE(PBLK%RANK)
+      ELSE
+        SCHUR_WORK = SCHUR_WORK + DBLE(MI)*DBLE(NJ)*DBLE(KW)
+      END IF
+    END IF
+
+    IF (ABLK%IS_LOWRANK .AND. PBLK%IS_LOWRANK) THEN
+      ! cas 2 : A et L*U basse-rang -> tenter de rester en low-rank
+      RMAX = MAX(1, INT(COMPRESS_WORTHWHILE_RATIO*REAL(MIN(MI,NJ),WP)) - 1)
+      IF (PRESENT(T_RECOMP)) TT0 = BLR_WALLTIME()
+      IF (PRESENT(WS) .AND. ORTHO_RECOMP .AND. ABLK%ORTHO .AND. ALLOCATED(ABLK%SV)) THEN
+        IF (SIZE(ABLK%SV) .EQ. ABLK%RANK) THEN
+          CALL FAST_RECOMPRESS_ORTHO(MI, NJ, ABLK, PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, WS)
+        ELSE
+          CALL FAST_RECOMPRESS(MI, NJ, ABLK%RANK, ABLK%UFAC, ABLK%VFAC, &
+                                PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, WS)
+        END IF
+      ELSE IF (PRESENT(WS)) THEN
+        CALL FAST_RECOMPRESS(MI, NJ, ABLK%RANK, ABLK%UFAC, ABLK%VFAC, &
+                              PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK, WS)
+      ELSE
+        CALL FAST_RECOMPRESS(MI, NJ, ABLK%RANK, ABLK%UFAC, ABLK%VFAC, &
+                              PBLK%RANK, PBLK%UFAC, PBLK%VFAC, TOL, RMAX, NEWBLK, OK)
+      END IF
+      IF (PRESENT(T_RECOMP)) T_RECOMP = T_RECOMP + (BLR_WALLTIME() - TT0)
+      IF (OK) THEN
+        IF (MOVEALLOC_ON) THEN
+          ! transfert de propriete (NEWBLK%UFAC/VFAC deja alloues a la
+          ! bonne taille dans FAST_RECOMPRESS) -- AUCUNE copie, AUCUNE
+          ! reallocation supplementaire, contrairement a "ABLK = NEWBLK".
+          IF (ALLOCATED(ABLK%UFAC))  DEALLOCATE(ABLK%UFAC)
+          IF (ALLOCATED(ABLK%VFAC))  DEALLOCATE(ABLK%VFAC)
+          IF (ALLOCATED(ABLK%DENSE)) DEALLOCATE(ABLK%DENSE)
+          CALL MOVE_ALLOC(NEWBLK%UFAC, ABLK%UFAC)
+          CALL MOVE_ALLOC(NEWBLK%VFAC, ABLK%VFAC)
+          IF (ALLOCATED(ABLK%SV)) DEALLOCATE(ABLK%SV)
+          IF (ALLOCATED(NEWBLK%SV)) CALL MOVE_ALLOC(NEWBLK%SV, ABLK%SV)
+          ABLK%ORTHO = NEWBLK%ORTHO
+          ABLK%IS_LOWRANK = .TRUE.
+          ABLK%M = MI; ABLK%N = NJ; ABLK%RANK = NEWBLK%RANK
+        ELSE
+          ABLK = NEWBLK
+        END IF
+        IF (SCHUR_PROF) THEN
+          SPROF_N(2) = SPROF_N(2) + 1
+          SPROF_T(2) = SPROF_T(2) + (BLR_WALLTIME() - TS0)
+        END IF
+        RETURN
+      END IF
+      ! rang recompresse trop grand -> tombe dans le repli dense ci-dessous
+    END IF
+
+    ! cas 1 (ou repli du cas 2) : A ou L*U non basse-rang -> dense
+    IF (PRESENT(T_PRODUCT)) TT0 = BLR_WALLTIME()
+    ALLOCATE(DENSE_TMP(MI,NJ))
+    CALL EXPAND_BLOCK(ABLK, DENSE_TMP, MI)
+    CALL SUBTRACT_PRODUCT_DENSE(MI, NJ, PBLK, DENSE_TMP)
+    IF (MOVEALLOC_ON) THEN
+      ! meme principe : DENSE_TMP est deja a la bonne taille, transfert
+      ! direct vers ABLK%DENSE au lieu de passer par un DENSEBLK
+      ! intermediaire puis "ABLK = DENSEBLK".
+      IF (ALLOCATED(ABLK%UFAC))  DEALLOCATE(ABLK%UFAC)
+      IF (ALLOCATED(ABLK%VFAC))  DEALLOCATE(ABLK%VFAC)
+      IF (ALLOCATED(ABLK%DENSE)) DEALLOCATE(ABLK%DENSE)
+      CALL MOVE_ALLOC(DENSE_TMP, ABLK%DENSE)
+      IF (ALLOCATED(ABLK%SV)) DEALLOCATE(ABLK%SV)
+      ABLK%ORTHO = .FALSE.
+      ABLK%IS_LOWRANK = .FALSE.
+      ABLK%M = MI; ABLK%N = NJ
+    ELSE
+      DENSEBLK%IS_LOWRANK = .FALSE.
+      DENSEBLK%M = MI; DENSEBLK%N = NJ
+      CALL MOVE_ALLOC(DENSE_TMP, DENSEBLK%DENSE)
+      ABLK = DENSEBLK
+    END IF
+    IF (PRESENT(T_PRODUCT)) T_PRODUCT = T_PRODUCT + (BLR_WALLTIME() - TT0)
+    IF (SCHUR_PROF) THEN
+      SPROF_N(ICASE) = SPROF_N(ICASE) + 1
+      SPROF_T(ICASE) = SPROF_T(ICASE) + (BLR_WALLTIME() - TS0)
+    END IF
+  END SUBROUTINE SCHUR_UPDATE_BLR_BLOCK
+
+  !-----------------------------------------------------------------------
+  ! Recompression INCREMENTALE de C = A - PU*PV pour un bloc cible ORTHO :
+  ! A = U*diag(S)*Wc^T, U (MI x RA) et Wc (NJ x RA) a colonnes orthonormees
+  ! (Wc^T = diag(1/S)*VFAC), S = ABLK%SV. Au lieu de re-orthonormaliser les
+  ! RA+RP colonnes de [U|-PU] et de [VA;PV]^T (FAST_RECOMPRESS), on projette
+  ! la mise a jour sur les bases existantes (ORTHO_RESIDUAL : PU = U*X +
+  ! Q1*B1, PV^T = Wc*Y + Q2*B2, Q1 et Q2 orthonormees et orthogonales aux
+  ! bases), d'ou
+  !   C = [U Q1] * K * [Wc Q2]^T,  K = diag(S, 0) - [X;B1]*[Y;B2]^T,
+  ! puis SVD du coeur K (au plus (RA+RP) x (RA+RP), comme FAST_RECOMPRESS)
+  ! et meme troncature (TOL relatif a la plus grande valeur singuliere).
+  ! Meme matrice C, meme critere : resultat identique aux arrondis pres ;
+  ! QR de largeur RP seulement, aucune QR de la base existante. La sortie
+  ! verifie de nouveau les invariants ORTHO. Memes conditions de sortie
+  ! OK = .FALSE. que FAST_RECOMPRESS (RA+RP >= MIN(MI,NJ), rang > RMAX).
+  ! Tableaux de travail de taille MI ou NJ pris dans WS (UCAT, VCATT,
+  ! BCOPY, UFULL, VTFULL, de dimension principale WS%MAXDIM).
+  !-----------------------------------------------------------------------
+  SUBROUTINE FAST_RECOMPRESS_ORTHO(MI, NJ, ABLK, RP, PU, PV, TOL, RMAX, NEWBLK, OK, WS)
+    INTEGER, INTENT(IN)            :: MI, NJ, RP, RMAX
+    TYPE(BLR_BLOCK_T), INTENT(IN)  :: ABLK
+    COMPLEX(WP), INTENT(IN)        :: PU(MI,RP), PV(RP,NJ)
+    REAL(WP), INTENT(IN)           :: TOL
+    TYPE(BLR_BLOCK_T), INTENT(OUT) :: NEWBLK
+    LOGICAL, INTENT(OUT)           :: OK
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT) :: WS
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: X(:,:), Y(:,:), B1(:,:), B2(:,:), L1(:,:), L2(:,:), KM(:,:), UK(:,:), VKT(:,:), CWL(:)
+    REAL(WP), ALLOCATABLE :: SK(:), RWK(:)
+    INTEGER, ALLOCATABLE :: IWK(:)
+    INTEGER :: RA, R1, R2, K1, K2, KMIN, KMAX, R, I, INFO, LD
+    REAL(WP) :: THRESH
+    DOUBLE PRECISION :: TP0
+
+    OK = .FALSE.
+    RA = ABLK%RANK
+    IF (RA + RP .GE. MIN(MI,NJ) .OR. RA + RP .GT. RMAX .OR. RA + RP .GT. WS%LDR) RETURN
+    LD = WS%MAXDIM
+    IF (SCHUR_PROF) TP0 = BLR_WALLTIME()
+    ALLOCATE(X(RA,RP), Y(RA,RP), B1(RP,RP), B2(RP,RP))
+
+    ! cote lignes : PU = U*X + Q1*B1 (Q1 dans BCOPY)
+    WS%UCAT(1:MI,1:RP) = PU
+    CALL ORTHO_RESIDUAL(MI, RA, ABLK%UFAC, MI, RP, WS%UCAT, LD, X, WS%BCOPY, LD, B1, R1, WS, INFO)
+    IF (INFO .NE. 0) RETURN
+    IF (SCHUR_PROF) CALL PROF_LAP(1, TP0)
+
+    ! cote colonnes : Wc = (diag(1/S)*VFAC)^T (UFULL), PV^T = Wc*Y + Q2*B2
+    ! (Q2 dans VTFULL)
+    DO I = 1, RA
+      WS%UFULL(1:NJ,I) = ABLK%VFAC(I,1:NJ) / ABLK%SV(I)
+    END DO
+    DO I = 1, RP
+      WS%VCATT(1:NJ,I) = PV(I,1:NJ)
+    END DO
+    CALL ORTHO_RESIDUAL(NJ, RA, WS%UFULL, LD, RP, WS%VCATT, LD, Y, WS%VTFULL, LD, B2, R2, WS, INFO)
+    IF (INFO .NE. 0) RETURN
+    IF (SCHUR_PROF) CALL PROF_LAP(2, TP0)
+
+    ! coeur K = diag(S,0) - [X;B1]*[Y;B2]^T et sa SVD
+    K1 = RA + R1; K2 = RA + R2; KMIN = MIN(K1, K2)
+    ALLOCATE(L1(K1,RP), L2(K2,RP), KM(K1,K2), SK(KMIN), UK(K1,KMIN), VKT(KMIN,K2))
+    L1(1:RA,:) = X
+    IF (R1 .GT. 0) L1(RA+1:K1,:) = B1(1:R1,:)
+    L2(1:RA,:) = Y
+    IF (R2 .GT. 0) L2(RA+1:K2,:) = B2(1:R2,:)
+    KM = CZERO
+    DO I = 1, RA
+      KM(I,I) = CMPLX(ABLK%SV(I), 0.0_WP, WP)
+    END DO
+    CALL CGEMM('No transpose', 'Transpose', K1, K2, RP, -CONE, L1, K1, L2, K2, CONE, KM, K1)
+    ! SVD par diviser-pour-regner (CGESDD) : plus rapide que CGESVD a cette
+    ! taille (coeur au plus (RA+RP) x (RA+RP)). RWORK et IWORK aux tailles
+    ! minimales de LAPACK pour JOBZ = 'S' ; CWORK2 (dimensionne pour un SVD
+    ! MAXDIM x MAXDIM) suffit.
+    KMAX = MAX(K1, K2)
+    ALLOCATE(RWK(MAX(5*KMIN*KMIN + 5*KMIN, 2*KMAX*KMIN + 2*KMIN*KMIN + KMIN)), IWK(8*KMIN))
+    IF (SIZE(WS%CWORK2) .GE. KMIN*KMIN + 2*KMIN + KMAX) THEN
+      CALL CGESDD('S', K1, K2, KM, K1, SK, UK, K1, VKT, KMIN, WS%CWORK2, SIZE(WS%CWORK2), RWK, IWK, INFO)
+    ELSE
+      ALLOCATE(CWL(KMIN*KMIN + 2*KMIN + KMAX))
+      CALL CGESDD('S', K1, K2, KM, K1, SK, UK, K1, VKT, KMIN, CWL, SIZE(CWL), RWK, IWK, INFO)
+    END IF
+    IF (INFO .NE. 0) RETURN
+    THRESH = TOL * MAX(SK(1), TINY(1.0_WP))
+    R = 0
+    DO I = 1, KMIN
+      IF (SK(I) .GT. THRESH) R = R + 1
+    END DO
+    R = MAX(R, 1)
+    IF (SCHUR_PROF) CALL PROF_LAP(3, TP0)
+    IF (R .GT. RMAX) RETURN
+
+    ! UFAC = [U Q1]*UK(:,1:R) ; VFAC = diag(SK)*VKT(1:R,:)*[Wc Q2]^T
+    NEWBLK%IS_LOWRANK = .TRUE.
+    NEWBLK%M = MI; NEWBLK%N = NJ; NEWBLK%RANK = R
+    ALLOCATE(NEWBLK%UFAC(MI,R), NEWBLK%VFAC(R,NJ), NEWBLK%SV(R))
+    CALL CGEMM('No transpose', 'No transpose', MI, R, RA, CONE, ABLK%UFAC, MI, UK, K1, CZERO, NEWBLK%UFAC, MI)
+    IF (R1 .GT. 0) CALL CGEMM('No transpose', 'No transpose', MI, R, R1, CONE, WS%BCOPY, LD, UK(RA+1,1), K1, &
+                              CONE, NEWBLK%UFAC, MI)
+    CALL CGEMM('No transpose', 'Transpose', R, NJ, RA, CONE, VKT, KMIN, WS%UFULL, LD, CZERO, NEWBLK%VFAC, R)
+    IF (R2 .GT. 0) CALL CGEMM('No transpose', 'Transpose', R, NJ, R2, CONE, VKT(1,RA+1), KMIN, WS%VTFULL, LD, &
+                              CONE, NEWBLK%VFAC, R)
+    DO I = 1, R
+      NEWBLK%VFAC(I,1:NJ) = SK(I) * NEWBLK%VFAC(I,1:NJ)
+    END DO
+    NEWBLK%SV = SK(1:R)
+    NEWBLK%ORTHO = .TRUE.
+    IF (SCHUR_PROF) THEN
+      SPROF_NO = SPROF_NO + 1
+      SPROF_RK(1) = SPROF_RK(1) + R1; SPROF_RK(2) = SPROF_RK(2) + R2
+    END IF
+    OK = .TRUE.
+    IF (SCHUR_PROF) THEN
+      CALL PROF_LAP(4, TP0)
+      SPROF_R(1) = SPROF_R(1) + RA; SPROF_R(2) = SPROF_R(2) + RP; SPROF_R(3) = SPROF_R(3) + R
+    END IF
+  END SUBROUTINE FAST_RECOMPRESS_ORTHO
+
+  !-----------------------------------------------------------------------
+  ! Base Q0 (N x RA, colonnes orthonormees) et E (N x RP, ecrase) :
+  ! E = Q0*X + Q*BK aux arrondis pres, Q (N x RK, dans Q/LDQ) a colonnes
+  ! orthonormees et orthogonales a Q0, BK (RK premieres lignes de RP x RP).
+  ! Deux passes de Gram-Schmidt par blocs (stabilite), QR du residu, puis
+  ! SVD de son facteur triangulaire : RK = rang numerique du residu
+  ! (directions de valeur singuliere <= 16 eps ||E||_F ignorees : bruit
+  ! d'arrondi, dont l'orthogonalite a Q0 ne serait pas garantie).
+  !-----------------------------------------------------------------------
+  SUBROUTINE ORTHO_RESIDUAL(N, RA, Q0, LDQ0, RP, E, LDE, X, Q, LDQ, BK, RK, WS, INFO)
+    INTEGER, INTENT(IN)        :: N, RA, LDQ0, RP, LDE, LDQ
+    COMPLEX(WP), INTENT(IN)    :: Q0(LDQ0,*)
+    COMPLEX(WP), INTENT(INOUT) :: E(LDE,*)
+    COMPLEX(WP), INTENT(OUT)   :: X(RA,RP), Q(LDQ,*), BK(RP,RP)
+    INTEGER, INTENT(OUT)       :: RK, INFO
+    TYPE(BLR_WORKSPACE_T), INTENT(INOUT) :: WS
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP), CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: T(:,:), RT(:,:), UR(:,:), VRH(:,:)
+    REAL(WP), ALLOCATABLE :: SR(:)
+    REAL(WP) :: ENRM, RDUM(1)
+    REAL(WP), EXTERNAL :: CLANGE
+    INTEGER :: I, LWORK
+    ENRM = CLANGE('F', N, RP, E, LDE, RDUM)
+    ALLOCATE(T(RA,RP), RT(RP,RP), UR(RP,RP), VRH(RP,RP), SR(RP))
+    CALL CGEMM('Conjugate transpose', 'No transpose', RA, RP, N, CONE, Q0, LDQ0, E, LDE, CZERO, X, RA)
+    CALL CGEMM('No transpose', 'No transpose', N, RP, RA, -CONE, Q0, LDQ0, X, RA, CONE, E, LDE)
+    CALL CGEMM('Conjugate transpose', 'No transpose', RA, RP, N, CONE, Q0, LDQ0, E, LDE, CZERO, T, RA)
+    CALL CGEMM('No transpose', 'No transpose', N, RP, RA, -CONE, Q0, LDQ0, T, RA, CONE, E, LDE)
+    X = X + T
+    LWORK = SIZE(WS%CWORK2)
+    CALL CGEQRF(N, RP, E, LDE, WS%TAUU, WS%CWORK2, LWORK, INFO)
+    IF (INFO .NE. 0) RETURN
+    RT = CZERO
+    DO I = 1, RP
+      RT(1:I,I) = E(1:I,I)
+    END DO
+    CALL CUNGQR(N, RP, RP, E, LDE, WS%TAUU, WS%CWORK2, LWORK, INFO)
+    IF (INFO .NE. 0) RETURN
+    CALL CGESVD('S', 'S', RP, RP, RT, RP, SR, UR, RP, VRH, RP, WS%CWORK2, LWORK, WS%RWORK2, INFO)
+    IF (INFO .NE. 0) RETURN
+    RK = 0
+    DO I = 1, RP
+      IF (SR(I) .GT. 16.0_WP*EPSILON(1.0_WP)*ENRM) RK = RK + 1
+    END DO
+    IF (RK .GT. 0) CALL CGEMM('No transpose', 'No transpose', N, RK, RP, CONE, E, LDE, UR, RP, CZERO, Q, LDQ)
+    DO I = 1, RK
+      BK(I,1:RP) = SR(I) * VRH(I,1:RP)
+    END DO
+  END SUBROUTINE ORTHO_RESIDUAL
+
+  ! Profil : ajoute le temps ecoule depuis T0 a SPROF_TR(I) et repart.
+  SUBROUTINE PROF_LAP(I, T0)
+    INTEGER, INTENT(IN) :: I
+    DOUBLE PRECISION, INTENT(INOUT) :: T0
+    DOUBLE PRECISION :: T1
+    T1 = BLR_WALLTIME()
+    SPROF_TR(I) = SPROF_TR(I) + (T1 - T0)
+    T0 = T1
+  END SUBROUTINE PROF_LAP
+
+  !-----------------------------------------------------------------------
+  ! PROPOSITION 2 (post-etape 6) : Y <- ALPHA*BLK*X + BETA*Y, ou BLK est
+  ! un bloc M x N (dense OU basse-rang) et X est N x NRHS. Utilise pour la
+  ! substitution par blocs (avant/arriere) d'une factorisation dont les
+  ! facteurs L21/U12 sont GARDES compresses en memoire (pas seulement
+  ! compresses le temps de la mise a jour de Schur, comme a l'etape 2/6e)
+  ! -- voir blr_lu_storage_mod.f90. Cas basse-rang : Y <- ALPHA*UFAC*
+  ! (VFAC*X) + BETA*Y (deux CGEMM avec une matrice intermediaire RANG x
+  ! NRHS, PETITE -- jamais besoin de reconstruire le bloc dense complet,
+  ! c'est exactement le gain memoire ET calcul vise par cette proposition).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_BLOCK_APPLY(BLK, NRHS, ALPHA, X, LDX, BETA, Y, LDY)
+    TYPE(BLR_BLOCK_T), INTENT(IN) :: BLK
+    INTEGER, INTENT(IN)           :: NRHS, LDX, LDY
+    COMPLEX(WP), INTENT(IN)       :: ALPHA, BETA
+    COMPLEX(WP), INTENT(IN)       :: X(LDX,NRHS)
+    COMPLEX(WP), INTENT(INOUT)    :: Y(LDY,NRHS)
+
+    COMPLEX(WP), PARAMETER :: CZERO = (0.0_WP,0.0_WP)
+    COMPLEX(WP), ALLOCATABLE :: T(:,:)
+
+    IF (BLK%M.EQ.0 .OR. BLK%N.EQ.0) RETURN
+
+    IF (BLK%IS_LOWRANK) THEN
+      ALLOCATE(T(BLK%RANK,NRHS))
+      CALL CGEMM('No transpose', 'No transpose', BLK%RANK, NRHS, BLK%N, &
+                  (1.0_WP,0.0_WP), BLK%VFAC, BLK%RANK, X, LDX, CZERO, T, BLK%RANK)
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, NRHS, BLK%RANK, &
+                  ALPHA, BLK%UFAC, BLK%M, T, BLK%RANK, BETA, Y, LDY)
+      DEALLOCATE(T)
+    ELSE
+      CALL CGEMM('No transpose', 'No transpose', BLK%M, NRHS, BLK%N, &
+                  ALPHA, BLK%DENSE, BLK%M, X, LDX, BETA, Y, LDY)
+    END IF
+  END SUBROUTINE BLR_BLOCK_APPLY
+
+  !-----------------------------------------------------------------------
+  ! Decoupage de [1:N] en blocs de taille reguliere NB (dernier bloc
+  ! eventuellement plus petit). BSTART/BEND sont alloues ici. Consolide
+  ! depuis blr_lu_mod.f90 ET blr_matrix_mod.f90 (code identique duplique
+  ! dans les deux avant cette generalisation).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLOCK_PARTITION(N, NB, NBLK, BSTART, BEND)
+    INTEGER, INTENT(IN)               :: N, NB
+    INTEGER, INTENT(OUT)              :: NBLK
+    INTEGER, ALLOCATABLE, INTENT(OUT) :: BSTART(:), BEND(:)
+    INTEGER :: MAXBLK, K
+
+    MAXBLK = (N + NB - 1) / NB
+    ALLOCATE(BSTART(MAXBLK), BEND(MAXBLK))
+    NBLK = 0
+    K = 1
+    DO WHILE (K .LE. N)
+      NBLK = NBLK + 1
+      BSTART(NBLK) = K
+      BEND(NBLK)   = MIN(K+NB-1, N)
+      K = BEND(NBLK) + 1
+    END DO
+  END SUBROUTINE BLOCK_PARTITION
+
+  !-----------------------------------------------------------------------
+  ! Empreinte memoire (octets) d'un bloc dense ou basse-rang. Consolide
+  ! depuis blr_lu_storage_mod.f90 ET blr_matrix_mod.f90 (BLOCK_BYTES,
+  ! code identique duplique dans les deux -- renomme BLR_BLOCK_BYTES ici
+  ! pour eviter toute ambiguite si un futur fichier importe plusieurs
+  ! modules definissant chacun un BLOCK_BYTES local).
+  !-----------------------------------------------------------------------
+  PURE FUNCTION BLR_BLOCK_BYTES(BLK) RESULT(NBYTES)
+    TYPE(BLR_BLOCK_T), INTENT(IN) :: BLK
+    INTEGER(8) :: NBYTES
+    IF (BLK%IS_LOWRANK) THEN
+      NBYTES = 8_8 * (INT(BLK%M,8)*INT(BLK%RANK,8) + INT(BLK%RANK,8)*INT(BLK%N,8))
+    ELSE
+      NBYTES = 8_8 * INT(BLK%M,8) * INT(BLK%N,8)
+    END IF
+  END FUNCTION BLR_BLOCK_BYTES
+
+  !-----------------------------------------------------------------------
+  ! LU sans pivot, non blocuee (CSCAL+CGERU, LAPACK n'a pas de "GETRF sans
+  ! pivot"). Consolide depuis blr_matrix_mod.f90 -- nommee AVEC prefixe
+  ! BLR_ (et pas juste LU_NOPIV_UNBLOCKED) car mpi_lu_nopiv_mod.f90 exporte
+  ! DEJA une routine de ce nom, et mpi_blr_lu_nopiv_mod.f90 importe les
+  ! deux modules simultanement -- un nom identique aurait cree une
+  ! ambiguite de resolution a la compilation.
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_LU_NOPIV_UNBLOCKED(KB, A, LDA, INFO)
+    INTEGER, INTENT(IN)          :: KB, LDA
+    COMPLEX(WP), INTENT(INOUT)   :: A(LDA,KB)
+    INTEGER, INTENT(OUT)         :: INFO
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    REAL(WP), PARAMETER :: PIVTOL = 1.0E-6_WP
+    INTEGER :: J
+    INFO = 0
+    DO J = 1, KB
+      IF (ABS(A(J,J)) .LT. PIVTOL) THEN
+        INFO = J
+        RETURN
+      END IF
+      IF (J .LT. KB) THEN
+        CALL CSCAL(KB-J, CONE/A(J,J), A(J+1,J), 1)
+        CALL CGERU(KB-J, KB-J, -CONE, A(J+1,J), 1, A(J,J+1), LDA, A(J+1,J+1), LDA)
+      END IF
+    END DO
+  END SUBROUTINE BLR_LU_NOPIV_UNBLOCKED
+
+  !-----------------------------------------------------------------------
+  ! LU sans pivot, blockee (right-looking, meme structure que BLOCK_LU_
+  ! FACTOR/block_lu_mod.f90, mais sans CGETRF/pivot) -- remplace
+  ! BLR_LU_NOPIV_UNBLOCKED sur le bloc diagonal de mpi_blr_matrix_mod.f90,
+  ! dont le cout domine 40-50% du temps de factorisation a NB>=750 : la
+  ! version non blockee ne fait que du BLAS niveau 1/2 (CSCAL/CGERU),
+  ! intrinsequement sequentiel et sans reutilisation de cache -- ici, seul
+  ! le panneau (INNER_NB colonnes, petit) reste non blocke (CALL a
+  ! BLR_LU_NOPIV_UNBLOCKED ci-dessus), le gros du travail (mise a jour de
+  ! la sous-matrice restante) passe par CTRSM/CGEMM (BLAS niveau 3 --
+  ! threadable par MKL, bien meilleure intensite arithmetique).
+  !
+  ! DELIBEREMENT PAS CGETRF (LAPACK) : CGETRF fait du pivot partiel par
+  ! construction, ce qui exigerait de propager les permutations de lignes
+  ! aux blocs L21/U12 de la meme ligne/colonne pour rester correct --
+  ! un pivot qui ne decompresse jamais un bloc bas-rang, hors de la portee
+  ! de cette routine. Cette version reste sans pivot de bout en bout,
+  ! seulement blockee -- meme resultat numerique que BLR_LU_NOPIV_
+  ! UNBLOCKED (memes operations, juste reordonnees/groupees), pas une
+  ! nouvelle methode.
+  !
+  ! INFO : indice (1-based, GLOBAL au bloc KBxKB) du premier pivot sous
+  ! PIVTOL rencontre, 0 si aucun -- meme convention que la version non
+  ! blockee.
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_LU_NOPIV_BLOCKED(KB, A, LDA, INFO)
+    INTEGER, INTENT(IN)          :: KB, LDA
+    COMPLEX(WP), INTENT(INOUT)   :: A(LDA,KB)
+    INTEGER, INTENT(OUT)         :: INFO
+    INTEGER, PARAMETER :: INNER_NB = 64
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    INTEGER :: J, JB, IINFO, NREST
+
+    INFO = 0
+    DO J = 1, KB, INNER_NB
+      JB = MIN(INNER_NB, KB-J+1)
+
+      ! Panneau diagonal JBxJB : trop petit pour valoir un BLAS niveau 3
+      ! dedie -- reste non blocke (reutilise la routine existante).
+      CALL BLR_LU_NOPIV_UNBLOCKED(JB, A(J,J), LDA, IINFO)
+      IF (IINFO .NE. 0) THEN
+        INFO = J - 1 + IINFO
+        RETURN
+      END IF
+
+      NREST = KB - J - JB + 1
+      IF (NREST .GT. 0) THEN
+        ! U12 <- L11^-1 * A12 (TRSM, triangulaire inferieure UNITAIRE)
+        CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', JB, NREST, CONE, &
+                    A(J,J), LDA, A(J,J+JB), LDA)
+        ! L21 <- A21 * U11^-1 (TRSM, triangulaire superieure NON unitaire)
+        CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', NREST, JB, CONE, &
+                    A(J,J), LDA, A(J+JB,J), LDA)
+        ! A22 <- A22 - L21*U12 (GEMM, BLAS niveau 3 -- le gros du travail)
+        CALL CGEMM('No transpose', 'No transpose', NREST, NREST, JB, -CONE, &
+                    A(J+JB,J), LDA, A(J,J+JB), LDA, CONE, A(J+JB,J+JB), LDA)
+      END IF
+    END DO
+  END SUBROUTINE BLR_LU_NOPIV_BLOCKED
+
+  !-----------------------------------------------------------------------
+  ! BLK <- L11^-1 * BLK, ou L11 (KWxKW, dense DKK) est unitaire triangulaire
+  ! inferieure, et BLK est un panneau KWxN dense OU basse-rang. Cas
+  ! basse-rang : resoudre sur le SEUL facteur UFAC (KWxRANG) donne
+  ! directement le bon resultat (L11^-1*(UFAC*VFAC) = (L11^-1*UFAC)*VFAC) --
+  ! un vrai gain de calcul (CTRSM sur KWxRANG au lieu de KWxN), pas une
+  ! simplification. Consolide depuis blr_matrix_mod.f90 (TRANSFORM_U12).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_TRSM_LEFT_LOWER_UNIT(DKK, KW, BLK)
+    INTEGER, INTENT(IN)             :: KW
+    COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
+    TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    BLK%ORTHO = .FALSE.
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, BLK%RANK, CONE, DKK, KW, BLK%UFAC, KW)
+    ELSE
+      CALL CTRSM('Left', 'Lower', 'No transpose', 'Unit', KW, BLK%N, CONE, DKK, KW, BLK%DENSE, KW)
+    END IF
+  END SUBROUTINE BLR_TRSM_LEFT_LOWER_UNIT
+
+  !-----------------------------------------------------------------------
+  ! BLK <- BLK * U11^-1, ou U11 (KWxKW, dense DKK) est triangulaire
+  ! superieure non-unitaire, et BLK est un panneau MxKW dense OU
+  ! basse-rang. Cas basse-rang : resoudre sur le SEUL facteur VFAC
+  ! (RANGxKW). Consolide depuis blr_matrix_mod.f90 (TRANSFORM_L21).
+  !-----------------------------------------------------------------------
+  SUBROUTINE BLR_TRSM_RIGHT_UPPER_NONUNIT(BLK, DKK, KW)
+    TYPE(BLR_BLOCK_T), INTENT(INOUT) :: BLK
+    INTEGER, INTENT(IN)             :: KW
+    COMPLEX(WP), INTENT(IN)         :: DKK(KW,KW)
+    COMPLEX(WP), PARAMETER :: CONE = (1.0_WP,0.0_WP)
+    BLK%ORTHO = .FALSE.
+    IF (BLK%IS_LOWRANK) THEN
+      CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', BLK%RANK, KW, CONE, DKK, KW, BLK%VFAC, BLK%RANK)
+    ELSE
+      CALL CTRSM('Right', 'Upper', 'No transpose', 'Non-unit', BLK%M, KW, CONE, DKK, KW, BLK%DENSE, BLK%M)
+    END IF
+  END SUBROUTINE BLR_TRSM_RIGHT_UPPER_NONUNIT
+
+  !-----------------------------------------------------------------------
+  ! Norme de Frobenius d'un bloc, SANS jamais l'expanser en dense si
+  ! basse-rang : ||UV||_F^2 = trace((U^H U)(V V^H)), calcule sur deux
+  ! matrices RANGxRANG (PETITES) plutot que sur le bloc MxN complet --
+  ! meme philosophie que le reste de cette librairie (ne jamais payer un
+  ! cout MxN quand un cout RANGxRANG suffit). NOUVELLE primitive (n'existait
+  ! sous aucune forme avant cette generalisation).
+  !-----------------------------------------------------------------------
+  FUNCTION BLR_BLOCK_NORM(BLK) RESULT(NRM)
+    TYPE(BLR_BLOCK_T), INTENT(IN) :: BLK
+    REAL(WP) :: NRM
+    COMPLEX(WP), ALLOCATABLE :: G(:,:), H(:,:)
+    COMPLEX(WP) :: TR
+    INTEGER :: I, J
+
+    IF (.NOT. BLK%IS_LOWRANK) THEN
+      NRM = SQRT(SUM(ABS(BLK%DENSE)**2))
+      RETURN
+    END IF
+
+    ALLOCATE(G(BLK%RANK,BLK%RANK), H(BLK%RANK,BLK%RANK))
+    CALL CGEMM('Conjugate transpose', 'No transpose', BLK%RANK, BLK%RANK, BLK%M, &
+                (1.0_WP,0.0_WP), BLK%UFAC, BLK%M, BLK%UFAC, BLK%M, (0.0_WP,0.0_WP), G, BLK%RANK)
+    CALL CGEMM('No transpose', 'Conjugate transpose', BLK%RANK, BLK%RANK, BLK%N, &
+                (1.0_WP,0.0_WP), BLK%VFAC, BLK%RANK, BLK%VFAC, BLK%RANK, (0.0_WP,0.0_WP), H, BLK%RANK)
+
+    TR = (0.0_WP,0.0_WP)
+    DO J = 1, BLK%RANK
+      DO I = 1, BLK%RANK
+        TR = TR + G(I,J)*H(J,I)
+      END DO
+    END DO
+    NRM = SQRT(MAX(REAL(TR,WP), 0.0_WP))
+    DEALLOCATE(G, H)
+  END FUNCTION BLR_BLOCK_NORM
+
+
+END MODULE BLR_COMPRESS_MOD

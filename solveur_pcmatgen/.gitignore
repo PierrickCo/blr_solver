@@ -5,3 +5,5 @@ solveur_blr_*
 *.csv
 *.bin
 *.dat
+# lib/ contient ici des SOURCES (le .gitignore racine ignore les lib/ de compilation)
+!lib/
