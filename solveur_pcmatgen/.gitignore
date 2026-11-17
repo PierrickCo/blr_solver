@@ -1,0 +1,7 @@
+build*/
+solveur_blr
+solveur_blr_*
+*__genmod.f90
+*.csv
+*.bin
+*.dat
