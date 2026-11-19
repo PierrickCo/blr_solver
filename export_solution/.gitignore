@@ -1,0 +1,5 @@
+build/
+export_solution
+*.nc
+*.bin
+*.txt
